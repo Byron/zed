@@ -11800,6 +11800,7 @@ name = "outline_panel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "buffer_diff",
  "collections",
  "db",
  "editor",
@@ -11811,6 +11812,7 @@ dependencies = [
  "log",
  "lsp",
  "menu",
+ "multi_buffer",
  "outline",
  "pretty_assertions",
  "project",

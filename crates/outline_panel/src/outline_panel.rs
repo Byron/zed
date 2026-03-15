@@ -371,6 +371,129 @@ enum ExcerptOutlines {
     NotFetched,
 }
 
+fn outline_intersects_excerpt_context(
+    outline: &Outline,
+    excerpt_range: &ExcerptRange<language::Anchor>,
+    buffer_snapshot: &BufferSnapshot,
+) -> bool {
+    outline
+        .source_range_for_text
+        .start
+        .cmp(&excerpt_range.context.end, buffer_snapshot)
+        .is_lt()
+        && outline
+            .source_range_for_text
+            .end
+            .cmp(&excerpt_range.context.start, buffer_snapshot)
+            .is_gt()
+}
+
+fn clip_anchor_range_to_excerpt(
+    range: &Range<language::Anchor>,
+    excerpt_range: &ExcerptRange<language::Anchor>,
+    buffer_snapshot: &BufferSnapshot,
+) -> Option<Range<language::Anchor>> {
+    let start = if range
+        .start
+        .cmp(&excerpt_range.context.start, buffer_snapshot)
+        .is_lt()
+    {
+        excerpt_range.context.start.clone()
+    } else {
+        range.start.clone()
+    };
+    let end = if range
+        .end
+        .cmp(&excerpt_range.context.end, buffer_snapshot)
+        .is_gt()
+    {
+        excerpt_range.context.end.clone()
+    } else {
+        range.end.clone()
+    };
+
+    if start.cmp(&end, buffer_snapshot).is_lt() {
+        Some(start..end)
+    } else {
+        None
+    }
+}
+
+fn filter_outlines_for_excerpt(
+    outlines: &[Outline],
+    excerpt_range: &ExcerptRange<language::Anchor>,
+    buffer_snapshot: &BufferSnapshot,
+) -> Vec<Outline> {
+    let mut visible_outlines = outlines
+        .iter()
+        .filter(|outline| {
+            outline_intersects_excerpt_context(outline, excerpt_range, buffer_snapshot)
+        })
+        .filter_map(|outline| {
+            Some(Outline {
+                depth: 0,
+                range: clip_anchor_range_to_excerpt(
+                    &outline.range,
+                    excerpt_range,
+                    buffer_snapshot,
+                )?,
+                source_range_for_text: clip_anchor_range_to_excerpt(
+                    &outline.source_range_for_text,
+                    excerpt_range,
+                    buffer_snapshot,
+                )?,
+                text: outline.text.clone(),
+                highlight_ranges: outline.highlight_ranges.clone(),
+                name_ranges: outline.name_ranges.clone(),
+                body_range: outline.body_range.as_ref().and_then(|body_range| {
+                    clip_anchor_range_to_excerpt(body_range, excerpt_range, buffer_snapshot)
+                }),
+                annotation_range: outline
+                    .annotation_range
+                    .as_ref()
+                    .and_then(|annotation_range| {
+                        clip_anchor_range_to_excerpt(
+                            annotation_range,
+                            excerpt_range,
+                            buffer_snapshot,
+                        )
+                    }),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut item_ends_stack: Vec<language::Anchor> = Vec::new();
+    for outline in &mut visible_outlines {
+        while let Some(last_end) = item_ends_stack.last() {
+            if last_end.cmp(&outline.range.end, buffer_snapshot).is_lt() {
+                item_ends_stack.pop();
+            } else {
+                break;
+            }
+        }
+
+        outline.depth = item_ends_stack.len();
+        item_ends_stack.push(outline.range.end.clone());
+    }
+
+    visible_outlines
+}
+
+fn outlines_with_children(outlines: &[Outline]) -> HashSet<(Range<language::Anchor>, usize)> {
+    outlines
+        .windows(2)
+        .filter_map(|window| {
+            let current = &window[0];
+            let next = &window[1];
+            if next.depth > current.depth {
+                Some((current.range.clone(), current.depth))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FoldedDirsEntry {
     worktree_id: WorktreeId,
@@ -2797,7 +2920,8 @@ impl OutlinePanel {
                 let git_store = outline_panel.project.read(cx).git_store().clone();
                 new_collapsed_entries = outline_panel.collapsed_entries.clone();
                 new_unfolded_dirs = outline_panel.unfolded_dirs.clone();
-                let multi_buffer_snapshot = active_multi_buffer.read(cx).snapshot(cx);
+                let active_multi_buffer = active_multi_buffer.read(cx);
+                let multi_buffer_snapshot = active_multi_buffer.snapshot(cx);
 
                 multi_buffer_snapshot.excerpts().fold(
                     HashMap::default(),
@@ -2808,13 +2932,24 @@ impl OutlinePanel {
                         let worktree = file.map(|file| file.worktree.read(cx).snapshot());
                         let is_new = new_entries.contains(&excerpt_id)
                             || !outline_panel.excerpts.contains_key(&buffer_id);
+                        let is_new_excerpt = new_entries.contains(&excerpt_id)
+                            || outline_panel
+                                .excerpts
+                                .get(&buffer_id)
+                                .and_then(|excerpts| excerpts.get(&excerpt_id))
+                                .is_none();
                         let is_folded = active_editor.read(cx).is_buffer_folded(buffer_id, cx);
+                        let has_diff = active_multi_buffer.diff_for(buffer_id).is_some();
                         let status = git_store
                             .read(cx)
                             .repository_and_path_for_buffer_id(buffer_id, cx)
                             .and_then(|(repo, path)| {
                                 Some(repo.read(cx).status_for_path(&path)?.status)
                             });
+                        if is_new_excerpt && has_diff {
+                            new_collapsed_entries
+                                .insert(CollapsedEntry::Excerpt(buffer_id, excerpt_id));
+                        }
                         buffer_excerpts
                             .entry(buffer_id)
                             .or_insert_with(|| {
@@ -3459,12 +3594,12 @@ impl OutlinePanel {
         }
 
         let first_update = Arc::new(AtomicBool::new(true));
-        for (buffer_id, (_buffer_snapshot, excerpt_ranges)) in excerpt_fetch_ranges {
+        for (buffer_id, (buffer_snapshot, excerpt_ranges)) in excerpt_fetch_ranges {
             let outline_task = self.active_editor().map(|editor| {
                 editor.update(cx, |editor, cx| editor.buffer_outline_items(buffer_id, cx))
             });
 
-            let excerpt_ids = excerpt_ranges.keys().copied().collect::<Vec<_>>();
+            let excerpt_ranges = excerpt_ranges.into_iter().collect::<Vec<_>>();
             let first_update = first_update.clone();
 
             self.outline_fetch_tasks.insert(
@@ -3474,18 +3609,6 @@ impl OutlinePanel {
                         return;
                     };
                     let fetched_outlines = outline_task.await;
-                    let outlines_with_children = fetched_outlines
-                        .windows(2)
-                        .filter_map(|window| {
-                            let current = &window[0];
-                            let next = &window[1];
-                            if next.depth > current.depth {
-                                Some((current.range.clone(), current.depth))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<HashSet<_>>();
 
                     outline_panel
                         .update_in(cx, |outline_panel, window, cx| {
@@ -3499,7 +3622,15 @@ impl OutlinePanel {
                                     Some(UPDATE_DEBOUNCE)
                                 };
 
-                            for excerpt_id in &excerpt_ids {
+                            for (excerpt_id, excerpt_range) in &excerpt_ranges {
+                                let filtered_outlines = filter_outlines_for_excerpt(
+                                    &fetched_outlines,
+                                    excerpt_range,
+                                    &buffer_snapshot,
+                                );
+                                let filtered_outlines_with_children =
+                                    outlines_with_children(&filtered_outlines);
+
                                 if let Some(excerpt) = outline_panel
                                     .excerpts
                                     .entry(buffer_id)
@@ -3507,7 +3638,7 @@ impl OutlinePanel {
                                     .get_mut(excerpt_id)
                                 {
                                     excerpt.outlines =
-                                        ExcerptOutlines::Outlines(fetched_outlines.clone());
+                                        ExcerptOutlines::Outlines(filtered_outlines.clone());
 
                                     if let Some(default_depth) = pending_default_depth
                                         && let ExcerptOutlines::Outlines(outlines) =
@@ -3518,7 +3649,7 @@ impl OutlinePanel {
                                             .filter(|outline| {
                                                 (default_depth == 0
                                                     || outline.depth >= default_depth)
-                                                    && outlines_with_children.contains(&(
+                                                    && filtered_outlines_with_children.contains(&(
                                                         outline.range.clone(),
                                                         outline.depth,
                                                     ))
@@ -5378,9 +5509,12 @@ impl GenerationState {
 
 #[cfg(test)]
 mod tests {
+    use buffer_diff::BufferDiff;
     use db::indoc;
+    use editor::MultiBuffer;
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext, WindowHandle};
     use language::{self, FakeLspAdapter, rust_lang};
+    use multi_buffer::PathKey;
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use search::{
@@ -6925,6 +7059,392 @@ outline: struct OutlineEntryExcerpt
             project_search::init(cx);
             buffer_search::init(cx);
             super::init(cx);
+        });
+    }
+
+    fn settle_outline_panel(cx: &mut VisualTestContext) {
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    async fn add_diff_editor(
+        workspace: &Entity<Workspace>,
+        project: &Entity<Project>,
+        path: PathBuf,
+        base_text: &str,
+        context_line_count: u32,
+        cx: &mut VisualTestContext,
+    ) -> Entity<Editor> {
+        let source_editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    path,
+                    OpenOptions {
+                        visible: Some(OpenVisible::All),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("Failed to open source file")
+            .downcast::<Editor>()
+            .expect("Should open an editor for the source file");
+
+        let buffer = source_editor.read_with(cx, |editor, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("Source editor should be a singleton")
+                .clone()
+        });
+        let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+        let diff = cx.new(|cx| BufferDiff::new_with_base_text(base_text, &buffer_snapshot, cx));
+        let diff_hunk_ranges = diff
+            .read_with(cx, |diff, cx| diff.snapshot(cx))
+            .hunks_intersecting_range(
+                language::Anchor::min_max_range_for_buffer(buffer_snapshot.remote_id()),
+                &buffer_snapshot,
+            )
+            .map(|diff_hunk| diff_hunk.buffer_range.to_point(&buffer_snapshot))
+            .collect::<Vec<_>>();
+        let multibuffer = cx.new(|_| MultiBuffer::new(language::Capability::ReadWrite));
+
+        multibuffer.update(cx, |multibuffer, cx| {
+            multibuffer.set_excerpts_for_path(
+                PathKey::for_buffer(&buffer, cx),
+                buffer.clone(),
+                diff_hunk_ranges,
+                context_line_count,
+                cx,
+            );
+            multibuffer.add_diff(diff, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let diff_editor = cx.new(|cx| {
+                let mut editor =
+                    Editor::for_multibuffer(multibuffer.clone(), Some(project.clone()), window, cx);
+                editor.set_expand_all_diff_hunks(cx);
+                editor
+            });
+
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.add_item(Box::new(diff_editor.clone()), true, true, None, window, cx);
+            });
+
+            diff_editor
+        })
+    }
+
+    #[gpui::test]
+    async fn test_diff_excerpt_outlines_only_include_visible_symbols_and_start_collapsed(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let root = path!("/root");
+        let base_text = indoc! {"
+            fn hidden_before() {
+                let before = 1;
+            }
+
+            mod outer {
+
+                fn visible_child() {
+                    let value = 1;
+                }
+            }
+
+            fn hidden_after() {
+                let after = 1;
+            }
+        "};
+        let current_text = base_text.replace("let value = 1;", "let value = 2;");
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            root,
+            json!({
+                "src": {
+                    "lib.rs": current_text,
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
+        project.read_with(cx, |project, _| project.languages().add(rust_lang()));
+
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+
+        let diff_editor = add_diff_editor(
+            &workspace,
+            &project,
+            PathBuf::from(path!("/root/src/lib.rs")),
+            base_text,
+            1,
+            cx,
+        )
+        .await;
+
+        settle_outline_panel(cx);
+
+        let (buffer_id, excerpt_id) = diff_editor
+            .read_with(cx, |editor, cx| {
+                let multibuffer = editor.buffer().read(cx);
+                let excerpt_id = multibuffer
+                    .excerpt_ids()
+                    .into_iter()
+                    .next()
+                    .expect("Diff editor should contain one excerpt");
+                let snapshot = multibuffer.snapshot(cx);
+                let buffer_id = snapshot.buffer_for_excerpt(excerpt_id)?.remote_id();
+                Some((buffer_id, excerpt_id))
+            })
+            .expect("Diff editor should resolve its excerpt buffer");
+
+        outline_panel.read_with(cx, |outline_panel, _| {
+            assert!(
+                outline_panel
+                    .collapsed_entries
+                    .contains(&CollapsedEntry::Excerpt(buffer_id, excerpt_id)),
+                "Diff excerpt rows should start collapsed"
+            );
+
+            let excerpt = outline_panel
+                .excerpts
+                .get(&buffer_id)
+                .and_then(|excerpts| excerpts.get(&excerpt_id))
+                .expect("Outline panel should track the diff excerpt");
+            let outline_summaries = excerpt
+                .iter_outlines()
+                .map(|outline| (outline.text.to_string(), outline.depth))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outline_summaries,
+                vec![("fn visible_child".to_string(), 0)],
+                "Only declarations visible inside the excerpt should be kept, with normalized depth"
+            );
+            assert!(
+                outline_panel.cached_entries.iter().all(|entry| {
+                    !matches!(entry.entry, PanelEntry::Outline(OutlineEntry::Outline(_)))
+                }),
+                "Collapsed diff excerpts should hide their child outline entries"
+            );
+        });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel
+                .collapsed_entries
+                .remove(&CollapsedEntry::Excerpt(buffer_id, excerpt_id));
+            outline_panel.update_cached_entries(None, window, cx);
+        });
+        settle_outline_panel(cx);
+
+        outline_panel.read_with(cx, |outline_panel, _| {
+            let visible_outlines = outline_panel
+                .cached_entries
+                .iter()
+                .filter_map(|entry| match &entry.entry {
+                    PanelEntry::Outline(OutlineEntry::Outline(outline)) => {
+                        Some((outline.outline.text.to_string(), outline.outline.depth))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(visible_outlines, vec![("fn visible_child".to_string(), 0)]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_diff_excerpt_outlines_filter_lsp_document_symbols(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let root = path!("/root");
+        let base_text = indoc! {"
+            fn hidden_before() {
+                let before = 1;
+            }
+
+            mod outer {
+
+                fn visible_child() {
+                    let value = 1;
+                }
+            }
+
+            fn hidden_after() {
+                let after = 1;
+            }
+        "};
+        let current_text = base_text.replace("let value = 1;", "let value = 2;");
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            root,
+            json!({
+                "src": {
+                    "lib.rs": current_text,
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
+        let language_registry = project.read_with(cx, |project, _| {
+            project.languages().add(rust_lang());
+            project.languages().clone()
+        });
+        let mut fake_language_servers = language_registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    document_symbol_provider: Some(lsp::OneOf::Left(true)),
+                    ..lsp::ServerCapabilities::default()
+                },
+                initializer: Some(Box::new(|fake_language_server| {
+                    fake_language_server
+                        .set_request_handler::<lsp::request::DocumentSymbolRequest, _, _>(
+                            move |_, _| async move {
+                                #[allow(deprecated)]
+                                Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
+                                    lsp::DocumentSymbol {
+                                        name: "hidden_before".to_string(),
+                                        detail: None,
+                                        kind: lsp::SymbolKind::FUNCTION,
+                                        tags: None,
+                                        deprecated: None,
+                                        range: lsp::Range::new(
+                                            lsp::Position::new(0, 0),
+                                            lsp::Position::new(2, 1),
+                                        ),
+                                        selection_range: lsp::Range::new(
+                                            lsp::Position::new(0, 3),
+                                            lsp::Position::new(0, 16),
+                                        ),
+                                        children: None,
+                                    },
+                                    lsp::DocumentSymbol {
+                                        name: "outer".to_string(),
+                                        detail: None,
+                                        kind: lsp::SymbolKind::MODULE,
+                                        tags: None,
+                                        deprecated: None,
+                                        range: lsp::Range::new(
+                                            lsp::Position::new(4, 0),
+                                            lsp::Position::new(8, 1),
+                                        ),
+                                        selection_range: lsp::Range::new(
+                                            lsp::Position::new(4, 4),
+                                            lsp::Position::new(4, 9),
+                                        ),
+                                        children: Some(vec![lsp::DocumentSymbol {
+                                            name: "visible_child".to_string(),
+                                            detail: None,
+                                            kind: lsp::SymbolKind::FUNCTION,
+                                            tags: None,
+                                            deprecated: None,
+                                            range: lsp::Range::new(
+                                                lsp::Position::new(6, 4),
+                                                lsp::Position::new(8, 5),
+                                            ),
+                                            selection_range: lsp::Range::new(
+                                                lsp::Position::new(6, 7),
+                                                lsp::Position::new(6, 20),
+                                            ),
+                                            children: None,
+                                        }]),
+                                    },
+                                    lsp::DocumentSymbol {
+                                        name: "hidden_after".to_string(),
+                                        detail: None,
+                                        kind: lsp::SymbolKind::FUNCTION,
+                                        tags: None,
+                                        deprecated: None,
+                                        range: lsp::Range::new(
+                                            lsp::Position::new(11, 0),
+                                            lsp::Position::new(13, 1),
+                                        ),
+                                        selection_range: lsp::Range::new(
+                                            lsp::Position::new(11, 3),
+                                            lsp::Position::new(11, 15),
+                                        ),
+                                        children: None,
+                                    },
+                                ])))
+                            },
+                        );
+                })),
+                ..FakeLspAdapter::default()
+            },
+        );
+
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(
+                cx,
+                |store: &mut settings::SettingsStore, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.project.all_languages.defaults.document_symbols =
+                            Some(settings::DocumentSymbols::On);
+                    });
+                },
+            );
+        });
+
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+
+        let diff_editor = add_diff_editor(
+            &workspace,
+            &project,
+            PathBuf::from(path!("/root/src/lib.rs")),
+            base_text,
+            1,
+            cx,
+        )
+        .await;
+        let _fake_language_server = fake_language_servers.next().await.unwrap();
+
+        settle_outline_panel(cx);
+
+        let (buffer_id, excerpt_id) = diff_editor
+            .read_with(cx, |editor, cx| {
+                let multibuffer = editor.buffer().read(cx);
+                let excerpt_id = multibuffer
+                    .excerpt_ids()
+                    .into_iter()
+                    .next()
+                    .expect("Diff editor should contain one excerpt");
+                let snapshot = multibuffer.snapshot(cx);
+                let buffer_id = snapshot.buffer_for_excerpt(excerpt_id)?.remote_id();
+                Some((buffer_id, excerpt_id))
+            })
+            .expect("Diff editor should resolve its excerpt buffer");
+
+        outline_panel.read_with(cx, |outline_panel, _| {
+            let excerpt = outline_panel
+                .excerpts
+                .get(&buffer_id)
+                .and_then(|excerpts| excerpts.get(&excerpt_id))
+                .expect("Outline panel should track the diff excerpt");
+            let outline_summaries = excerpt
+                .iter_outlines()
+                .map(|outline| (outline.text.to_string(), outline.depth))
+                .collect::<Vec<_>>();
+            assert_eq!(outline_summaries, vec![("fn visible_child".to_string(), 0)]);
         });
     }
 
