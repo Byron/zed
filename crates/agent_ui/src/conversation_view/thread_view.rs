@@ -4,6 +4,8 @@ use std::cell::RefCell;
 use acp_thread::ContentBlock;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
+use markdown::PathWithRange;
+use util::paths::PathWithPosition;
 
 use crate::StartThreadIn;
 use crate::message_editor::SharedSessionCapabilities;
@@ -8360,16 +8362,7 @@ pub(crate) fn open_link(
     if let Some(mention) = MentionUri::parse(&url, workspace.read(cx).path_style(cx)).log_err() {
         workspace.update(cx, |workspace, cx| match mention {
             MentionUri::File { abs_path } => {
-                let project = workspace.project();
-                let Some(path) =
-                    project.update(cx, |project, cx| project.find_project_path(abs_path, cx))
-                else {
-                    return;
-                };
-
-                workspace
-                    .open_path(path, None, true, window, cx)
-                    .detach_and_log_err(cx);
+                open_project_path(workspace, &abs_path, None, window, cx);
             }
             MentionUri::PastedImage => {}
             MentionUri::Directory { abs_path } => {
@@ -8394,34 +8387,13 @@ pub(crate) fn open_link(
                 abs_path: Some(path),
                 line_range,
             } => {
-                let project = workspace.project();
-                let Some(path) =
-                    project.update(cx, |project, cx| project.find_project_path(path, cx))
-                else {
-                    return;
-                };
-
-                let item = workspace.open_path(path, None, true, window, cx);
-                window
-                    .spawn(cx, async move |cx| {
-                        let Some(editor) = item.await?.downcast::<Editor>() else {
-                            return Ok(());
-                        };
-                        let range =
-                            Point::new(*line_range.start(), 0)..Point::new(*line_range.start(), 0);
-                        editor
-                            .update_in(cx, |editor, window, cx| {
-                                editor.change_selections(
-                                    SelectionEffects::scroll(Autoscroll::center()),
-                                    window,
-                                    cx,
-                                    |s| s.select_ranges(vec![range]),
-                                );
-                            })
-                            .ok();
-                        anyhow::Ok(())
-                    })
-                    .detach_and_log_err(cx);
+                open_project_path(
+                    workspace,
+                    &path,
+                    Some(Point::new(*line_range.start(), 0)),
+                    window,
+                    cx,
+                );
             }
             MentionUri::Selection { abs_path: None, .. } => {}
             MentionUri::Thread { id, name } => {
@@ -8459,7 +8431,90 @@ pub(crate) fn open_link(
             MentionUri::GitDiff { .. } => {}
             MentionUri::MergeConflict { .. } => {}
         })
-    } else {
+    } else if !open_project_path_from_link(&url, &workspace, window, cx) {
         cx.open_url(&url);
     }
+}
+
+fn open_project_path_from_link(
+    url: &str,
+    workspace: &Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let path_with_range = PathWithRange::new(url);
+    if path_with_range.range.is_some() {
+        let target_position = path_with_range
+            .range
+            .as_ref()
+            .and_then(|range| target_point_for_line_col(range.start));
+        return workspace.update(cx, |workspace, cx| {
+            open_project_path(
+                workspace,
+                path_with_range.path.as_ref(),
+                target_position,
+                window,
+                cx,
+            )
+        });
+    }
+
+    let path_with_position = PathWithPosition::parse_str(url);
+    let target_position =
+        target_point_for_row_and_column(path_with_position.row, path_with_position.column);
+    workspace.update(cx, |workspace, cx| {
+        open_project_path(
+            workspace,
+            &path_with_position.path,
+            target_position,
+            window,
+            cx,
+        )
+    })
+}
+
+fn target_point_for_line_col(line_col: markdown::LineCol) -> Option<Point> {
+    target_point_for_row_and_column(Some(line_col.line), line_col.col)
+}
+
+fn target_point_for_row_and_column(row: Option<u32>, column: Option<u32>) -> Option<Point> {
+    let row = row?.checked_sub(1)?;
+    let column = column.map(|column| column.saturating_sub(1)).unwrap_or(0);
+    Some(Point::new(row, column))
+}
+
+fn open_project_path(
+    workspace: &mut Workspace,
+    path: impl AsRef<Path>,
+    target_position: Option<Point>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let project = workspace.project();
+    let Some(project_path) = project.update(cx, |project, cx| project.find_project_path(path, cx))
+    else {
+        return false;
+    };
+
+    let item = workspace.open_path(project_path, None, true, window, cx);
+
+    if let Some(target_position) = target_position {
+        window
+            .spawn(cx, async move |cx| {
+                let Some(editor) = item.await?.downcast::<Editor>() else {
+                    return Ok(());
+                };
+                editor
+                    .update_in(cx, |editor, window, cx| {
+                        editor.go_to_singleton_buffer_point(target_position, window, cx);
+                    })
+                    .ok();
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+    } else {
+        item.detach_and_log_err(cx);
+    }
+
+    true
 }

@@ -2720,6 +2720,75 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_open_link_opens_absolute_project_path_in_editor(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                "src": {
+                    "main.rs": "fn main() {}\nprintln!(\"hello\");\n"
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let weak_workspace = workspace.downgrade();
+
+        cx.update(|window, cx| {
+            open_link(
+                "/project/src/main.rs#L2".into(),
+                &weak_workspace,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let active_editor = workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<Editor>(cx))
+            .expect("expected the link to open an editor");
+
+        active_editor.update(cx, |editor, cx| {
+            let selections = editor
+                .selections
+                .all::<Point>(&editor.display_snapshot(cx))
+                .into_iter()
+                .map(|selection| selection.range())
+                .collect::<Vec<_>>();
+            assert_eq!(selections, vec![Point::new(1, 0)..Point::new(1, 0)]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_link_falls_back_to_external_urls(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let weak_workspace = workspace.downgrade();
+
+        cx.update(|window, cx| {
+            open_link(
+                "https://example.com/docs".into(),
+                &weak_workspace,
+                window,
+                cx,
+            );
+        });
+
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/docs"));
+    }
+
+    #[gpui::test]
     async fn test_external_source_prompt_requires_manual_send(cx: &mut TestAppContext) {
         init_test(cx);
 
