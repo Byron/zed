@@ -1999,6 +1999,253 @@ impl OutlinePanel {
         }
     }
 
+    fn collapsed_entry_for_panel_entry(&self, entry: &PanelEntry) -> Option<CollapsedEntry> {
+        match entry {
+            PanelEntry::Fs(FsEntry::Directory(FsEntryDirectory {
+                worktree_id, entry, ..
+            })) => Some(CollapsedEntry::Dir(*worktree_id, entry.id)),
+            PanelEntry::Fs(FsEntry::File(FsEntryFile {
+                worktree_id,
+                buffer_id,
+                ..
+            })) => Some(CollapsedEntry::File(*worktree_id, *buffer_id)),
+            PanelEntry::Fs(FsEntry::ExternalFile(external_file)) => {
+                Some(CollapsedEntry::ExternalFile(external_file.buffer_id))
+            }
+            PanelEntry::FoldedDirs(FoldedDirsEntry {
+                worktree_id,
+                entries,
+                ..
+            }) => entries
+                .first()
+                .map(|entry| CollapsedEntry::Dir(*worktree_id, entry.id)),
+            PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => {
+                Some(CollapsedEntry::Excerpt(excerpt.buffer_id, excerpt.id))
+            }
+            PanelEntry::Outline(OutlineEntry::Outline(outline)) => Some(CollapsedEntry::Outline(
+                outline.buffer_id,
+                outline.excerpt_id,
+                outline.outline.range.clone(),
+            )),
+            PanelEntry::Search(_) => None,
+        }
+    }
+
+    fn is_collapsed(&self, entry: &PanelEntry) -> bool {
+        self.collapsed_entry_for_panel_entry(entry)
+            .is_some_and(|collapsed_entry| self.collapsed_entries.contains(&collapsed_entry))
+    }
+
+    fn collect_single_level_collapsed_entries(
+        &self,
+        entry: &PanelEntry,
+        collapsed_entries: &mut HashSet<CollapsedEntry>,
+        cx: &App,
+    ) {
+        match entry {
+            PanelEntry::Fs(FsEntry::Directory(FsEntryDirectory {
+                worktree_id,
+                entry: directory_entry,
+            })) => {
+                for fs_entry in &self.fs_entries {
+                    match fs_entry {
+                        FsEntry::Directory(directory)
+                            if directory.worktree_id == *worktree_id
+                                && directory.entry.path.parent()
+                                    == Some(directory_entry.path.as_ref()) =>
+                        {
+                            collapsed_entries
+                                .insert(CollapsedEntry::Dir(*worktree_id, directory.entry.id));
+                        }
+                        FsEntry::File(file)
+                            if file.worktree_id == *worktree_id
+                                && file.entry.path.parent()
+                                    == Some(directory_entry.path.as_ref()) =>
+                        {
+                            collapsed_entries
+                                .insert(CollapsedEntry::File(*worktree_id, file.buffer_id));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            PanelEntry::Fs(FsEntry::File(FsEntryFile {
+                worktree_id: _,
+                buffer_id,
+                excerpts,
+                ..
+            })) => {
+                for excerpt_id in excerpts {
+                    collapsed_entries.insert(CollapsedEntry::Excerpt(*buffer_id, *excerpt_id));
+                }
+            }
+            PanelEntry::Fs(FsEntry::ExternalFile(external_file)) => {
+                for excerpt_id in &external_file.excerpts {
+                    collapsed_entries.insert(CollapsedEntry::Excerpt(
+                        external_file.buffer_id,
+                        *excerpt_id,
+                    ));
+                }
+            }
+            PanelEntry::FoldedDirs(FoldedDirsEntry {
+                worktree_id,
+                entries,
+                ..
+            }) => {
+                if let Some(directory_entry) = entries.first() {
+                    self.collect_single_level_collapsed_entries(
+                        &PanelEntry::Fs(FsEntry::Directory(FsEntryDirectory {
+                            worktree_id: *worktree_id,
+                            entry: directory_entry.clone(),
+                        })),
+                        collapsed_entries,
+                        cx,
+                    );
+                }
+            }
+            PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => {
+                let Some(excerpt_data) = self
+                    .excerpts
+                    .get(&excerpt.buffer_id)
+                    .and_then(|excerpts| excerpts.get(&excerpt.id))
+                else {
+                    return;
+                };
+
+                for outline in excerpt_data.iter_outlines() {
+                    if outline.depth == 0 {
+                        collapsed_entries.insert(CollapsedEntry::Outline(
+                            excerpt.buffer_id,
+                            excerpt.id,
+                            outline.range.clone(),
+                        ));
+                    }
+                }
+            }
+            PanelEntry::Outline(OutlineEntry::Outline(outline_entry)) => {
+                let Some(excerpt) = self
+                    .excerpts
+                    .get(&outline_entry.buffer_id)
+                    .and_then(|excerpts| excerpts.get(&outline_entry.excerpt_id))
+                else {
+                    return;
+                };
+
+                let Some(buffer_snapshot) =
+                    self.buffer_snapshot_for_id(outline_entry.buffer_id, cx)
+                else {
+                    return;
+                };
+
+                let mut found_selected_outline = false;
+                for outline in excerpt.iter_outlines() {
+                    if !found_selected_outline {
+                        found_selected_outline = outline.depth == outline_entry.outline.depth
+                            && outline.range == outline_entry.outline.range;
+                        continue;
+                    }
+
+                    if outline.depth <= outline_entry.outline.depth {
+                        break;
+                    }
+
+                    let starts_inside = outline
+                        .range
+                        .start
+                        .cmp(&outline_entry.outline.range.start, &buffer_snapshot)
+                        .is_ge();
+                    let ends_inside = outline
+                        .range
+                        .end
+                        .cmp(&outline_entry.outline.range.end, &buffer_snapshot)
+                        .is_le();
+
+                    if outline.depth == outline_entry.outline.depth + 1
+                        && starts_inside
+                        && ends_inside
+                    {
+                        collapsed_entries.insert(CollapsedEntry::Outline(
+                            outline_entry.buffer_id,
+                            outline_entry.excerpt_id,
+                            outline.range.clone(),
+                        ));
+                    }
+                }
+            }
+            PanelEntry::Search(_) => {}
+        }
+    }
+
+    fn expand_single_level(
+        &mut self,
+        entry: &PanelEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_editor) = self.active_editor() else {
+            return;
+        };
+        let Some(root_collapsed_entry) = self.collapsed_entry_for_panel_entry(entry) else {
+            return;
+        };
+
+        if !self.collapsed_entries.remove(&root_collapsed_entry) {
+            self.toggle_expanded(entry, window, cx);
+            return;
+        }
+
+        let mut immediate_collapsed_entries = HashSet::default();
+        let mut buffers_to_unfold = HashSet::default();
+        self.collect_single_level_collapsed_entries(entry, &mut immediate_collapsed_entries, cx);
+        self.collapsed_entries.extend(immediate_collapsed_entries);
+
+        match entry {
+            PanelEntry::Fs(FsEntry::Directory(FsEntryDirectory {
+                worktree_id,
+                entry: directory_entry,
+                ..
+            })) => {
+                self.project
+                    .update(cx, |project, cx| {
+                        project.expand_entry(*worktree_id, directory_entry.id, cx)
+                    })
+                    .unwrap_or_else(|| Task::ready(Ok(())))
+                    .detach_and_log_err(cx);
+            }
+            PanelEntry::FoldedDirs(FoldedDirsEntry {
+                worktree_id,
+                entries,
+                ..
+            }) => {
+                if let Some(directory_entry) = entries.first() {
+                    self.project
+                        .update(cx, |project, cx| {
+                            project.expand_entry(*worktree_id, directory_entry.id, cx)
+                        })
+                        .unwrap_or_else(|| Task::ready(Ok(())))
+                        .detach_and_log_err(cx);
+                }
+            }
+            PanelEntry::Fs(FsEntry::File(FsEntryFile { buffer_id, .. }))
+            | PanelEntry::Fs(FsEntry::ExternalFile(FsEntryExternalFile { buffer_id, .. })) => {
+                buffers_to_unfold.insert(*buffer_id);
+            }
+            PanelEntry::Outline(..) | PanelEntry::Search(_) => {}
+        }
+
+        active_editor.update(cx, |editor, cx| {
+            buffers_to_unfold.retain(|buffer_id| editor.is_buffer_folded(*buffer_id, cx));
+        });
+
+        self.select_entry(entry.clone(), true, window, cx);
+        if buffers_to_unfold.is_empty() {
+            self.update_cached_entries(None, window, cx);
+        } else {
+            self.toggle_buffers_fold(buffers_to_unfold, false, window, cx)
+                .detach();
+        }
+    }
+
     fn toggle_expanded(&mut self, entry: &PanelEntry, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active_editor) = self.active_editor() else {
             return;
@@ -2814,7 +3061,11 @@ impl OutlinePanel {
                     }
 
                     let change_focus = event.click_count() > 1;
-                    outline_panel.toggle_expanded(&clicked_entry, window, cx);
+                    if event.modifiers().alt && outline_panel.is_collapsed(&clicked_entry) {
+                        outline_panel.expand_single_level(&clicked_entry, window, cx);
+                    } else {
+                        outline_panel.toggle_expanded(&clicked_entry, window, cx);
+                    }
 
                     outline_panel.scroll_editor_to_entry(
                         &clicked_entry,
@@ -8318,6 +8569,128 @@ outline: fn main"
                 ),
                 expected_expanded_output
             };
+        });
+    }
+
+    #[gpui::test]
+    async fn test_outline_alt_click_expands_a_single_level(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/test",
+            json!({
+                "src": {
+                    "lib.rs": indoc!("
+                            mod outer {
+                                pub struct OuterStruct {
+                                    field: String,
+                                }
+                                impl OuterStruct {
+                                    pub fn new() -> Self {
+                                        Self { field: String::new() }
+                                    }
+                                    pub fn method(&self) {
+                                        println!(\"{}\", self.field);
+                                    }
+                                }
+                                mod inner {
+                                    pub fn inner_function() {
+                                        let x = 42;
+                                        println!(\"{}\", x);
+                                    }
+                                    pub struct InnerStruct {
+                                        value: i32,
+                                    }
+                                }
+                            }
+                            fn main() {
+                                let s = outer::OuterStruct::new();
+                                s.method();
+                            }
+                        "),
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
+        project.read_with(cx, |project, _| project.languages().add(rust_lang()));
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from("/test/src/lib.rs"),
+                    OpenOptions {
+                        visible: Some(OpenVisible::All),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(500));
+        cx.run_until_parked();
+
+        outline_panel.update_in(cx, |panel, window, cx| {
+            panel.update_non_fs_items(window, cx);
+            panel.update_cached_entries(Some(UPDATE_DEBOUNCE), window, cx);
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(500));
+        cx.run_until_parked();
+
+        let root_outline = outline_panel.read_with(cx, |panel, _cx| {
+            panel
+                .cached_entries
+                .first()
+                .map(|entry| entry.entry.clone())
+                .expect("Expected the top-level outline to be cached")
+        });
+
+        outline_panel.update_in(cx, |panel, window, cx| {
+            panel.collapse_selected_entry(&CollapseSelectedEntry, window, cx);
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        outline_panel.update_in(cx, |panel, window, cx| {
+            panel.expand_single_level(&root_outline, window, cx);
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        outline_panel.update(cx, |panel, cx| {
+            assert_eq!(
+                display_entries(
+                    &project,
+                    &snapshot(panel, cx),
+                    &panel.cached_entries,
+                    panel.selected_entry(),
+                    cx,
+                ),
+                indoc!(
+                    "
+outline: mod outer  <==== selected
+  outline: pub struct OuterStruct
+  outline: impl OuterStruct
+  outline: mod inner
+outline: fn main"
+                )
+            );
         });
     }
 
