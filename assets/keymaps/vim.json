@@ -1023,6 +1023,7 @@
       "g g": "menu::SelectFirst",
       "shift-g": "menu::SelectLast",
       "g f": "menu::Confirm",
+      "g space": "workspace::Open",
       "i": "git_panel::FocusEditor",
       "x": "git::ToggleStaged",
       "shift-x": "git::StageAll",

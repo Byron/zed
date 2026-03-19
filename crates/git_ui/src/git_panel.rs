@@ -971,14 +971,17 @@ impl GitPanel {
         cx.notify();
     }
 
+    fn changes_list_focused(&self, window: &mut Window, cx: &Context<Self>) -> bool {
+        window
+            .focused(cx)
+            .is_some_and(|focused| self.focus_handle == focused)
+    }
+
     fn dispatch_context(&self, window: &mut Window, cx: &Context<Self>) -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("GitPanel");
 
-        if window
-            .focused(cx)
-            .is_some_and(|focused| self.focus_handle == focused)
-        {
+        if self.changes_list_focused(window, cx) {
             dispatch_context.add("menu");
             dispatch_context.add("ChangesList");
         }
@@ -1329,66 +1332,96 @@ impl GitPanel {
         });
     }
 
+    fn open_selected_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected_entry) = self.selected_entry else {
+            return;
+        };
+        let Some(entry) = self
+            .entries
+            .get(selected_entry)
+            .and_then(|entry| entry.status_entry())
+        else {
+            return;
+        };
+        let Some(active_repo) = self.active_repository.as_ref() else {
+            return;
+        };
+        let Some(path) = active_repo
+            .read(cx)
+            .repo_path_to_project_path(&entry.repo_path, cx)
+        else {
+            return;
+        };
+        if entry.status.is_deleted() {
+            return;
+        }
+
+        let Some(open_task) = self
+            .workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_path_preview(path, None, false, false, true, window, cx)
+            })
+            .ok()
+        else {
+            return;
+        };
+
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, mut cx| {
+            let item = open_task
+                .await
+                .notify_workspace_async_err(workspace, &mut cx)
+                .ok_or_else(|| anyhow::anyhow!("Failed to open file"))?;
+            if let Some(active_editor) = item.downcast::<Editor>() {
+                if let Some(diff_task) =
+                    active_editor.update(cx, |editor, _cx| editor.wait_for_diff_to_load())
+                {
+                    diff_task.await;
+                }
+
+                cx.update(|window, cx| {
+                    active_editor.update(cx, |editor, cx| {
+                        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+
+                        let snapshot = editor.snapshot(window, cx);
+                        editor.go_to_hunk_before_or_after_position(
+                            &snapshot,
+                            language::Point::new(0, 0),
+                            Direction::Next,
+                            true,
+                            window,
+                            cx,
+                        );
+                    })
+                })
+                .log_err();
+            }
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
     fn open_file(
         &mut self,
         _: &menu::SecondaryConfirm,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        maybe!({
-            let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
-            let active_repo = self.active_repository.as_ref()?;
-            let path = active_repo
-                .read(cx)
-                .repo_path_to_project_path(&entry.repo_path, cx)?;
-            if entry.status.is_deleted() {
-                return None;
-            }
+        self.open_selected_file(window, cx);
+    }
 
-            let open_task = self
-                .workspace
-                .update(cx, |workspace, cx| {
-                    workspace.open_path_preview(path, None, false, false, true, window, cx)
-                })
-                .ok()?;
-
-            let workspace = self.workspace.clone();
-            cx.spawn_in(window, async move |_, mut cx| {
-                let item = open_task
-                    .await
-                    .notify_workspace_async_err(workspace, &mut cx)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to open file"))?;
-                if let Some(active_editor) = item.downcast::<Editor>() {
-                    if let Some(diff_task) =
-                        active_editor.update(cx, |editor, _cx| editor.wait_for_diff_to_load())
-                    {
-                        diff_task.await;
-                    }
-
-                    cx.update(|window, cx| {
-                        active_editor.update(cx, |editor, cx| {
-                            editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
-
-                            let snapshot = editor.snapshot(window, cx);
-                            editor.go_to_hunk_before_or_after_position(
-                                &snapshot,
-                                language::Point::new(0, 0),
-                                Direction::Next,
-                                true,
-                                window,
-                                cx,
-                            );
-                        })
-                    })
-                    .log_err();
-                }
-
-                anyhow::Ok(())
-            })
-            .detach();
-
-            Some(())
-        });
+    fn open_workspace_file(
+        &mut self,
+        _: &workspace::Open,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.changes_list_focused(window, cx) {
+            self.open_selected_file(window, cx);
+        } else {
+            cx.propagate();
+        }
     }
 
     fn revert_selected(
@@ -5688,6 +5721,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::close_panel))
             .on_action(cx.listener(Self::open_diff))
             .on_action(cx.listener(Self::open_file))
+            .on_action(cx.listener(Self::open_workspace_file))
             .on_action(cx.listener(Self::file_history))
             .on_action(cx.listener(Self::focus_changes_list))
             .on_action(cx.listener(Self::focus_editor))
@@ -6481,11 +6515,12 @@ fn format_git_error_toast_message(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use editor::Editor;
     use git::{
         repository::repo_path,
         status::{StatusCode, UnmergedStatus, UnmergedStatusCode},
     };
-    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
+    use gpui::{Entity, TestAppContext, UpdateGlobal, VisualTestContext};
     use indoc::indoc;
     use project::FakeFs;
     use serde_json::json;
@@ -7338,6 +7373,64 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_workspace_open_opens_selected_git_file_when_changes_list_is_focused(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "context\nnew tracked\n",
+            }),
+        )
+        .await;
+
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "context\nold tracked\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        })
+        .await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.focus_changes_list(&FocusChanges, window, cx);
+            assert!(panel.changes_list_focused(window, cx));
+            let selected_entry = panel
+                .get_selected_entry()
+                .and_then(|entry| entry.status_entry())
+                .expect("focused changes list should select the tracked file");
+            assert_eq!(selected_entry.repo_path, repo_path("tracked"));
+            panel.open_workspace_file(&workspace::Open::default(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let active_editor = workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<Editor>(cx))
+            .unwrap();
+        assert_eq!(selected_row_text(&active_editor, cx), "old tracked");
+    }
+
+    #[gpui::test]
     async fn test_tree_view_reveals_collapsed_parent_on_select_entry_by_path(
         cx: &mut TestAppContext,
     ) {
@@ -7870,5 +7963,31 @@ mod tests {
         // "Update tracked"
         let message = panel.update(cx, |panel, cx| panel.suggest_commit_message(cx));
         assert_eq!(message, Some("Update tracked".to_string()));
+    }
+
+    fn selected_row_text(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                let selections =
+                    editor.selections.all::<language::Point>(&editor.display_snapshot(cx));
+                assert_eq!(
+                    selections.len(),
+                    1,
+                    "Active editor should have exactly one selection after opening a git panel file"
+                );
+                let selection = selections.first().expect("selection should exist");
+                let multi_buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+                let line_start = language::Point::new(selection.start.row, 0);
+                let line_end = multi_buffer_snapshot.clip_point(
+                    language::Point::new(selection.end.row, u32::MAX),
+                    language::Bias::Right,
+                );
+                multi_buffer_snapshot
+                    .text_for_range(line_start..line_end)
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+        })
     }
 }
