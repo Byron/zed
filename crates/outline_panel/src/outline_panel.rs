@@ -1170,6 +1170,14 @@ impl OutlinePanel {
         }
     }
 
+    fn open_file(&mut self, _: &workspace::Open, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_editor.focus_handle(cx).is_focused(window) {
+            cx.propagate()
+        } else if let Some(selected_entry) = self.selected_entry().cloned() {
+            self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
+        }
+    }
+
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter_editor.focus_handle(cx).is_focused(window) {
             self.focus_handle.focus(window, cx);
@@ -1194,6 +1202,7 @@ impl OutlinePanel {
         } else if let Some((active_editor, selected_entry)) =
             self.active_editor().zip(self.selected_entry().cloned())
         {
+            self.select_excerpt_entry_in_editor(&selected_entry, &active_editor, window, cx);
             self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
             active_editor.update(cx, |editor, cx| editor.open_excerpts(action, window, cx));
         }
@@ -1210,9 +1219,37 @@ impl OutlinePanel {
         } else if let Some((active_editor, selected_entry)) =
             self.active_editor().zip(self.selected_entry().cloned())
         {
+            self.select_excerpt_entry_in_editor(&selected_entry, &active_editor, window, cx);
             self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
             active_editor.update(cx, |editor, cx| {
                 editor.open_excerpts_in_split(action, window, cx)
+            });
+        }
+    }
+
+    fn select_excerpt_entry_in_editor(
+        &self,
+        entry: &PanelEntry,
+        active_editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) = entry else {
+            return;
+        };
+        let anchor = {
+            let active_multi_buffer = active_editor.read(cx).buffer().clone();
+            let multi_buffer_snapshot = active_multi_buffer.read(cx).snapshot(cx);
+            multi_buffer_snapshot.anchor_in_excerpt(excerpt.id, excerpt.range.context.start)
+        };
+        if let Some(anchor) = anchor {
+            active_editor.update(cx, |editor, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |s| s.select_ranges(Some(anchor..anchor)),
+                );
             });
         }
     }
@@ -5489,6 +5526,7 @@ impl Render for OutlinePanel {
             .overflow_hidden()
             .relative()
             .key_context(self.dispatch_context(window, cx))
+            .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::open_selected_entry))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::scroll_up))
@@ -7513,6 +7551,175 @@ outline: struct OutlineEntryExcerpt
                 })
                 .collect::<Vec<_>>();
             assert_eq!(visible_outlines, vec![("fn visible_child".to_string(), 0)]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_file_jumps_to_excerpt_start_line(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let root = path!("/root");
+        let base_text = indoc! {"
+            fn hidden_before() {
+                let before = 1;
+            }
+
+            mod outer {
+
+                fn visible_child() {
+                    let value = 1;
+                }
+            }
+
+            fn hidden_after() {
+                let after = 1;
+            }
+        "};
+        let current_text = base_text.replace("let value = 1;", "let value = 2;");
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            root,
+            json!({
+                "src": {
+                    "lib.rs": current_text,
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
+        project.read_with(cx, |project, _| project.languages().add(rust_lang()));
+
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+
+        let diff_editor = add_diff_editor(
+            &workspace,
+            &project,
+            PathBuf::from(path!("/root/src/lib.rs")),
+            base_text,
+            1,
+            cx,
+        )
+        .await;
+
+        settle_outline_panel(cx);
+
+        let excerpt_entry = outline_panel.read_with(cx, |outline_panel, _| {
+            outline_panel
+                .cached_entries
+                .iter()
+                .find_map(|entry| match &entry.entry {
+                    PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => Some(excerpt.clone()),
+                    _ => None,
+                })
+                .expect("Expected diff editor to produce an excerpt row")
+        });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_entry(
+                PanelEntry::Outline(OutlineEntry::Excerpt(excerpt_entry.clone())),
+                true,
+                window,
+                cx,
+            );
+            outline_panel.open_file(&workspace::Open::default(), window, cx);
+        });
+
+        outline_panel.update(cx, |_outline_panel, cx| {
+            assert_eq!(selected_row_text(&diff_editor, cx), "fn visible_child() {");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_excerpts_jumps_to_excerpt_start_line(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let root = path!("/root");
+        let base_text = indoc! {"
+            fn hidden_before() {
+                let before = 1;
+            }
+
+            mod outer {
+
+                fn visible_child() {
+                    let value = 1;
+                }
+            }
+
+            fn hidden_after() {
+                let after = 1;
+            }
+        "};
+        let current_text = base_text.replace("let value = 1;", "let value = 2;");
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            root,
+            json!({
+                "src": {
+                    "lib.rs": current_text,
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
+        project.read_with(cx, |project, _| project.languages().add(rust_lang()));
+
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+
+        let diff_editor = add_diff_editor(
+            &workspace,
+            &project,
+            PathBuf::from(path!("/root/src/lib.rs")),
+            base_text,
+            1,
+            cx,
+        )
+        .await;
+
+        settle_outline_panel(cx);
+
+        let excerpt_entry = outline_panel.read_with(cx, |outline_panel, _| {
+            outline_panel
+                .cached_entries
+                .iter()
+                .find_map(|entry| match &entry.entry {
+                    PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => Some(excerpt.clone()),
+                    _ => None,
+                })
+                .expect("Expected diff editor to produce an excerpt row")
+        });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_entry(
+                PanelEntry::Outline(OutlineEntry::Excerpt(excerpt_entry.clone())),
+                true,
+                window,
+                cx,
+            );
+            outline_panel.open_excerpts(&editor::actions::OpenExcerpts, window, cx);
+        });
+        cx.run_until_parked();
+
+        let opened_editor = workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<Editor>(cx))
+            .unwrap();
+        assert_ne!(opened_editor, diff_editor);
+        cx.update(|_, cx| {
+            assert_eq!(selected_row_text(&opened_editor, cx), "fn visible_child() {");
         });
     }
 
