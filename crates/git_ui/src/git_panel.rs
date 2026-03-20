@@ -455,6 +455,7 @@ impl TreeViewState {
                     name,
                     depth,
                     expanded,
+                    diff_stat: Self::aggregate_diff_stat(&child_statuses),
                 }),
                 true,
             ));
@@ -480,6 +481,33 @@ impl TreeViewState {
         }
 
         (flattened, all_statuses)
+    }
+
+    fn aggregate_diff_stat(entries: &[GitStatusEntry]) -> Option<DiffStat> {
+        let mut saw_diff_stat = false;
+        let mut diff_stat = DiffStat::default();
+
+        for entry in entries {
+            let Some(entry_diff_stat) = entry.diff_stat else {
+                continue;
+            };
+            saw_diff_stat = true;
+            diff_stat.added += entry_diff_stat.added;
+            diff_stat.deleted += entry_diff_stat.deleted;
+        }
+
+        saw_diff_stat.then_some(diff_stat)
+    }
+
+    fn collapse_descendant_directories(&mut self, key: &TreeKey) {
+        for (descendant_key, expanded) in &mut self.expanded_dirs {
+            if descendant_key.section == key.section
+                && descendant_key.path != key.path
+                && descendant_key.path.starts_with(&key.path)
+            {
+                *expanded = false;
+            }
+        }
     }
 
     fn compact_directory_chain(mut node: &TreeNode) -> (&TreeNode, SharedString) {
@@ -518,6 +546,7 @@ struct GitTreeDirEntry {
     depth: usize,
     // staged_state: ToggleState,
     expanded: bool,
+    diff_stat: Option<DiffStat>,
 }
 
 #[derive(Default)]
@@ -3429,9 +3458,26 @@ impl GitPanel {
     }
 
     fn toggle_directory(&mut self, key: &TreeKey, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_directory_with_depth(key, false, window, cx);
+    }
+
+    fn toggle_directory_with_depth(
+        &mut self,
+        key: &TreeKey,
+        shallow_open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(state) = self.view_mode.tree_state_mut() {
-            let expanded = state.expanded_dirs.entry(key.clone()).or_insert(true);
-            *expanded = !*expanded;
+            let is_expanded = *state.expanded_dirs.entry(key.clone()).or_insert(true);
+            if is_expanded {
+                state.expanded_dirs.insert(key.clone(), false);
+            } else {
+                if shallow_open {
+                    state.collapse_descendant_directories(key);
+                }
+                state.expanded_dirs.insert(key.clone(), true);
+            }
             self.update_visible_entries(window, cx);
         } else {
             util::debug_panic!("Attempted to toggle directory in flat Git Panel state");
@@ -5337,6 +5383,7 @@ impl GitPanel {
             ElementId::Name(format!("dir_checkbox_{}_{}", entry.name, ix).into());
         let checkbox_wrapper_id: ElementId =
             ElementId::Name(format!("dir_checkbox_wrapper_{}_{}", entry.name, ix).into());
+        let id_for_diff_stat = format!("dir_{}_{}", entry.name, ix);
 
         let selected_bg_alpha = 0.08;
         let state_opacity_step = 0.04;
@@ -5395,6 +5442,7 @@ impl GitPanel {
 
         let name_row = h_flex()
             .min_w_0()
+            .flex_1()
             .gap_1()
             .pl(px(entry.depth as f32 * TREE_INDENT))
             .child(
@@ -5420,7 +5468,6 @@ impl GitPanel {
             .pl_3()
             .pr_1()
             .gap_1p5()
-            .justify_between()
             .border_1()
             .border_r_2()
             .when(selected && self.focus_handle.is_focused(window), |el| {
@@ -5430,6 +5477,16 @@ impl GitPanel {
             .hover(|s| s.bg(hover_bg))
             .active(|s| s.bg(active_bg))
             .child(name_row)
+            .when(GitPanelSettings::get_global(cx).diff_stats, |el| {
+                el.when_some(entry.diff_stat, move |this, stat| {
+                    let id = format!("diff-stat-dir-{}", id_for_diff_stat);
+                    this.child(ui::DiffStat::new(
+                        id,
+                        stat.added as usize,
+                        stat.deleted as usize,
+                    ))
+                })
+            })
             .child(
                 div()
                     .id(checkbox_wrapper_id)
@@ -5470,9 +5527,9 @@ impl GitPanel {
             )
             .on_click({
                 let key = entry.key.clone();
-                cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.selected_entry = Some(ix);
-                    this.toggle_directory(&key, window, cx);
+                    this.toggle_directory_with_depth(&key, event.modifiers().alt, window, cx);
                 })
             })
             .into_any_element()
@@ -7552,6 +7609,240 @@ mod tests {
                 .and_then(|entry| entry.status_entry())
                 .expect("selected entry should be a status entry");
             assert_eq!(selected_entry.repo_path, repo_path("src/a/foo.rs"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tree_view_alt_toggle_directory_opens_one_level(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "src": {
+                    "nested": {
+                        "deep.rs": "fn deep() {}",
+                    },
+                    "other": {
+                        "peer.rs": "fn peer() {}",
+                    },
+                },
+            }),
+        )
+        .await;
+
+        fs.set_status_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("src/nested/deep.rs", StatusCode::Modified.worktree()),
+                ("src/other/peer.rs", StatusCode::Modified.worktree()),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+
+        cx.executor().run_until_parked();
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().tree_view = Some(true);
+                })
+            });
+        });
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        let src_key = panel.read_with(cx, |panel, _| {
+            panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir) if dir.key.path == repo_path("src") => {
+                        Some(dir.key.clone())
+                    }
+                    _ => None,
+                })
+                .expect("src directory should exist in tree view")
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_directory(&src_key, window, cx);
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_directory_with_depth(&src_key, true, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel
+                .view_mode
+                .tree_state()
+                .expect("tree view state should exist");
+            assert_eq!(state.expanded_dirs.get(&src_key).copied(), Some(true));
+
+            let nested_directory = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir) if dir.key.path == repo_path("src/nested") => {
+                        Some(dir)
+                    }
+                    _ => None,
+                })
+                .expect("nested directory should be visible after shallow open");
+            assert!(!nested_directory.expanded);
+
+            assert!(
+                state
+                    .logical_indices
+                    .iter()
+                    .all(|index| panel.entries[*index].status_entry().is_none()),
+                "shallow open should not reveal files below nested directories",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tree_view_directory_aggregates_diff_stats_when_collapsed(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "src": {
+                    "a": {
+                        "foo.rs": "fn foo() {}",
+                    },
+                    "b": {
+                        "bar.rs": "fn bar() {}",
+                    },
+                },
+            }),
+        )
+        .await;
+
+        fs.set_status_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("src/a/foo.rs", StatusCode::Modified.worktree()),
+                ("src/b/bar.rs", StatusCode::Modified.worktree()),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+
+        cx.executor().run_until_parked();
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().tree_view = Some(true);
+                })
+            });
+        });
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        let src_key = panel.read_with(cx, |panel, _| {
+            let src_directory = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir) if dir.key.path == repo_path("src") => Some(dir),
+                    _ => None,
+                })
+                .expect("src directory should exist in tree view");
+
+            assert_eq!(
+                src_directory.diff_stat,
+                Some(DiffStat {
+                    added: 2,
+                    deleted: 2,
+                })
+            );
+
+            src_directory.key.clone()
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_directory(&src_key, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let src_directory = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir) if dir.key.path == repo_path("src") => Some(dir),
+                    _ => None,
+                })
+                .expect("collapsed src directory should remain visible");
+
+            assert!(!src_directory.expanded);
+            assert_eq!(
+                src_directory.diff_stat,
+                Some(DiffStat {
+                    added: 2,
+                    deleted: 2,
+                })
+            );
         });
     }
 
