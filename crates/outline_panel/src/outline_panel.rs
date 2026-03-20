@@ -1179,16 +1179,12 @@ impl OutlinePanel {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_editor.focus_handle(cx).is_focused(window) {
-            self.focus_handle.focus(window, cx);
-        } else {
-            self.filter_editor.focus_handle(cx).focus(window, cx);
-        }
-
         if self.context_menu.is_some() {
             self.context_menu.take();
             cx.notify();
         }
+
+        self.focus_active_editor(window, cx);
     }
 
     fn open_excerpts(
@@ -1202,7 +1198,6 @@ impl OutlinePanel {
         } else if let Some((active_editor, selected_entry)) =
             self.active_editor().zip(self.selected_entry().cloned())
         {
-            self.select_excerpt_entry_in_editor(&selected_entry, &active_editor, window, cx);
             self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
             active_editor.update(cx, |editor, cx| editor.open_excerpts(action, window, cx));
         }
@@ -1219,37 +1214,9 @@ impl OutlinePanel {
         } else if let Some((active_editor, selected_entry)) =
             self.active_editor().zip(self.selected_entry().cloned())
         {
-            self.select_excerpt_entry_in_editor(&selected_entry, &active_editor, window, cx);
             self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
             active_editor.update(cx, |editor, cx| {
                 editor.open_excerpts_in_split(action, window, cx)
-            });
-        }
-    }
-
-    fn select_excerpt_entry_in_editor(
-        &self,
-        entry: &PanelEntry,
-        active_editor: &Entity<Editor>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) = entry else {
-            return;
-        };
-        let anchor = {
-            let active_multi_buffer = active_editor.read(cx).buffer().clone();
-            let multi_buffer_snapshot = active_multi_buffer.read(cx).snapshot(cx);
-            multi_buffer_snapshot.anchor_in_excerpt(excerpt.id, excerpt.range.context.start)
-        };
-        if let Some(anchor) = anchor {
-            active_editor.update(cx, |editor, cx| {
-                editor.change_selections(
-                    SelectionEffects::scroll(Autoscroll::center()),
-                    window,
-                    cx,
-                    |s| s.select_ranges(Some(anchor..anchor)),
-                );
             });
         }
     }
@@ -1318,7 +1285,6 @@ impl OutlinePanel {
                 }),
             PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => {
                 change_selection = false;
-                change_focus = false;
                 multi_buffer_snapshot.anchor_in_excerpt(excerpt.id, excerpt.range.context.start)
             }
             PanelEntry::Search(search_entry) => Some(search_entry.match_range.start),
@@ -1369,6 +1335,18 @@ impl OutlinePanel {
                     self.focus_handle.focus(window, cx);
                 }
             }
+        }
+    }
+
+    fn focus_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active_item) = self.active_item() {
+            let _ = self.workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(active_item.as_ref(), true, true, window, cx);
+            });
+        } else if let Some(active_editor) = self.active_editor() {
+            active_editor.focus_handle(cx).focus(window, cx);
+        } else if self.filter_editor.focus_handle(cx).is_focused(window) {
+            self.focus_handle.focus(window, cx);
         }
     }
 
@@ -7720,6 +7698,64 @@ outline: struct OutlineEntryExcerpt
         assert_ne!(opened_editor, diff_editor);
         cx.update(|_, cx| {
             assert_eq!(selected_row_text(&opened_editor, cx), "fn visible_child() {");
+        });
+        opened_editor.update_in(cx, |editor, window, cx| {
+            assert!(editor.focus_handle(cx).is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cancel_focuses_active_editor(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let root = path!("/root");
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            root,
+            json!({
+                "src": {
+                    "lib.rs": "fn main() {}\n",
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from(path!("/root/src/lib.rs")),
+                    OpenOptions {
+                        visible: Some(OpenVisible::All),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("Failed to open source file")
+            .downcast::<Editor>()
+            .expect("Should open an editor for the source file");
+
+        let outline_panel = outline_panel(&workspace, cx);
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx);
+        });
+        settle_outline_panel(cx);
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.focus_handle.focus(window, cx);
+            assert!(outline_panel.focus_handle.is_focused(window));
+            outline_panel.cancel(&Cancel, window, cx);
+        });
+        cx.run_until_parked();
+
+        editor.update_in(cx, |editor, window, cx| {
+            assert!(editor.focus_handle(cx).is_focused(window));
         });
     }
 
