@@ -7,6 +7,8 @@ mod settings_file;
 mod settings_store;
 mod vscode_import;
 
+use crate as settings;
+
 pub use settings_macros::RegisterSetting;
 
 pub mod settings_content {
@@ -27,7 +29,7 @@ use gpui::{App, Global};
 
 use rust_embed::RustEmbed;
 use std::env;
-use std::{borrow::Cow, fmt, str};
+use std::{borrow::Cow, fmt, str, time::Duration};
 use util::asset_str;
 
 pub use ::settings_content::*;
@@ -57,6 +59,19 @@ pub use keymap_file::ActionSequence;
 pub struct ActiveSettingsProfileName(pub String);
 
 impl Global for ActiveSettingsProfileName {}
+
+#[derive(Debug, Clone, Copy, RegisterSetting)]
+pub struct MultiKeystrokeTimeout {
+    pub timeout: Duration,
+}
+
+impl Settings for MultiKeystrokeTimeout {
+    fn from_settings(content: &SettingsContent) -> Self {
+        Self {
+            timeout: Duration::from_millis(content.multi_keystroke_timeout_ms.unwrap()),
+        }
+    }
+}
 
 pub trait UserSettingsContentExt {
     fn for_profile(&self, cx: &App) -> Option<&SettingsContent>;

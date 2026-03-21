@@ -26,6 +26,10 @@
   // 5. "SublimeText"
   // 6. "TextMate"
   "base_keymap": "VSCode",
+  // Delay in milliseconds before pending multi-stroke keybindings are replayed
+  // as standalone input.
+  // Set to 0 to replay pending keystrokes immediately.
+  "multi_keystroke_timeout_ms": 1000,
   // The name of a font to use for rendering text in the editor
   // ".ZedMono" currently aliases to Lilex
   // but this may change in the future.

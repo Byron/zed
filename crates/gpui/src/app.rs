@@ -68,6 +68,8 @@ mod visual_test_context;
 
 /// The duration for which futures returned from [Context::on_app_quit] can run before the application fully quits.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+/// The default delay before pending multi-stroke keybindings are replayed as standalone input.
+pub const DEFAULT_PENDING_KEYSTROKE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
 /// Strongly consider removing after stabilization.
@@ -644,11 +646,11 @@ pub struct App {
     #[cfg(any(test, feature = "test-support", debug_assertions))]
     pub(crate) name: Option<&'static str>,
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
-
     pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) mode: GpuiMode,
     flushing_effects: bool,
     pending_updates: usize,
+    pending_keystroke_timeout: Duration,
     quit_mode: QuitMode,
     quitting: bool,
 
@@ -686,6 +688,7 @@ impl App {
                 platform: platform.clone(),
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
+                pending_keystroke_timeout: DEFAULT_PENDING_KEYSTROKE_TIMEOUT,
                 mode: GpuiMode::Production,
                 actions: Rc::new(ActionRegistry::default()),
                 flushing_effects: false,
@@ -1190,6 +1193,16 @@ impl App {
     /// Returns the current text rendering mode for the application.
     pub fn text_rendering_mode(&self) -> TextRenderingMode {
         self.text_rendering_mode.get()
+    }
+
+    /// Sets how long pending multi-stroke keybindings wait for the next keystroke.
+    pub fn set_pending_keystroke_timeout(&mut self, timeout: Duration) {
+        self.pending_keystroke_timeout = timeout;
+    }
+
+    /// Returns how long pending multi-stroke keybindings wait for the next keystroke.
+    pub fn pending_keystroke_timeout(&self) -> Duration {
+        self.pending_keystroke_timeout
     }
 
     /// Writes data to the platform clipboard.

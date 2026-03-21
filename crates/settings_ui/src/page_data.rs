@@ -1291,6 +1291,25 @@ fn keymap_page() -> SettingsPage {
         ]
     }
 
+    fn multi_stroke_bindings_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Multi-Stroke Bindings"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Timeout (milliseconds)",
+                description: "How long to wait for the next key in a multi-stroke binding before replaying the pending keys.",
+                field: Box::new(SettingField {
+                    json_path: Some("multi_keystroke_timeout_ms"),
+                    pick: |settings_content| settings_content.multi_keystroke_timeout_ms.as_ref(),
+                    write: |settings_content, value| {
+                        settings_content.multi_keystroke_timeout_ms = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     fn modal_editing_section() -> [SettingsPageItem; 3] {
         [
             SettingsPageItem::SectionHeader("Modal Editing"),
@@ -1327,6 +1346,7 @@ fn keymap_page() -> SettingsPage {
 
     let items: Box<[SettingsPageItem]> = concat_sections!(
         keybindings_section(),
+        multi_stroke_bindings_section(),
         base_keymap_section(),
         modal_editing_section(),
     );

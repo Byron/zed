@@ -40,7 +40,7 @@ use proto;
 use recent_projects::{RemoteSettings, open_remote_project};
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
-use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
+use settings::{BaseKeymap, MultiKeystrokeTimeout, Settings, SettingsStore, watch_config_file};
 use std::{
     cell::RefCell,
     env,
@@ -753,10 +753,13 @@ fn main() {
         #[cfg(target_os = "windows")]
         etw_tracing::init(cx);
 
+        cx.set_pending_keystroke_timeout(MultiKeystrokeTimeout::get_global(cx).timeout);
         cx.observe_global::<SettingsStore>({
             let http = app_state.client.http_client();
             let client = app_state.client.clone();
             move |cx| {
+                cx.set_pending_keystroke_timeout(MultiKeystrokeTimeout::get_global(cx).timeout);
+
                 for &mut window in cx.windows().iter_mut() {
                     let background_appearance = cx.theme().window_background_appearance();
                     window

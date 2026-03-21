@@ -125,6 +125,13 @@ pub struct SettingsContent {
     /// Default: VSCode
     pub base_keymap: Option<BaseKeymapContent>,
 
+    /// Delay in milliseconds before pending multi-stroke keybindings are replayed as standalone
+    /// input.
+    /// Set to `0` to replay pending keystrokes immediately.
+    ///
+    /// Default: 1000
+    pub multi_keystroke_timeout_ms: Option<u64>,
+
     /// Configuration for the collab panel visual settings.
     pub collaboration_panel: Option<PanelSettingsContent>,
 
