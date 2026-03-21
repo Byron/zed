@@ -234,7 +234,13 @@ const TREE_INDENT: f32 = 16.0;
 
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-        workspace.toggle_panel_focus::<GitPanel>(window, cx);
+        if workspace.toggle_panel_focus::<GitPanel>(window, cx)
+            && let Some(panel) = workspace.panel::<GitPanel>(cx)
+        {
+            panel.update(cx, |panel, cx| {
+                panel.request_focus_changes_list(window, cx);
+            });
+        }
     });
     workspace.register_action(|workspace, _: &Toggle, window, cx| {
         if !workspace.toggle_panel_focus::<GitPanel>(window, cx) {
@@ -368,10 +374,16 @@ struct TreeViewState {
     // This is needed because some entries (like collapsed directories) may be hidden.
     logical_indices: Vec<usize>,
     expanded_dirs: HashMap<TreeKey, bool>,
+    temporarily_collapsed_dirs: HashSet<TreeKey>,
     directory_descendants: HashMap<TreeKey, Vec<GitStatusEntry>>,
 }
 
 impl TreeViewState {
+    fn directory_is_expanded(&self, key: &TreeKey) -> bool {
+        *self.expanded_dirs.get(key).unwrap_or(&true)
+            && !self.temporarily_collapsed_dirs.contains(key)
+    }
+
     fn build_tree_entries(
         &mut self,
         section: Section,
@@ -442,8 +454,8 @@ impl TreeViewState {
             let (child_flattened, mut child_statuses) =
                 self.flatten_tree(terminal, section, depth + 1, seen_directories);
             let key = TreeKey { section, path };
-            let expanded = *self.expanded_dirs.get(&key).unwrap_or(&true);
             self.expanded_dirs.entry(key.clone()).or_insert(true);
+            let expanded = self.directory_is_expanded(&key);
             seen_directories.insert(key.clone());
 
             self.directory_descendants
@@ -500,14 +512,24 @@ impl TreeViewState {
     }
 
     fn collapse_descendant_directories(&mut self, key: &TreeKey) {
-        for (descendant_key, expanded) in &mut self.expanded_dirs {
-            if descendant_key.section == key.section
+        self.clear_temporary_collapsed_descendants(key);
+
+        for (descendant_key, expanded) in &self.expanded_dirs {
+            if *expanded
+                && descendant_key.section == key.section
                 && descendant_key.path != key.path
                 && descendant_key.path.starts_with(&key.path)
             {
-                *expanded = false;
+                self.temporarily_collapsed_dirs
+                    .insert(descendant_key.clone());
             }
         }
+    }
+
+    fn clear_temporary_collapsed_descendants(&mut self, key: &TreeKey) {
+        self.temporarily_collapsed_dirs.retain(|descendant_key| {
+            descendant_key.section != key.section || !descendant_key.path.starts_with(&key.path)
+        });
     }
 
     fn compact_directory_chain(mut node: &TreeNode) -> (&TreeNode, SharedString) {
@@ -670,6 +692,7 @@ pub struct GitPanel {
     scroll_handle: UniformListScrollHandle,
     max_width_item_index: Option<usize>,
     selected_entry: Option<usize>,
+    pending_focus_changes_list: bool,
     marked_entries: Vec<usize>,
     tracked_count: usize,
     tracked_staged_count: usize,
@@ -857,6 +880,7 @@ impl GitPanel {
                 scroll_handle,
                 max_width_item_index: None,
                 selected_entry: None,
+                pending_focus_changes_list: false,
                 marked_entries: Vec::new(),
                 tracked_count: 0,
                 tracked_staged_count: 0,
@@ -925,7 +949,11 @@ impl GitPanel {
                 };
 
                 if tree_state.expanded_dirs.get(&key) == Some(&false) {
-                    tree_state.expanded_dirs.insert(key, true);
+                    tree_state.expanded_dirs.insert(key.clone(), true);
+                    needs_rebuild = true;
+                }
+
+                if tree_state.temporarily_collapsed_dirs.remove(&key) {
                     needs_rebuild = true;
                 }
 
@@ -1305,6 +1333,31 @@ impl GitPanel {
     ) {
         self.focus_handle.focus(window, cx);
         self.select_first_entry_if_none(window, cx);
+    }
+
+    fn request_focus_changes_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_focus_changes_list = true;
+        self.focus_changes_list_if_needed(window, cx);
+    }
+
+    fn panel_has_focus(&self, window: &mut Window, cx: &Context<Self>) -> bool {
+        self.changes_list_focused(window, cx) || self.commit_editor.read(cx).is_focused(window)
+    }
+
+    fn focus_changes_list_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pending_focus_changes_list {
+            return;
+        }
+
+        if self.entries.is_empty() {
+            return;
+        }
+
+        self.pending_focus_changes_list = false;
+
+        if self.panel_has_focus(window, cx) {
+            self.focus_changes_list(&FocusChanges, window, cx);
+        }
     }
 
     fn get_selected_entry(&self) -> Option<&GitListEntry> {
@@ -3469,12 +3522,15 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         if let Some(state) = self.view_mode.tree_state_mut() {
-            let is_expanded = *state.expanded_dirs.entry(key.clone()).or_insert(true);
+            let is_expanded = state.directory_is_expanded(key);
             if is_expanded {
+                state.clear_temporary_collapsed_descendants(key);
                 state.expanded_dirs.insert(key.clone(), false);
             } else {
                 if shallow_open {
                     state.collapse_descendant_directories(key);
+                } else {
+                    state.clear_temporary_collapsed_descendants(key);
                 }
                 state.expanded_dirs.insert(key.clone(), true);
             }
@@ -3770,6 +3826,9 @@ impl GitPanel {
                 tree_state
                     .expanded_dirs
                     .retain(|key, _| seen_directories.contains(key));
+                tree_state
+                    .temporarily_collapsed_dirs
+                    .retain(|key| seen_directories.contains(key));
                 self.view_mode = GitPanelViewMode::Tree(tree_state);
             }
             GitPanelViewMode::Flat => {
@@ -3814,6 +3873,7 @@ impl GitPanel {
         }
 
         self.select_first_entry_if_none(window, cx);
+        self.focus_changes_list_if_needed(window, cx);
 
         let suggested_commit_message = self.suggest_commit_message(cx);
         let placeholder_text = suggested_commit_message.unwrap_or("Enter commit message".into());
@@ -6602,6 +6662,13 @@ mod tests {
         });
     }
 
+    fn request_git_panel_changes_focus(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) {
+        panel.update_in(cx, |panel, window, cx| {
+            panel.focus_editor(&FocusEditor, window, cx);
+            panel.request_focus_changes_list(window, cx);
+        });
+    }
+
     #[test]
     fn test_format_git_error_toast_message_prefers_raw_rpc_message() {
         let rpc_error = RpcError::from_proto(
@@ -7488,6 +7555,115 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_toggle_focus_request_selects_first_entry_when_entries_are_loaded(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "context\nnew tracked\n",
+            }),
+        )
+        .await;
+
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "context\nold tracked\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        })
+        .await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        request_git_panel_changes_focus(&panel, cx);
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, _window, _cx| {
+            assert!(!panel.pending_focus_changes_list);
+            let selected_entry = panel
+                .get_selected_entry()
+                .and_then(|entry| entry.status_entry())
+                .expect("focused changes list should select the tracked file");
+            assert_eq!(selected_entry.repo_path, repo_path("tracked"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_toggle_focus_request_is_consumed_after_entries_load(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "context\nnew tracked\n",
+            }),
+        )
+        .await;
+
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "context\nold tracked\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        request_git_panel_changes_focus(&panel, cx);
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, _window, _cx| {
+            assert!(panel.pending_focus_changes_list);
+        });
+
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        panel.update_in(cx, |panel, _window, _cx| {
+            assert!(!panel.pending_focus_changes_list);
+            let selected_entry = panel
+                .get_selected_entry()
+                .and_then(|entry| entry.status_entry())
+                .expect("focused changes list should select the tracked file");
+            assert_eq!(selected_entry.repo_path, repo_path("tracked"));
+        });
+    }
+
+    #[gpui::test]
     async fn test_tree_view_reveals_collapsed_parent_on_select_entry_by_path(
         cx: &mut TestAppContext,
     ) {
@@ -7680,8 +7856,8 @@ mod tests {
         cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
         handle.await;
 
-        let src_key = panel.read_with(cx, |panel, _| {
-            panel
+        let (src_key, nested_key) = panel.read_with(cx, |panel, _| {
+            let src_key = panel
                 .entries
                 .iter()
                 .find_map(|entry| match entry {
@@ -7690,7 +7866,19 @@ mod tests {
                     }
                     _ => None,
                 })
-                .expect("src directory should exist in tree view")
+                .expect("src directory should exist in tree view");
+            let nested_key = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir) if dir.key.path == repo_path("src/nested") => {
+                        Some(dir.key.clone())
+                    }
+                    _ => None,
+                })
+                .expect("nested directory should exist in tree view");
+
+            (src_key, nested_key)
         });
 
         panel.update_in(cx, |panel, window, cx| {
@@ -7707,6 +7895,8 @@ mod tests {
                 .tree_state()
                 .expect("tree view state should exist");
             assert_eq!(state.expanded_dirs.get(&src_key).copied(), Some(true));
+            assert_eq!(state.expanded_dirs.get(&nested_key).copied(), Some(true));
+            assert!(state.temporarily_collapsed_dirs.contains(&nested_key));
 
             let nested_directory = panel
                 .entries
@@ -7726,6 +7916,201 @@ mod tests {
                     .iter()
                     .all(|index| panel.entries[*index].status_entry().is_none()),
                 "shallow open should not reveal files below nested directories",
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_directory(&src_key, window, cx);
+            panel.toggle_directory(&src_key, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel
+                .view_mode
+                .tree_state()
+                .expect("tree view state should exist");
+            assert_eq!(state.expanded_dirs.get(&nested_key).copied(), Some(true));
+            assert!(!state.temporarily_collapsed_dirs.contains(&nested_key));
+
+            let nested_directory = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir) if dir.key.path == repo_path("src/nested") => {
+                        Some(dir)
+                    }
+                    _ => None,
+                })
+                .expect("nested directory should remain visible after normal reopen");
+            assert!(nested_directory.expanded);
+
+            let deep_index = panel
+                .entry_by_path(&repo_path("src/nested/deep.rs"))
+                .expect("deep file should exist in tree view");
+            assert!(
+                state.logical_indices.contains(&deep_index),
+                "normal reopen should restore remembered recursive expansion",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tree_view_normal_expand_clears_shallow_collapse_for_child_subtree(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "src": {
+                    "nested": {
+                        "anchor.rs": "fn anchor() {}",
+                        "deeper": {
+                            "deep.rs": "fn deep() {}",
+                        },
+                    },
+                    "other": {
+                        "peer.rs": "fn peer() {}",
+                    },
+                },
+            }),
+        )
+        .await;
+
+        fs.set_status_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("src/nested/anchor.rs", StatusCode::Modified.worktree()),
+                ("src/nested/deeper/deep.rs", StatusCode::Modified.worktree()),
+                ("src/other/peer.rs", StatusCode::Modified.worktree()),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+
+        cx.executor().run_until_parked();
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().tree_view = Some(true);
+                })
+            });
+        });
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        let (src_key, nested_key, deeper_key) = panel.read_with(cx, |panel, _| {
+            let src_key = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir) if dir.key.path == repo_path("src") => {
+                        Some(dir.key.clone())
+                    }
+                    _ => None,
+                })
+                .expect("src directory should exist in tree view");
+            let nested_key = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir) if dir.key.path == repo_path("src/nested") => {
+                        Some(dir.key.clone())
+                    }
+                    _ => None,
+                })
+                .expect("nested directory should exist in tree view");
+            let deeper_key = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir)
+                        if dir.key.path == repo_path("src/nested/deeper") =>
+                    {
+                        Some(dir.key.clone())
+                    }
+                    _ => None,
+                })
+                .expect("deeper directory should exist in tree view");
+
+            (src_key, nested_key, deeper_key)
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_directory(&src_key, window, cx);
+            panel.toggle_directory_with_depth(&src_key, true, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel
+                .view_mode
+                .tree_state()
+                .expect("tree view state should exist");
+            assert!(state.temporarily_collapsed_dirs.contains(&nested_key));
+            assert!(state.temporarily_collapsed_dirs.contains(&deeper_key));
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_directory(&nested_key, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel
+                .view_mode
+                .tree_state()
+                .expect("tree view state should exist");
+            assert!(!state.temporarily_collapsed_dirs.contains(&nested_key));
+            assert!(!state.temporarily_collapsed_dirs.contains(&deeper_key));
+
+            let deeper_directory = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir)
+                        if dir.key.path == repo_path("src/nested/deeper") =>
+                    {
+                        Some(dir)
+                    }
+                    _ => None,
+                })
+                .expect("deeper directory should be visible after expanding nested");
+            assert!(deeper_directory.expanded);
+
+            let deep_index = panel
+                .entry_by_path(&repo_path("src/nested/deeper/deep.rs"))
+                .expect("deep file should exist in tree view");
+            assert!(
+                state.logical_indices.contains(&deep_index),
+                "expanding a child should restore remembered expansion for its subtree",
             );
         });
     }
