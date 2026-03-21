@@ -1166,7 +1166,14 @@ impl OutlinePanel {
         if self.filter_editor.focus_handle(cx).is_focused(window) {
             cx.propagate()
         } else if let Some(selected_entry) = self.selected_entry().cloned() {
-            self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
+            if matches!(
+                selected_entry,
+                PanelEntry::Fs(FsEntry::Directory(_)) | PanelEntry::FoldedDirs(_)
+            ) {
+                self.toggle_expanded(&selected_entry, window, cx);
+            } else {
+                self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
+            }
         }
     }
 
@@ -6543,6 +6550,132 @@ two/  <==== selected
   b.txt
     search: a «aaa»"#,
                 )
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_selected_entry_toggles_directory(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "one": {
+                    "a.txt": "aaa aaa"
+                },
+                "two": {
+                    "b.txt": "a aaa"
+                }
+
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/root/one"))], cx).await;
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+
+        let items = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_paths(
+                    vec![PathBuf::from(path!("/root/two"))],
+                    OpenOptions {
+                        visible: Some(OpenVisible::OnlyDirectories),
+                        ..Default::default()
+                    },
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .await;
+        assert_eq!(items.len(), 1, "Were opening another worktree directory");
+        assert!(
+            items[0].is_none(),
+            "Directory should be opened successfully"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectSearchView::deploy_search(
+                workspace,
+                &workspace::DeploySearch::default(),
+                window,
+                cx,
+            )
+        });
+        let search_view = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<ProjectSearchView>())
+                .expect("Project search view expected to appear after new search event trigger")
+        });
+
+        let query = "aaa";
+        perform_project_search(&search_view, query, cx);
+
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_previous(&SelectPrevious, window, cx);
+            outline_panel.select_previous(&SelectPrevious, window, cx);
+            outline_panel.open_selected_entry(&OpenSelectedEntry, window, cx);
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        outline_panel.update(cx, |outline_panel, cx| {
+            assert_eq!(
+                display_entries(
+                    &project,
+                    &snapshot(outline_panel, cx),
+                    &outline_panel.cached_entries,
+                    outline_panel.selected_entry(),
+                    cx,
+                ),
+                format!(
+                    r#"one/  <==== selected
+two/
+  b.txt
+    search: a «aaa»"#,
+                ),
+            );
+        });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.open_selected_entry(&OpenSelectedEntry, window, cx);
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        outline_panel.update(cx, |outline_panel, cx| {
+            assert_eq!(
+                display_entries(
+                    &project,
+                    &snapshot(outline_panel, cx),
+                    &outline_panel.cached_entries,
+                    outline_panel.selected_entry(),
+                    cx,
+                ),
+                format!(
+                    r#"one/  <==== selected
+  a.txt
+    search: «aaa» aaa
+    search: aaa «aaa»
+two/
+  b.txt
+    search: a «aaa»"#,
+                ),
             );
         });
     }

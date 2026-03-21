@@ -52,8 +52,8 @@ use futures::{
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Bounds, Context,
     CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, KeystrokeEvent, ManagedView,
-    MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
+    Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
+    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
     Subscription, SystemWindowTabController, Task, Tiling, WeakEntity, WindowBounds,
     WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
     transparent_black,
@@ -119,7 +119,6 @@ use std::{
     collections::VecDeque,
     env,
     hash::Hash,
-    mem,
     path::{Path, PathBuf},
     process::ExitStatus,
     rc::Rc,
@@ -1282,13 +1281,6 @@ struct DispatchingKeystrokes {
     task: Option<Shared<Task<()>>>,
 }
 
-#[derive(Default)]
-struct ForwardedPanelKeystrokes {
-    pending: Vec<Keystroke>,
-    target: Option<FocusHandle>,
-    timer: Option<Task<()>>,
-}
-
 /// Collects everything project-related for a certain window opened.
 /// In some way, is a counterpart of a window, as the [`WindowHandle`] could be downcast into `Workspace`.
 ///
@@ -1328,7 +1320,6 @@ pub struct Workspace {
     database_id: Option<WorkspaceId>,
     app_state: Arc<AppState>,
     dispatching_keystrokes: Rc<RefCell<DispatchingKeystrokes>>,
-    forwarded_panel_keystrokes: ForwardedPanelKeystrokes,
     _subscriptions: Vec<Subscription>,
     _apply_leader_updates: Task<Result<()>>,
     _observe_current_user: Task<Result<()>>,
@@ -1663,7 +1654,6 @@ impl Workspace {
 
         let subscriptions = vec![
             cx.observe_window_activation(window, Self::on_window_activation_changed),
-            cx.observe_keystrokes(Self::handle_unbound_panel_keystrokes),
             cx.observe_window_bounds(window, move |this, window, cx| {
                 if this.bounds_save_task_queued.is_some() {
                     return;
@@ -1745,7 +1735,6 @@ impl Workspace {
             _serialize_workspace_task: None,
             _schedule_serialize_ssh_paths: None,
             leader_updates_tx,
-            forwarded_panel_keystrokes: Default::default(),
             _subscriptions: subscriptions,
             pane_history_timestamp,
             workspace_actions: Default::default(),
@@ -2969,187 +2958,6 @@ impl Workspace {
             cx,
         )
         .detach_and_log_err(cx);
-    }
-
-    fn handle_unbound_panel_keystrokes(
-        &mut self,
-        keystroke_event: &KeystrokeEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if keystroke_event.action.is_some()
-            || window.has_pending_keystrokes()
-            || keystroke_event.keystroke.is_ime_in_progress()
-        {
-            self.clear_forwarded_panel_keystrokes();
-            return;
-        }
-
-        let Some(target) = self.fallback_editor_focus_handle(window, cx) else {
-            self.clear_forwarded_panel_keystrokes();
-            return;
-        };
-
-        let pending = if self.forwarded_panel_keystrokes.target.as_ref() == Some(&target) {
-            self.forwarded_panel_keystrokes.pending.clone()
-        } else {
-            self.clear_forwarded_panel_keystrokes();
-            Vec::new()
-        };
-
-        let Some(resolution) =
-            window.resolve_keystroke_in(&target, &pending, keystroke_event.keystroke.clone())
-        else {
-            self.clear_forwarded_panel_keystrokes();
-            return;
-        };
-
-        self.dispatch_resolved_keystroke_replays(&target, resolution.replays, window, cx);
-
-        if !resolution.pending.is_empty() {
-            self.set_forwarded_panel_keystrokes(
-                target,
-                resolution.pending,
-                resolution.pending_has_binding,
-                window,
-                cx,
-            );
-            return;
-        }
-
-        self.clear_forwarded_panel_keystrokes();
-        self.dispatch_resolved_bindings(&target, resolution.bindings, window, cx);
-    }
-
-    fn fallback_editor_focus_handle(&self, window: &Window, cx: &App) -> Option<FocusHandle> {
-        if !self.is_non_editor_panel_focused(window, cx) {
-            return None;
-        }
-
-        let pane = self.last_active_center_pane.clone()?.upgrade()?;
-        let active_item = pane.read(cx).active_item()?;
-        let focus_handle = active_item.item_focus_handle(cx);
-        window
-            .has_key_context_in(&focus_handle, "Editor")
-            .then_some(focus_handle)
-    }
-
-    fn is_non_editor_panel_focused(&self, window: &Window, cx: &App) -> bool {
-        if self
-            .sidebar_focus_handle
-            .as_ref()
-            .is_some_and(|handle| handle.contains_focused(window, cx))
-        {
-            return true;
-        }
-
-        self.all_docks().into_iter().any(|dock| {
-            let dock_state = dock.read(cx);
-            if !dock_state.is_open() {
-                return false;
-            }
-
-            if dock.focus_handle(cx).contains_focused(window, cx) {
-                return true;
-            }
-
-            dock_state
-                .active_panel()
-                .is_some_and(|panel| panel.panel_focus_handle(cx).contains_focused(window, cx))
-        })
-    }
-
-    fn dispatch_resolved_bindings(
-        &mut self,
-        target: &FocusHandle,
-        bindings: Vec<gpui::KeyBinding>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        for binding in bindings {
-            if window.dispatch_action_in(target, binding.action(), cx) {
-                break;
-            }
-        }
-    }
-
-    fn dispatch_resolved_keystroke_replays(
-        &mut self,
-        target: &FocusHandle,
-        replays: Vec<gpui::ResolvedKeystrokeReplay>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        for replay in replays {
-            self.dispatch_resolved_bindings(target, replay.bindings, window, cx);
-        }
-    }
-
-    fn set_forwarded_panel_keystrokes(
-        &mut self,
-        target: FocusHandle,
-        pending: Vec<Keystroke>,
-        needs_timeout: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.clear_forwarded_panel_keystrokes();
-
-        let timer = if needs_timeout {
-            let pending_keystroke_timeout = cx.pending_keystroke_timeout();
-            let timeout_target = target.clone();
-            let timeout_pending = pending.clone();
-            Some(cx.spawn_in(window, async move |this, cx| {
-                cx.background_executor()
-                    .timer(pending_keystroke_timeout)
-                    .await;
-                this.update_in(cx, |this, window, cx| {
-                    let Some((target, pending)) = this.take_forwarded_panel_keystrokes_if_matches(
-                        &timeout_target,
-                        &timeout_pending,
-                    ) else {
-                        return;
-                    };
-
-                    if let Some(replays) = window.flush_keystrokes_in(&target, &pending) {
-                        this.dispatch_resolved_keystroke_replays(&target, replays, window, cx);
-                    }
-                })
-                .ok();
-            }))
-        } else {
-            None
-        };
-
-        self.forwarded_panel_keystrokes = ForwardedPanelKeystrokes {
-            pending,
-            target: Some(target),
-            timer,
-        };
-    }
-
-    fn take_forwarded_panel_keystrokes_if_matches(
-        &mut self,
-        target: &FocusHandle,
-        pending: &[Keystroke],
-    ) -> Option<(FocusHandle, Vec<Keystroke>)> {
-        if self.forwarded_panel_keystrokes.target.as_ref() != Some(target)
-            || self.forwarded_panel_keystrokes.pending.as_slice() != pending
-        {
-            return None;
-        }
-
-        self.forwarded_panel_keystrokes.timer.take();
-        Some((
-            self.forwarded_panel_keystrokes.target.take()?,
-            mem::take(&mut self.forwarded_panel_keystrokes.pending),
-        ))
-    }
-
-    fn clear_forwarded_panel_keystrokes(&mut self) {
-        self.forwarded_panel_keystrokes.timer.take();
-        self.forwarded_panel_keystrokes.target.take();
-        self.forwarded_panel_keystrokes.pending.clear();
     }
     fn send_keystrokes(
         &mut self,
@@ -10302,7 +10110,7 @@ pub fn with_active_or_new_workspace(
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::{Cell, RefCell},
+        cell::RefCell,
         rc::Rc,
         sync::Arc,
         time::Duration,
@@ -10318,355 +10126,14 @@ mod tests {
     };
     use fs::FakeFs;
     use gpui::{
-        DismissEvent, Empty, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
-        Keystroke, Pixels, Render, SharedString, TestAppContext, UpdateGlobal, VisualTestContext,
-        px,
+        DismissEvent, Empty, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render,
+        SharedString, TestAppContext, UpdateGlobal, VisualTestContext, px,
     };
     use project::{Project, ProjectEntryId};
     use serde_json::json;
     use settings::SettingsStore;
     use util::path;
     use util::rel_path::rel_path;
-
-    actions!(
-        workspace_panel_key_fallback,
-        [TriggerEditorBinding, TriggerPanelBinding, ToggleBoundPanel]
-    );
-
-    struct EditorBindingItem {
-        focus_handle: FocusHandle,
-        triggered: Rc<Cell<usize>>,
-    }
-
-    impl EditorBindingItem {
-        fn new(triggered: Rc<Cell<usize>>, cx: &mut Context<Self>) -> Self {
-            Self {
-                focus_handle: cx.focus_handle(),
-                triggered,
-            }
-        }
-
-        fn trigger(
-            &mut self,
-            _: &TriggerEditorBinding,
-            _window: &mut Window,
-            _cx: &mut Context<Self>,
-        ) {
-            self.triggered.set(self.triggered.get() + 1);
-        }
-    }
-
-    impl EventEmitter<ItemEvent> for EditorBindingItem {}
-
-    impl Focusable for EditorBindingItem {
-        fn focus_handle(&self, _cx: &App) -> FocusHandle {
-            self.focus_handle.clone()
-        }
-    }
-
-    impl Render for EditorBindingItem {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            gpui::div()
-                .track_focus(&self.focus_handle(cx))
-                .key_context("Editor")
-                .on_action(cx.listener(Self::trigger))
-        }
-    }
-
-    impl Item for EditorBindingItem {
-        type Event = ItemEvent;
-
-        fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(ItemEvent)) {}
-
-        fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-            "EditorBindingItem".into()
-        }
-    }
-
-    struct BoundPanel {
-        position: DockPosition,
-        zoomed: bool,
-        active: bool,
-        focus_handle: FocusHandle,
-        size: Pixels,
-        activation_priority: u32,
-        triggered: Rc<Cell<usize>>,
-    }
-
-    impl BoundPanel {
-        fn new(
-            position: DockPosition,
-            activation_priority: u32,
-            triggered: Rc<Cell<usize>>,
-            cx: &mut Context<Self>,
-        ) -> Self {
-            Self {
-                position,
-                zoomed: false,
-                active: false,
-                focus_handle: cx.focus_handle(),
-                size: px(300.),
-                activation_priority,
-                triggered,
-            }
-        }
-
-        fn trigger(
-            &mut self,
-            _: &TriggerPanelBinding,
-            _window: &mut Window,
-            _cx: &mut Context<Self>,
-        ) {
-            self.triggered.set(self.triggered.get() + 1);
-        }
-    }
-
-    impl EventEmitter<PanelEvent> for BoundPanel {}
-
-    impl Render for BoundPanel {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            gpui::div()
-                .track_focus(&self.focus_handle(cx))
-                .key_context("BoundPanel")
-                .on_action(cx.listener(Self::trigger))
-        }
-    }
-
-    impl Panel for BoundPanel {
-        fn persistent_name() -> &'static str {
-            "BoundPanel"
-        }
-
-        fn panel_key() -> &'static str {
-            "BoundPanel"
-        }
-
-        fn position(&self, _window: &Window, _: &App) -> DockPosition {
-            self.position
-        }
-
-        fn position_is_valid(&self, _: DockPosition) -> bool {
-            true
-        }
-
-        fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
-            self.position = position;
-            cx.update_global::<SettingsStore, _>(|_, _| {});
-        }
-
-        fn size(&self, _window: &Window, _: &App) -> Pixels {
-            self.size
-        }
-
-        fn set_size(&mut self, size: Option<Pixels>, _window: &mut Window, _: &mut Context<Self>) {
-            self.size = size.unwrap_or(px(300.));
-        }
-
-        fn icon(&self, _window: &Window, _: &App) -> Option<ui::IconName> {
-            None
-        }
-
-        fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-            None
-        }
-
-        fn toggle_action(&self) -> Box<dyn Action> {
-            ToggleBoundPanel.boxed_clone()
-        }
-
-        fn is_zoomed(&self, _window: &Window, _: &App) -> bool {
-            self.zoomed
-        }
-
-        fn set_zoomed(&mut self, zoomed: bool, _window: &mut Window, _cx: &mut Context<Self>) {
-            self.zoomed = zoomed;
-        }
-
-        fn set_active(&mut self, active: bool, _window: &mut Window, _cx: &mut Context<Self>) {
-            self.active = active;
-        }
-
-        fn activation_priority(&self) -> u32 {
-            self.activation_priority
-        }
-    }
-
-    impl Focusable for BoundPanel {
-        fn focus_handle(&self, _cx: &App) -> FocusHandle {
-            self.focus_handle.clone()
-        }
-    }
-
-    async fn setup_panel_fallback_test(
-        cx: &mut TestAppContext,
-    ) -> (
-        Entity<Workspace>,
-        gpui::AnyWindowHandle,
-        Entity<BoundPanel>,
-        Rc<Cell<usize>>,
-        Rc<Cell<usize>>,
-    ) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let editor_triggered = Rc::new(Cell::new(0));
-        let panel_triggered = Rc::new(Cell::new(0));
-
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
-        let window = cx.windows().into_iter().next().unwrap();
-
-        let panel = workspace.update_in(cx, |workspace, window, cx| {
-            let panel =
-                cx.new(|cx| BoundPanel::new(DockPosition::Right, 100, panel_triggered.clone(), cx));
-            workspace.add_panel(panel.clone(), window, cx);
-            workspace
-                .right_dock()
-                .update(cx, |dock, cx| dock.set_open(true, window, cx));
-            panel
-        });
-
-        workspace.update_in(cx, |workspace, window, cx| {
-            let item = cx.new(|cx| EditorBindingItem::new(editor_triggered.clone(), cx));
-            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
-            workspace.toggle_panel_focus::<BoundPanel>(window, cx);
-        });
-
-        (workspace, window, panel, editor_triggered, panel_triggered)
-    }
-
-    fn assert_panel_focused(
-        cx: &mut TestAppContext,
-        window: gpui::AnyWindowHandle,
-        panel: &Entity<BoundPanel>,
-    ) {
-        window
-            .update(cx, |_, window, cx| {
-                assert!(panel.read(cx).focus_handle(cx).contains_focused(window, cx));
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
-    async fn test_unbound_panel_keystrokes_dispatch_to_last_active_center_editor(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(|cx| {
-            cx.bind_keys([KeyBinding::new(
-                "ctrl-k",
-                TriggerEditorBinding,
-                Some("Editor"),
-            )]);
-        });
-
-        let (_workspace, window, panel, editor_triggered, panel_triggered) =
-            setup_panel_fallback_test(cx).await;
-
-        cx.dispatch_keystroke(window, Keystroke::parse("ctrl-k").unwrap());
-        cx.run_until_parked();
-
-        assert_eq!(editor_triggered.get(), 1);
-        assert_eq!(panel_triggered.get(), 0);
-        assert_panel_focused(cx, window, &panel);
-    }
-
-    #[gpui::test]
-    async fn test_panel_binding_takes_precedence_over_editor_fallback(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            cx.bind_keys([
-                KeyBinding::new("ctrl-k", TriggerEditorBinding, Some("Editor")),
-                KeyBinding::new("ctrl-k", TriggerPanelBinding, Some("BoundPanel")),
-            ]);
-        });
-
-        let (_workspace, window, panel, editor_triggered, panel_triggered) =
-            setup_panel_fallback_test(cx).await;
-
-        cx.dispatch_keystroke(window, Keystroke::parse("ctrl-k").unwrap());
-        cx.run_until_parked();
-
-        assert_eq!(editor_triggered.get(), 0);
-        assert_eq!(panel_triggered.get(), 1);
-        assert_panel_focused(cx, window, &panel);
-    }
-
-    #[gpui::test]
-    async fn test_unbound_panel_keystrokes_support_multi_stroke_editor_bindings(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(|cx| {
-            cx.bind_keys([KeyBinding::new("g g", TriggerEditorBinding, Some("Editor"))]);
-        });
-
-        let (_workspace, window, panel, editor_triggered, panel_triggered) =
-            setup_panel_fallback_test(cx).await;
-
-        cx.dispatch_keystroke(window, Keystroke::parse("g").unwrap());
-        cx.run_until_parked();
-        assert_eq!(editor_triggered.get(), 0);
-        assert_panel_focused(cx, window, &panel);
-
-        cx.dispatch_keystroke(window, Keystroke::parse("g").unwrap());
-        cx.run_until_parked();
-
-        assert_eq!(editor_triggered.get(), 1);
-        assert_eq!(panel_triggered.get(), 0);
-        assert_panel_focused(cx, window, &panel);
-    }
-
-    #[gpui::test]
-    async fn test_unbound_panel_keystrokes_flush_pending_editor_binding_after_timeout(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(|cx| {
-            cx.bind_keys([
-                KeyBinding::new("space", TriggerEditorBinding, Some("Editor")),
-                KeyBinding::new("space w", TriggerEditorBinding, Some("Editor")),
-            ]);
-        });
-
-        let (_workspace, window, panel, editor_triggered, panel_triggered) =
-            setup_panel_fallback_test(cx).await;
-
-        cx.dispatch_keystroke(window, Keystroke::parse("space").unwrap());
-        cx.run_until_parked();
-
-        assert_eq!(editor_triggered.get(), 0);
-        cx.executor().advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-
-        assert_eq!(editor_triggered.get(), 1);
-        assert_eq!(panel_triggered.get(), 0);
-        assert_panel_focused(cx, window, &panel);
-    }
-
-    #[gpui::test]
-    async fn test_pending_editor_binding_uses_custom_timeout(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            cx.bind_keys([
-                KeyBinding::new("space", TriggerEditorBinding, Some("Editor")),
-                KeyBinding::new("space w", TriggerEditorBinding, Some("Editor")),
-            ]);
-            cx.set_pending_keystroke_timeout(Duration::from_secs(2));
-        });
-
-        let (_workspace, window, panel, editor_triggered, panel_triggered) =
-            setup_panel_fallback_test(cx).await;
-
-        cx.dispatch_keystroke(window, Keystroke::parse("space").unwrap());
-        cx.run_until_parked();
-
-        cx.executor().advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-        assert_eq!(editor_triggered.get(), 0);
-
-        cx.executor().advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-        assert_eq!(editor_triggered.get(), 1);
-        assert_eq!(panel_triggered.get(), 0);
-        assert_panel_focused(cx, window, &panel);
-    }
 
     #[gpui::test]
     async fn test_tab_disambiguation(cx: &mut TestAppContext) {

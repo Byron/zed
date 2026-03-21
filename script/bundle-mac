@@ -3,8 +3,8 @@
 set -euo pipefail
 source script/lib/blob-store.sh
 
-build_flag="--release"
-target_dir="release"
+build_flag="${ZED_BUNDLE_BUILD_FLAG:---release}"
+target_dir="${ZED_BUNDLE_TARGET_DIR:-release}"
 open_result=false
 local_install=false
 can_code_sign=false
