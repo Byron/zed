@@ -147,6 +147,12 @@ enum ItemsDisplayMode {
     Outline,
 }
 
+#[derive(Clone, Copy)]
+enum NavigationMode {
+    Preview { update_editor_selection: bool },
+    Activate,
+}
+
 #[derive(Debug)]
 struct SearchState {
     kind: SearchKind,
@@ -1172,7 +1178,7 @@ impl OutlinePanel {
             ) {
                 self.toggle_expanded(&selected_entry, window, cx);
             } else {
-                self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
+                self.scroll_editor_to_entry(&selected_entry, NavigationMode::Activate, window, cx);
             }
         }
     }
@@ -1181,7 +1187,7 @@ impl OutlinePanel {
         if self.filter_editor.focus_handle(cx).is_focused(window) {
             cx.propagate()
         } else if let Some(selected_entry) = self.selected_entry().cloned() {
-            self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
+            self.scroll_editor_to_entry(&selected_entry, NavigationMode::Activate, window, cx);
         }
     }
 
@@ -1205,7 +1211,7 @@ impl OutlinePanel {
         } else if let Some((active_editor, selected_entry)) =
             self.active_editor().zip(self.selected_entry().cloned())
         {
-            self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
+            self.scroll_editor_to_entry(&selected_entry, NavigationMode::Activate, window, cx);
             active_editor.update(cx, |editor, cx| editor.open_excerpts(action, window, cx));
         }
     }
@@ -1221,42 +1227,134 @@ impl OutlinePanel {
         } else if let Some((active_editor, selected_entry)) =
             self.active_editor().zip(self.selected_entry().cloned())
         {
-            self.scroll_editor_to_entry(&selected_entry, true, true, window, cx);
+            self.scroll_editor_to_entry(&selected_entry, NavigationMode::Activate, window, cx);
             active_editor.update(cx, |editor, cx| {
                 editor.open_excerpts_in_split(action, window, cx)
             });
         }
     }
 
-    fn scroll_editor_to_entry(
+    fn handle_focus_center_pane(
+        &mut self,
+        _: &workspace::FocusCenterPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let did_navigate = self
+            .selected_entry()
+            .cloned()
+            .is_some_and(|selected_entry| {
+                self.focus_active_editor_on_entry(&selected_entry, window, cx)
+            });
+
+        if !did_navigate {
+            self.focus_active_editor(window, cx);
+        }
+    }
+
+    fn focus_active_editor_on_entry(
         &mut self,
         entry: &PanelEntry,
-        prefer_selection_change: bool,
-        prefer_focus_change: bool,
         window: &mut Window,
-        cx: &mut Context<OutlinePanel>,
-    ) {
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(active_editor) = self.active_editor() else {
-            return;
+            return false;
         };
         let active_multi_buffer = active_editor.read(cx).buffer().clone();
         let multi_buffer_snapshot = active_multi_buffer.read(cx).snapshot(cx);
-        let mut change_selection = prefer_selection_change;
-        let mut change_focus = prefer_focus_change;
+        let anchor = match entry {
+            PanelEntry::FoldedDirs(..) | PanelEntry::Fs(FsEntry::Directory(..)) => return false,
+            PanelEntry::Fs(FsEntry::ExternalFile(file)) => multi_buffer_snapshot
+                .excerpts()
+                .find_map(|(excerpt_id, buffer_snapshot, excerpt_range)| {
+                    if buffer_snapshot.remote_id() == file.buffer_id {
+                        multi_buffer_snapshot
+                            .anchor_in_excerpt(excerpt_id, excerpt_range.primary.start)
+                    } else {
+                        None
+                    }
+                }),
+            PanelEntry::Fs(FsEntry::File(file)) => self
+                .project
+                .update(cx, |project, cx| {
+                    project
+                        .path_for_entry(file.entry.id, cx)
+                        .and_then(|path| project.get_open_buffer(&path, cx))
+                })
+                .map(|buffer| {
+                    active_multi_buffer
+                        .read(cx)
+                        .excerpts_for_buffer(buffer.read(cx).remote_id(), cx)
+                })
+                .and_then(|excerpts| {
+                    let (excerpt_id, _, excerpt_range) = excerpts.first()?;
+                    multi_buffer_snapshot
+                        .anchor_in_excerpt(*excerpt_id, excerpt_range.primary.start)
+                }),
+            PanelEntry::Outline(OutlineEntry::Outline(outline)) => multi_buffer_snapshot
+                .anchor_in_excerpt(outline.excerpt_id, outline.outline.range.start)
+                .or_else(|| {
+                    multi_buffer_snapshot
+                        .anchor_in_excerpt(outline.excerpt_id, outline.outline.range.end)
+                }),
+            PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => {
+                multi_buffer_snapshot.anchor_in_excerpt(excerpt.id, excerpt.range.primary.start)
+            }
+            PanelEntry::Search(search_entry) => Some(search_entry.match_range.start),
+        };
+
+        let Some(anchor) = anchor else {
+            return false;
+        };
+
+        self.select_entry(entry.clone(), false, window, cx);
+        active_editor.focus_handle(cx).focus(window, cx);
+        active_editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges(Some(anchor..anchor))
+            });
+        });
+        true
+    }
+
+    fn scroll_editor_to_entry(
+        &mut self,
+        entry: &PanelEntry,
+        navigation_mode: NavigationMode,
+        window: &mut Window,
+        cx: &mut Context<OutlinePanel>,
+    ) -> bool {
+        let Some(active_editor) = self.active_editor() else {
+            return false;
+        };
+        let active_multi_buffer = active_editor.read(cx).buffer().clone();
+        let multi_buffer_snapshot = active_multi_buffer.read(cx).snapshot(cx);
+        let mut change_selection = match navigation_mode {
+            NavigationMode::Preview {
+                update_editor_selection,
+            } => update_editor_selection,
+            NavigationMode::Activate => true,
+        };
+        let change_focus = matches!(navigation_mode, NavigationMode::Activate);
         let mut scroll_to_buffer = None;
         let scroll_target = match entry {
-            PanelEntry::FoldedDirs(..) | PanelEntry::Fs(FsEntry::Directory(..)) => {
-                change_focus = false;
-                None
-            }
+            PanelEntry::FoldedDirs(..) | PanelEntry::Fs(FsEntry::Directory(..)) => return false,
             PanelEntry::Fs(FsEntry::ExternalFile(file)) => {
-                change_selection = false;
+                if matches!(navigation_mode, NavigationMode::Preview { .. }) {
+                    change_selection = false;
+                }
                 scroll_to_buffer = Some(file.buffer_id);
                 multi_buffer_snapshot.excerpts().find_map(
                     |(excerpt_id, buffer_snapshot, excerpt_range)| {
                         if buffer_snapshot.remote_id() == file.buffer_id {
-                            multi_buffer_snapshot
-                                .anchor_in_excerpt(excerpt_id, excerpt_range.context.start)
+                            let excerpt_start =
+                                if matches!(navigation_mode, NavigationMode::Activate) {
+                                    excerpt_range.primary.start
+                                } else {
+                                    excerpt_range.context.start
+                                };
+                            multi_buffer_snapshot.anchor_in_excerpt(excerpt_id, excerpt_start)
                         } else {
                             None
                         }
@@ -1265,7 +1363,9 @@ impl OutlinePanel {
             }
 
             PanelEntry::Fs(FsEntry::File(file)) => {
-                change_selection = false;
+                if matches!(navigation_mode, NavigationMode::Preview { .. }) {
+                    change_selection = false;
+                }
                 scroll_to_buffer = Some(file.buffer_id);
                 self.project
                     .update(cx, |project, cx| {
@@ -1280,8 +1380,12 @@ impl OutlinePanel {
                     })
                     .and_then(|excerpts| {
                         let (excerpt_id, _, excerpt_range) = excerpts.first()?;
-                        multi_buffer_snapshot
-                            .anchor_in_excerpt(*excerpt_id, excerpt_range.context.start)
+                        let excerpt_start = if matches!(navigation_mode, NavigationMode::Activate) {
+                            excerpt_range.primary.start
+                        } else {
+                            excerpt_range.context.start
+                        };
+                        multi_buffer_snapshot.anchor_in_excerpt(*excerpt_id, excerpt_start)
                     })
             }
             PanelEntry::Outline(OutlineEntry::Outline(outline)) => multi_buffer_snapshot
@@ -1291,8 +1395,15 @@ impl OutlinePanel {
                         .anchor_in_excerpt(outline.excerpt_id, outline.outline.range.end)
                 }),
             PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => {
-                change_selection = false;
-                multi_buffer_snapshot.anchor_in_excerpt(excerpt.id, excerpt.range.context.start)
+                if matches!(navigation_mode, NavigationMode::Preview { .. }) {
+                    change_selection = false;
+                }
+                let excerpt_start = if matches!(navigation_mode, NavigationMode::Activate) {
+                    excerpt.range.primary.start
+                } else {
+                    excerpt.range.context.start
+                };
+                multi_buffer_snapshot.anchor_in_excerpt(excerpt.id, excerpt_start)
             }
             PanelEntry::Search(search_entry) => Some(search_entry.match_range.start),
         };
@@ -1341,8 +1452,12 @@ impl OutlinePanel {
                 } else {
                     self.focus_handle.focus(window, cx);
                 }
+
+                return true;
             }
         }
+
+        false
     }
 
     fn focus_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1435,7 +1550,14 @@ impl OutlinePanel {
             self.select_first(&SelectFirst {}, window, cx)
         }
         if let Some(selected_entry) = self.selected_entry().cloned() {
-            self.scroll_editor_to_entry(&selected_entry, true, false, window, cx);
+            self.scroll_editor_to_entry(
+                &selected_entry,
+                NavigationMode::Preview {
+                    update_editor_selection: true,
+                },
+                window,
+                cx,
+            );
         }
     }
 
@@ -1454,7 +1576,14 @@ impl OutlinePanel {
             self.select_last(&SelectLast, window, cx)
         }
         if let Some(selected_entry) = self.selected_entry().cloned() {
-            self.scroll_editor_to_entry(&selected_entry, true, false, window, cx);
+            self.scroll_editor_to_entry(
+                &selected_entry,
+                NavigationMode::Preview {
+                    update_editor_selection: true,
+                },
+                window,
+                cx,
+            );
         }
     }
 
@@ -2399,7 +2528,14 @@ impl OutlinePanel {
                         }
                     });
                     if let Some(selection) = outline_panel.selected_entry().cloned() {
-                        outline_panel.scroll_editor_to_entry(&selection, false, false, window, cx);
+                        outline_panel.scroll_editor_to_entry(
+                            &selection,
+                            NavigationMode::Preview {
+                                update_editor_selection: false,
+                            },
+                            window,
+                            cx,
+                        );
                     }
                 })
                 .ok();
@@ -3082,7 +3218,13 @@ impl OutlinePanel {
                         return;
                     }
 
-                    let change_focus = event.click_count() > 1;
+                    let navigation_mode = if event.click_count() > 1 {
+                        NavigationMode::Activate
+                    } else {
+                        NavigationMode::Preview {
+                            update_editor_selection: true,
+                        }
+                    };
                     if event.modifiers().alt && outline_panel.is_collapsed(&clicked_entry) {
                         outline_panel.expand_single_level(&clicked_entry, window, cx);
                     } else {
@@ -3091,8 +3233,7 @@ impl OutlinePanel {
 
                     outline_panel.scroll_editor_to_entry(
                         &clicked_entry,
-                        true,
-                        change_focus,
+                        navigation_mode,
                         window,
                         cx,
                     );
@@ -5417,6 +5558,27 @@ impl Panel for OutlinePanel {
         });
     }
 
+    fn focus_center_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.focus_handle.contains_focused(window, cx)
+            && !self.filter_editor.focus_handle(cx).is_focused(window)
+        {
+            return false;
+        }
+
+        let did_navigate = self
+            .selected_entry()
+            .cloned()
+            .is_some_and(|selected_entry| {
+                self.focus_active_editor_on_entry(&selected_entry, window, cx)
+            });
+
+        if !did_navigate {
+            self.focus_active_editor(window, cx);
+        }
+
+        did_navigate
+    }
+
     fn icon(&self, _: &Window, cx: &App) -> Option<IconName> {
         OutlinePanelSettings::get_global(cx)
             .button
@@ -5535,6 +5697,7 @@ impl Render for OutlinePanel {
             .on_action(cx.listener(Self::fold_directory))
             .on_action(cx.listener(Self::open_excerpts))
             .on_action(cx.listener(Self::open_excerpts_split))
+            .on_action(cx.listener(Self::handle_focus_center_pane))
             .when(is_local, |el| {
                 el.on_action(cx.listener(Self::reveal_in_finder))
             })
@@ -7743,7 +7906,7 @@ outline: struct OutlineEntryExcerpt
         });
 
         outline_panel.update(cx, |_outline_panel, cx| {
-            assert_eq!(selected_row_text(&diff_editor, cx), "fn visible_child() {");
+            assert_eq!(selected_row_text(&diff_editor, cx), "let value = 1;");
         });
     }
 
@@ -7830,9 +7993,282 @@ outline: struct OutlineEntryExcerpt
             .unwrap();
         assert_ne!(opened_editor, diff_editor);
         cx.update(|_, cx| {
-            assert_eq!(selected_row_text(&opened_editor, cx), "fn visible_child() {");
+            assert_eq!(selected_row_text(&opened_editor, cx), "let value = 2;");
         });
         opened_editor.update_in(cx, |editor, window, cx| {
+            assert!(editor.focus_handle(cx).is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_focus_center_pane_jumps_to_selected_excerpt_start_line(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let root = path!("/root");
+        let base_text = indoc! {"
+            fn first() {
+                let first = 1;
+            }
+
+            fn spacing_one() {
+                let unchanged = 1;
+            }
+
+            fn spacing_two() {
+                let unchanged = 2;
+            }
+
+            fn second() {
+                let second = 1;
+            }
+        "};
+        let current_text = base_text
+            .replace("let first = 1;", "let first = 2;")
+            .replace("let second = 1;", "let second = 2;");
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            root,
+            json!({
+                "src": {
+                    "lib.rs": current_text,
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
+        project.read_with(cx, |project, _| project.languages().add(rust_lang()));
+
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+
+        let diff_editor = add_diff_editor(
+            &workspace,
+            &project,
+            PathBuf::from(path!("/root/src/lib.rs")),
+            base_text,
+            0,
+            cx,
+        )
+        .await;
+
+        settle_outline_panel(cx);
+
+        let [first_excerpt_entry, second_excerpt_entry]: [_; 2] =
+            outline_panel.read_with(cx, |outline_panel, _| {
+                outline_panel
+                    .cached_entries
+                    .iter()
+                    .filter_map(|entry| match &entry.entry {
+                        PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => {
+                            Some(excerpt.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .expect("Expected two excerpt rows for the diff editor")
+            });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_entry(
+                PanelEntry::Outline(OutlineEntry::Excerpt(first_excerpt_entry.clone())),
+                true,
+                window,
+                cx,
+            );
+            outline_panel.open_file(&workspace::Open::default(), window, cx);
+        });
+        let first_excerpt_row_text = cx.update(|_, cx| selected_row_text(&diff_editor, cx));
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_entry(
+                PanelEntry::Outline(OutlineEntry::Excerpt(second_excerpt_entry.clone())),
+                true,
+                window,
+                cx,
+            );
+            outline_panel.open_file(&workspace::Open::default(), window, cx);
+        });
+        let second_excerpt_row_text = cx.update(|_, cx| selected_row_text(&diff_editor, cx));
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_entry(
+                PanelEntry::Outline(OutlineEntry::Excerpt(first_excerpt_entry.clone())),
+                true,
+                window,
+                cx,
+            );
+            outline_panel.open_file(&workspace::Open::default(), window, cx);
+        });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_entry(
+                PanelEntry::Outline(OutlineEntry::Excerpt(second_excerpt_entry.clone())),
+                true,
+                window,
+                cx,
+            );
+        });
+
+        outline_panel.update(cx, |_outline_panel, cx| {
+            assert_eq!(
+                selected_row_text(&diff_editor, cx),
+                first_excerpt_row_text,
+                "Selecting a Lines row should preserve the preview caret",
+            );
+        });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.handle_focus_center_pane(&workspace::FocusCenterPane, window, cx);
+        });
+
+        outline_panel.update(cx, |_outline_panel, cx| {
+            assert_eq!(selected_row_text(&diff_editor, cx), second_excerpt_row_text);
+        });
+        diff_editor.update_in(cx, |editor, window, cx| {
+            assert!(editor.focus_handle(cx).is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_focus_center_pane_jumps_to_top_excerpt_for_selected_file(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let root = path!("/root");
+        let base_text = indoc! {"
+            fn first() {
+                let first = 1;
+            }
+
+            fn spacing_one() {
+                let unchanged = 1;
+            }
+
+            fn spacing_two() {
+                let unchanged = 2;
+            }
+
+            fn second() {
+                let second = 1;
+            }
+        "};
+        let current_text = base_text
+            .replace("let first = 1;", "let first = 2;")
+            .replace("let second = 1;", "let second = 2;");
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            root,
+            json!({
+                "src": {
+                    "lib.rs": current_text,
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
+        project.read_with(cx, |project, _| project.languages().add(rust_lang()));
+
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+
+        let diff_editor = add_diff_editor(
+            &workspace,
+            &project,
+            PathBuf::from(path!("/root/src/lib.rs")),
+            base_text,
+            0,
+            cx,
+        )
+        .await;
+
+        settle_outline_panel(cx);
+
+        let (file_entry, first_excerpt_entry, second_excerpt_entry) =
+            outline_panel.read_with(cx, |outline_panel, _| {
+                let file_entry = outline_panel
+                    .cached_entries
+                    .iter()
+                    .find_map(|entry| match &entry.entry {
+                        PanelEntry::Fs(FsEntry::File(file)) => Some(file.clone()),
+                        _ => None,
+                    })
+                    .expect("Expected a file row for the diff editor");
+                let [first_excerpt_entry, second_excerpt_entry]: [_; 2] = outline_panel
+                    .cached_entries
+                    .iter()
+                    .filter_map(|entry| match &entry.entry {
+                        PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => {
+                            Some(excerpt.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .expect("Expected two excerpt rows for the diff editor");
+                (file_entry, first_excerpt_entry, second_excerpt_entry)
+            });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_entry(
+                PanelEntry::Outline(OutlineEntry::Excerpt(first_excerpt_entry.clone())),
+                true,
+                window,
+                cx,
+            );
+            outline_panel.open_file(&workspace::Open::default(), window, cx);
+        });
+        let first_excerpt_row_text = cx.update(|_, cx| selected_row_text(&diff_editor, cx));
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_entry(
+                PanelEntry::Outline(OutlineEntry::Excerpt(second_excerpt_entry.clone())),
+                true,
+                window,
+                cx,
+            );
+            outline_panel.open_file(&workspace::Open::default(), window, cx);
+        });
+        let second_excerpt_row_text = cx.update(|_, cx| selected_row_text(&diff_editor, cx));
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.select_entry(
+                PanelEntry::Fs(FsEntry::File(file_entry.clone())),
+                true,
+                window,
+                cx,
+            );
+        });
+
+        outline_panel.update(cx, |_outline_panel, cx| {
+            assert_eq!(
+                selected_row_text(&diff_editor, cx),
+                second_excerpt_row_text,
+                "Selecting a file row should preserve the preview caret",
+            );
+        });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.handle_focus_center_pane(&workspace::FocusCenterPane, window, cx);
+        });
+
+        outline_panel.update(cx, |_outline_panel, cx| {
+            assert_eq!(selected_row_text(&diff_editor, cx), first_excerpt_row_text);
+        });
+        diff_editor.update_in(cx, |editor, window, cx| {
             assert!(editor.focus_handle(cx).is_focused(window));
         });
     }

@@ -51,6 +51,9 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     }
     fn set_zoomed(&mut self, _zoomed: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
     fn set_active(&mut self, _active: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn focus_center_pane(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        false
+    }
     fn pane(&self) -> Option<Entity<Pane>> {
         None
     }
@@ -73,6 +76,7 @@ pub trait PanelHandle: Send + Sync {
     fn is_zoomed(&self, window: &Window, cx: &App) -> bool;
     fn set_zoomed(&self, zoomed: bool, window: &mut Window, cx: &mut App);
     fn set_active(&self, active: bool, window: &mut Window, cx: &mut App);
+    fn focus_center_pane(&self, window: &mut Window, cx: &mut App) -> bool;
     fn remote_id(&self) -> Option<proto::PanelId>;
     fn pane(&self, cx: &App) -> Option<Entity<Pane>>;
     fn size(&self, window: &Window, cx: &App) -> Pixels;
@@ -140,6 +144,10 @@ where
 
     fn set_active(&self, active: bool, window: &mut Window, cx: &mut App) {
         self.update(cx, |this, cx| this.set_active(active, window, cx))
+    }
+
+    fn focus_center_pane(&self, window: &mut Window, cx: &mut App) -> bool {
+        self.update(cx, |this, cx| this.focus_center_pane(window, cx))
     }
 
     fn pane(&self, cx: &App) -> Option<Entity<Pane>> {
