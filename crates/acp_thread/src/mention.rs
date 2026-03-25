@@ -95,12 +95,19 @@ impl MentionUri {
             Ok(())
         };
 
-        if path_style.has_root(Path::new(input)) && !input.contains("://") {
-            return parse_absolute_path(input)
-                .with_context(|| format!("Invalid absolute path mention URI: {input}"));
+        let trimmed = input.trim();
+        if path_style.has_root(Path::new(trimmed)) && !trimmed.contains("://") {
+            if trimmed.ends_with(path_style.separators_ch()) {
+                return Ok(Self::Directory {
+                    abs_path: PathBuf::from(trimmed),
+                });
+            }
+
+            return parse_absolute_path(trimmed)
+                .with_context(|| format!("Invalid absolute path mention URI: {trimmed}"));
         }
 
-        let url = url::Url::parse(input)?;
+        let url = url::Url::parse(trimmed)?;
         let path = url.path();
         match url.scheme() {
             "file" => {
@@ -1308,6 +1315,42 @@ mod tests {
             _ => panic!("Expected Selection variant"),
         }
         assert_eq!(parsed.to_uri().to_string(), selection_uri);
+    }
+
+    #[test]
+    fn test_parse_absolute_path_link_with_line_suffix() {
+        let selection_path = path!("/path/to/file.rs:15");
+        let parsed = MentionUri::parse(selection_path, PathStyle::local()).unwrap();
+        match &parsed {
+            MentionUri::Selection {
+                abs_path: path,
+                line_range,
+                ..
+            } => {
+                assert_eq!(path.as_ref().unwrap(), Path::new(path!("/path/to/file.rs")));
+                assert_eq!(line_range.start(), &14);
+                assert_eq!(line_range.end(), &14);
+            }
+            _ => panic!("Expected Selection variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_absolute_path_link_with_fragment() {
+        let selection_path = path!("/path/to/file.rs#L5");
+        let parsed = MentionUri::parse(selection_path, PathStyle::local()).unwrap();
+        match &parsed {
+            MentionUri::Selection {
+                abs_path: path,
+                line_range,
+                ..
+            } => {
+                assert_eq!(path.as_ref().unwrap(), Path::new(path!("/path/to/file.rs")));
+                assert_eq!(line_range.start(), &4);
+                assert_eq!(line_range.end(), &4);
+            }
+            _ => panic!("Expected Selection variant"),
+        }
     }
 
     #[test]
