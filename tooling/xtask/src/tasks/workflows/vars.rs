@@ -59,6 +59,7 @@ var!(AZURE_SIGNING_ENDPOINT);
 pub fn bundle_envs(platform: Platform) -> Env {
     let env = Env::default()
         .add("CARGO_INCREMENTAL", 0)
+        .add("ZED_BUNDLE_REMOTE_SERVER", 1)
         .add("ZED_CLIENT_CHECKSUM_SEED", ZED_CLIENT_CHECKSUM_SEED)
         .add("ZED_MINIDUMP_ENDPOINT", ZED_SENTRY_MINIDUMP_ENDPOINT);
 
