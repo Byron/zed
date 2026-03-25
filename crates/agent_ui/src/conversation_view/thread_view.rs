@@ -5524,7 +5524,7 @@ impl ThreadView {
             .and_then(|ws| {
                 ws.read(cx)
                     .active_item(cx)
-                    .and_then(|item| item.downcast::<Editor>())
+                    .and_then(|item| item.act_as::<Editor>(cx))
             })
             .is_some_and(|editor| {
                 editor.update(cx, |editor, cx| {

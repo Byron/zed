@@ -3697,12 +3697,14 @@ pub(crate) mod tests {
     use editor::actions::Paste;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _, FeatureFlagAppExt as _};
     use fs::FakeFs;
-    use gpui::{ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size};
+    use gpui::{
+        AnyEntity, ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size,
+    };
     use parking_lot::Mutex;
     use project::Project;
     use serde_json::json;
     use settings::SettingsStore;
-    use std::any::Any;
+    use std::any::{Any, TypeId};
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
@@ -3945,6 +3947,75 @@ pub(crate) mod tests {
 
         store.update(cx, |store, cx| store.clear(cx));
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_open_link_opens_absolute_project_path_in_editor(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                "src": {
+                    "main.rs": "fn main() {}\nprintln!(\"hello\");\n"
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let weak_workspace = workspace.downgrade();
+
+        cx.update(|window, cx| {
+            open_link(
+                "/project/src/main.rs#L2".into(),
+                &weak_workspace,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let active_editor = workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<Editor>(cx))
+            .expect("expected the link to open an editor");
+
+        active_editor.update(cx, |editor, cx| {
+            let selections = editor
+                .selections
+                .all::<Point>(&editor.display_snapshot(cx))
+                .into_iter()
+                .map(|selection| selection.range())
+                .collect::<Vec<_>>();
+            assert_eq!(selections, vec![Point::new(1, 0)..Point::new(1, 0)]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_link_falls_back_to_external_urls(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let weak_workspace = workspace.downgrade();
+
+        cx.update(|window, cx| {
+            open_link(
+                "https://example.com/docs".into(),
+                &weak_workspace,
+                window,
+                cx,
+            );
+        });
+
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/docs"));
     }
 
     #[gpui::test]
@@ -5781,6 +5852,48 @@ pub(crate) mod tests {
                 .map(|t| t.read(cx).title_editor.clone());
 
             v_flex().children(title_editor).child(self.0.clone())
+        }
+    }
+
+    struct EditorWrapperItem {
+        editor: Entity<Editor>,
+        focus_handle: FocusHandle,
+    }
+
+    impl Item for EditorWrapperItem {
+        type Event = ();
+
+        fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+            "Wrapped Editor".into()
+        }
+
+        fn act_as_type<'a>(
+            &'a self,
+            type_id: TypeId,
+            self_handle: &'a Entity<Self>,
+            _cx: &'a App,
+        ) -> Option<AnyEntity> {
+            if TypeId::of::<Self>() == type_id {
+                Some(self_handle.clone().into())
+            } else if TypeId::of::<Editor>() == type_id {
+                Some(self.editor.clone().into())
+            } else {
+                None
+            }
+        }
+    }
+
+    impl EventEmitter<()> for EditorWrapperItem {}
+
+    impl Focusable for EditorWrapperItem {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for EditorWrapperItem {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            gpui::Empty
         }
     }
 
@@ -8906,6 +9019,70 @@ pub(crate) mod tests {
 
             assert_eq!(text, expected_txt);
         })
+    }
+
+    #[gpui::test]
+    async fn test_insert_selections_from_active_item_that_acts_as_editor(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response".into()),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Can you review this snippet ", window, cx)
+        });
+
+        let (workspace, project) = conversation_view.read_with(cx, |conversation_view, _cx| {
+            (
+                conversation_view.workspace.clone(),
+                conversation_view.project.clone(),
+            )
+        });
+        let buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer("let a = 10 + 10;", None, false, cx)
+        });
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                let editor = cx.new(|cx| {
+                    let mut editor =
+                        Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx);
+
+                    editor.change_selections(Default::default(), window, cx, |selections| {
+                        selections.select_ranges([MultiBufferOffset(8)..MultiBufferOffset(15)]);
+                    });
+
+                    editor
+                });
+                let wrapper = cx.new(|cx| EditorWrapperItem {
+                    editor,
+                    focus_handle: cx.focus_handle(),
+                });
+                workspace.add_item_to_active_pane(Box::new(wrapper), None, false, window, cx);
+            })
+            .unwrap();
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            let workspace = view.workspace.upgrade().unwrap();
+            let selection = workspace
+                .update(cx, |workspace, cx| {
+                    AgentContextSource::from_active(workspace, cx)?
+                        .read_selection(workspace, false, cx)
+                })
+                .unwrap();
+            view.insert_selection(selection, window, cx);
+        });
+
+        message_editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "Can you review this snippet selection ");
+        });
     }
 
     #[gpui::test]
