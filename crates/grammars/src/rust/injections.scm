@@ -1,8 +1,16 @@
 ([
-  (line_comment)
-  (block_comment)
+  (line_comment !doc)
+  (block_comment !doc)
 ] @injection.content
   (#set! injection.language "comment"))
+
+((block_comment
+   doc: (doc_comment) @injection.content)
+  (#set! injection.language "markdown"))
+
+((line_comment
+   doc: (doc_comment) @injection.content)
+  (#set! injection.language "markdown-inline"))
 
 (macro_invocation
   macro: [

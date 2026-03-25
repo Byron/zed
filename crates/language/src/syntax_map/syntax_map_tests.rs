@@ -354,7 +354,6 @@ fn test_rust_json_macro_empty_string_highlighting(cx: &mut App) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
     let language = rust_lang();
     registry.add(language.clone());
-
     let buffer = Buffer::new(
         ReplicaId::LOCAL,
         BufferId::new(1).unwrap(),
@@ -396,6 +395,71 @@ fn test_rust_json_macro_empty_string_highlighting(cx: &mut App) {
                 "requires2FA": «false»
             })
         "#,
+    );
+}
+
+#[gpui::test]
+fn test_rust_doc_comment_markdown_injections(cx: &mut App) {
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let rust = rust_lang();
+    let markdown = markdown_lang();
+    let markdown_inline = Arc::new(markdown_inline_lang());
+    registry.add(markdown);
+    registry.add(markdown_inline);
+    registry.add(rust.clone());
+
+    let buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        r#"
+            /**
+            ```rs
+            fn helper() {}
+            ```
+            */
+            /// `line_doc`
+            // `plain_comment`
+            fn example() {}
+        "#
+        .unindent(),
+    );
+
+    let mut syntax_map = SyntaxMap::new(&buffer);
+    syntax_map.set_language_registry(registry);
+    syntax_map.reparse(rust, &buffer);
+
+    let helper_point = buffer.offset_to_point(range_for_text(&buffer, "helper").start);
+    assert_layers_for_range(
+        &syntax_map,
+        &buffer,
+        helper_point..helper_point,
+        &[
+            "...(block_comment outer: (outer_doc_comment_marker) doc: (doc_comment))...(function_item name: (identifier) parameters: (parameters) body: (block))",
+            "(document (section (fenced_code_block (fenced_code_block_delimiter) (info_string (language)) (block_continuation) (code_fence_content (block_continuation)) (fenced_code_block_delimiter))))",
+            "...(function_item name: (identifier) parameters: (parameters) body: (block))",
+        ],
+    );
+
+    let line_doc_point = buffer.offset_to_point(range_for_text(&buffer, "line_doc").start);
+    assert_layers_for_range(
+        &syntax_map,
+        &buffer,
+        line_doc_point..line_doc_point,
+        &[
+            "...(line_comment outer: (outer_doc_comment_marker) doc: (doc_comment))...(function_item name: (identifier) parameters: (parameters) body: (block))",
+            "(inline (code_span (code_span_delimiter) (code_span_delimiter)))",
+        ],
+    );
+
+    let plain_comment_point =
+        buffer.offset_to_point(range_for_text(&buffer, "plain_comment").start);
+    assert_layers_for_range(
+        &syntax_map,
+        &buffer,
+        plain_comment_point..plain_comment_point,
+        &[
+            "...(line_comment)...(function_item name: (identifier) parameters: (parameters) body: (block))",
+        ],
     );
 }
 
