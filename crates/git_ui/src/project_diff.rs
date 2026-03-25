@@ -2721,6 +2721,99 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_update_after_amending_partially_staged_changes(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let initial_contents = concat!(
+            "before one\n",
+            "keep 1\n",
+            "keep 2\n",
+            "keep 3\n",
+            "keep 4\n",
+            "before two\n",
+        );
+        let partially_staged_contents = concat!(
+            "after one\n",
+            "keep 1\n",
+            "keep 2\n",
+            "keep 3\n",
+            "keep 4\n",
+            "before two\n",
+        );
+        let working_tree_contents = concat!(
+            "after one\n",
+            "keep 1\n",
+            "keep 2\n",
+            "keep 3\n",
+            "keep 4\n",
+            "after two\n",
+        );
+
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "README.md": working_tree_contents,
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("README.md", initial_contents.to_owned())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        cx.focus(&workspace);
+        cx.update(|window, cx| {
+            window.dispatch_action(project_diff::Diff.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let item = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
+        });
+
+        assert_eq!(
+            item.read_with(cx, |item, cx| {
+                item.multibuffer.read(cx).snapshot(cx).diff_hunks().count()
+            }),
+            2,
+        );
+
+        fs.set_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("README.md", partially_staged_contents.to_owned())],
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            item.read_with(cx, |item, cx| {
+                item.multibuffer.read(cx).snapshot(cx).diff_hunks().count()
+            }),
+            2,
+        );
+
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("README.md", partially_staged_contents.to_owned())],
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            item.read_with(cx, |item, cx| {
+                item.multibuffer.read(cx).snapshot(cx).diff_hunks().count()
+            }),
+            1,
+        );
+    }
+
+    #[gpui::test]
     async fn test_deploy_at_respects_worktree_override(cx: &mut TestAppContext) {
         init_test(cx);
 

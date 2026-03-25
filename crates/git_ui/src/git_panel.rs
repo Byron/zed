@@ -7589,7 +7589,10 @@ mod tests {
                     GitListEntry::Directory(dir) if dir.key == src_key
                 )
             });
-            assert!(panel.selected_entry.is_some(), "src directory should be selectable");
+            assert!(
+                panel.selected_entry.is_some(),
+                "src directory should be selectable"
+            );
         };
 
         panel.update_in(cx, |panel, window, cx| {
@@ -8767,8 +8770,9 @@ mod tests {
     fn selected_row_text(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
         cx.update(|_, cx| {
             editor.update(cx, |editor, cx| {
-                let selections =
-                    editor.selections.all::<language::Point>(&editor.display_snapshot(cx));
+                let selections = editor
+                    .selections
+                    .all::<language::Point>(&editor.display_snapshot(cx));
                 assert_eq!(
                     selections.len(),
                     1,

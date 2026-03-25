@@ -12267,6 +12267,125 @@ async fn test_optimistic_hunks_in_staged_files(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_uncommitted_diff_updates_after_amending_partially_staged_changes(
+    cx: &mut gpui::TestAppContext,
+) {
+    use DiffHunkSecondaryStatus::*;
+    init_test(cx);
+
+    let committed_contents = concat!(
+        "one\n", "keep 1\n", "keep 2\n", "keep 3\n", "keep 4\n", "two\n",
+    );
+    let partially_staged_contents = concat!(
+        "ONE\n", "keep 1\n", "keep 2\n", "keep 3\n", "keep 4\n", "two\n",
+    );
+    let working_tree_contents = concat!(
+        "ONE\n", "keep 1\n", "keep 2\n", "keep 3\n", "keep 4\n", "TWO\n",
+    );
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            ".git": {},
+            "file.txt": working_tree_contents,
+        }),
+    )
+    .await;
+
+    fs.set_head_and_index_for_repo(
+        path!("/dir/.git").as_ref(),
+        &[("file.txt", committed_contents.to_owned())],
+    );
+
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/file.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+    let uncommitted_diff = project
+        .update(cx, |project, cx| {
+            project.open_uncommitted_diff(buffer.clone(), cx)
+        })
+        .await
+        .unwrap();
+
+    uncommitted_diff.read_with(cx, |diff, cx| {
+        assert_hunks(
+            diff.snapshot(cx).hunks(&snapshot),
+            &snapshot,
+            &diff.base_text_string(cx).unwrap(),
+            &[
+                (
+                    0..1,
+                    "one\n",
+                    "ONE\n",
+                    DiffHunkStatus::modified(HasSecondaryHunk),
+                ),
+                (
+                    5..6,
+                    "two\n",
+                    "TWO\n",
+                    DiffHunkStatus::modified(HasSecondaryHunk),
+                ),
+            ],
+        );
+    });
+
+    fs.set_index_for_repo(
+        path!("/dir/.git").as_ref(),
+        &[("file.txt", partially_staged_contents.to_owned())],
+    );
+    cx.run_until_parked();
+
+    uncommitted_diff.read_with(cx, |diff, cx| {
+        assert_hunks(
+            diff.snapshot(cx).hunks(&snapshot),
+            &snapshot,
+            &diff.base_text_string(cx).unwrap(),
+            &[
+                (
+                    0..1,
+                    "one\n",
+                    "ONE\n",
+                    DiffHunkStatus::modified(NoSecondaryHunk),
+                ),
+                (
+                    5..6,
+                    "two\n",
+                    "TWO\n",
+                    DiffHunkStatus::modified(HasSecondaryHunk),
+                ),
+            ],
+        );
+    });
+
+    fs.set_head_and_index_for_repo(
+        path!("/dir/.git").as_ref(),
+        &[("file.txt", partially_staged_contents.to_owned())],
+    );
+    cx.run_until_parked();
+
+    uncommitted_diff.read_with(cx, |diff, cx| {
+        assert_hunks(
+            diff.snapshot(cx).hunks(&snapshot),
+            &snapshot,
+            &diff.base_text_string(cx).unwrap(),
+            &[(
+                5..6,
+                "two\n",
+                "TWO\n",
+                DiffHunkStatus::modified(HasSecondaryHunk),
+            )],
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_read_only_files_setting(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 

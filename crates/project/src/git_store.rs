@@ -1450,6 +1450,15 @@ impl GitStore {
         event: &RepositoryEvent,
         cx: &mut Context<Self>,
     ) {
+        if matches!(self.state, GitStoreState::Local { .. })
+            && matches!(
+                event,
+                RepositoryEvent::StatusesChanged | RepositoryEvent::BranchChanged
+            )
+        {
+            repo.update(cx, |repo, cx| repo.reload_buffer_diff_bases(cx));
+        }
+
         let id = repo.read(cx).id;
         let repo_snapshot = repo.read(cx).snapshot.clone();
         for (buffer_id, diff) in self.diffs.iter() {
