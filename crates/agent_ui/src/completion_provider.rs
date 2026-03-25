@@ -146,10 +146,10 @@ pub(crate) enum PromptContextEntry {
 }
 
 impl PromptContextEntry {
-    pub fn keyword(&self) -> &'static str {
+    pub fn keywords(&self) -> &'static [&'static str] {
         match self {
-            Self::Mode(mode) => mode.keyword(),
-            Self::Action(action) => action.keyword(),
+            Self::Mode(mode) => mode.keywords(),
+            Self::Action(action) => action.keywords(),
         }
     }
 }
@@ -171,9 +171,9 @@ pub(crate) enum PromptContextAction {
 }
 
 impl PromptContextAction {
-    pub fn keyword(&self) -> &'static str {
+    pub fn keywords(&self) -> &'static [&'static str] {
         match self {
-            Self::AddSelections => "selection",
+            Self::AddSelections => &["selection", "here"],
         }
     }
 
@@ -262,6 +262,18 @@ impl PromptContextType {
             Self::Skill => "skill",
             Self::Diagnostics => "diagnostics",
             Self::BranchDiff => "branch diff",
+        }
+    }
+
+    pub fn keywords(&self) -> &'static [&'static str] {
+        match self {
+            Self::File => &["file"],
+            Self::Symbol => &["symbol"],
+            Self::Fetch => &["fetch"],
+            Self::Thread => &["thread"],
+            Self::Skill => &["skill", "rule"],
+            Self::Diagnostics => &["diagnostics"],
+            Self::BranchDiff => &["branch diff"],
         }
     }
 
@@ -526,7 +538,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             PromptContextEntry::Action(action) => {
                 let selection = workspace.update(cx, |workspace, cx| {
                     AgentContextSource::from_active(workspace, cx)?
-                        .read_selection(workspace, false, cx)
+                        .read_selection(workspace, true, cx)
                 });
                 Self::completion_for_action(
                     action,
@@ -1200,11 +1212,15 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                 let search_files_task =
                     search_files(query.clone(), cancellation_flag, &workspace, cx);
 
-                let entries = self.available_context_picker_entries(&workspace, cx);
-                let entry_candidates = entries
+                let entry_candidate_entries = self
+                    .available_context_picker_entries(&workspace, cx)
+                    .iter()
+                    .flat_map(|entry| entry.keywords().iter().map(|keyword| (*entry, *keyword)))
+                    .collect::<Vec<_>>();
+                let entry_candidates = entry_candidate_entries
                     .iter()
                     .enumerate()
-                    .map(|(ix, entry)| StringMatchCandidate::new(ix, entry.keyword()))
+                    .map(|(ix, (_, keyword))| StringMatchCandidate::new(ix, keyword))
                     .collect::<Vec<_>>();
 
                 let branch_diff_task = if self
@@ -1234,11 +1250,15 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                     )
                     .await;
 
-                    matches.extend(entry_matches.into_iter().map(|mat| {
-                        Match::Entry(EntryMatch {
-                            entry: entries[mat.candidate_id],
-                            mat: Some(mat),
-                        })
+                    matches.extend(entry_matches.into_iter().filter_map(|mat| {
+                        entry_candidate_entries
+                            .get(mat.candidate_id)
+                            .map(|(entry, _)| {
+                                Match::Entry(EntryMatch {
+                                    entry: *entry,
+                                    mat: Some(mat),
+                                })
+                            })
                     }));
 
                     if let Some(branch_diff_task) = branch_diff_task {
@@ -1370,12 +1390,12 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             entries.push(PromptContextEntry::Mode(PromptContextType::Thread));
         }
 
-        let has_active_selection = workspace.update(cx, |workspace, cx| {
+        let has_active_context_selection = workspace.update(cx, |workspace, cx| {
             AgentContextSource::from_active(workspace, cx)
-                .and_then(|source| source.read_selection(workspace, false, cx))
+                .and_then(|source| source.read_selection(workspace, true, cx))
                 .is_some()
         });
-        if has_active_selection {
+        if has_active_context_selection {
             entries.push(PromptContextEntry::Action(
                 PromptContextAction::AddSelections,
             ));
@@ -2848,7 +2868,72 @@ fn completion_text_for_terminal_selections(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{
+        AnyEntity, Context, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
+        TestAppContext, Window,
+    };
+    use std::any::TypeId;
+    use workspace::{Item, MultiWorkspace};
+
+    struct TestCompletionSource;
+
+    impl PromptCompletionProviderDelegate for TestCompletionSource {
+        fn supported_modes(&self, _cx: &App) -> Vec<PromptContextType> {
+            vec![PromptContextType::File, PromptContextType::Symbol]
+        }
+
+        fn supports_images(&self, _cx: &App) -> bool {
+            false
+        }
+
+        fn available_commands(&self, _cx: &App) -> Vec<AvailableCommand> {
+            Vec::new()
+        }
+
+        fn confirm_command(&self, _cx: &mut App) {}
+    }
+
+    struct EditorWrapperItem {
+        editor: Entity<Editor>,
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<()> for EditorWrapperItem {}
+
+    impl Focusable for EditorWrapperItem {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for EditorWrapperItem {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            gpui::Empty
+        }
+    }
+
+    impl Item for EditorWrapperItem {
+        type Event = ();
+
+        fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+            "Wrapped Editor".into()
+        }
+
+        fn act_as_type<'a>(
+            &'a self,
+            type_id: TypeId,
+            self_handle: &'a Entity<Self>,
+            _cx: &'a App,
+        ) -> Option<AnyEntity> {
+            if type_id == TypeId::of::<Self>() {
+                Some(self_handle.clone().into())
+            } else if type_id == TypeId::of::<Editor>() {
+                Some(self.editor.clone().into())
+            } else {
+                None
+            }
+        }
+    }
 
     #[test]
     fn test_prompt_completion_parse() {
@@ -3285,6 +3370,239 @@ mod tests {
         let results = task.await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_id, alpha.session_id);
+    }
+
+    #[gpui::test]
+    async fn test_selection_context_available_for_active_item_that_acts_as_editor(
+        cx: &mut TestAppContext,
+    ) {
+        use project::Project;
+        use serde_json::json;
+        use util::path;
+        use workspace::AppState;
+
+        let app_state = cx.update(|cx| {
+            let state = AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            workspace::init(state.clone(), cx);
+            state
+        });
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/root"),
+                json!({ "file.rs": "let selected = true;\n" }),
+            )
+            .await;
+
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+
+        let selected_buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer("let selected = true;\n", None, false, cx)
+        });
+        let prompt_buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer("", None, false, cx)
+        });
+
+        let prompt_editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                let selected_editor = cx.new(|cx| {
+                    let mut editor = Editor::for_buffer(
+                        selected_buffer.clone(),
+                        Some(project.clone()),
+                        window,
+                        cx,
+                    );
+                    editor.change_selections(Default::default(), window, cx, |selections| {
+                        selections.select_ranges([Point::new(0, 4)..Point::new(0, 12)]);
+                    });
+                    editor
+                });
+
+                let wrapper = cx.new(|cx| EditorWrapperItem {
+                    editor: selected_editor,
+                    focus_handle: cx.focus_handle(),
+                });
+                workspace.add_item_to_active_pane(Box::new(wrapper), None, true, window, cx);
+
+                anyhow::Ok(cx.new(|cx| {
+                    Editor::for_buffer(prompt_buffer.clone(), Some(project.clone()), window, cx)
+                }))
+            })
+            .unwrap();
+
+        let mention_set = cx.new(|_cx| MentionSet::new(project.downgrade(), None));
+        let provider = PromptCompletionProvider::new(
+            TestCompletionSource,
+            prompt_editor.downgrade(),
+            mention_set,
+            workspace.downgrade(),
+        );
+
+        let entries = cx.update(|_, cx| provider.available_context_picker_entries(&workspace, cx));
+        assert!(
+            entries.contains(&PromptContextEntry::Action(
+                PromptContextAction::AddSelections
+            )),
+            "Selection context should be available for active items that expose an inner editor"
+        );
+
+        let contains_selection_action = |matches: &[Match]| {
+            matches.iter().any(|mat| {
+                matches!(
+                    mat,
+                    Match::Entry(EntryMatch {
+                        entry: PromptContextEntry::Action(PromptContextAction::AddSelections),
+                        ..
+                    })
+                )
+            })
+        };
+
+        let selection_matches = cx
+            .update(|_window, cx| {
+                provider.search_mentions(
+                    None,
+                    "selection".into(),
+                    Arc::new(AtomicBool::default()),
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            contains_selection_action(&selection_matches),
+            "@selection should match the selection action"
+        );
+
+        let here_matches = cx
+            .update(|_window, cx| {
+                provider.search_mentions(None, "here".into(), Arc::new(AtomicBool::default()), cx)
+            })
+            .await;
+        assert!(
+            contains_selection_action(&here_matches),
+            "@here should match the selection action"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_selection_context_available_for_active_editor_cursor(cx: &mut TestAppContext) {
+        use project::Project;
+        use serde_json::json;
+        use util::path;
+        use workspace::AppState;
+
+        let app_state = cx.update(|cx| {
+            let state = AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            workspace::init(state.clone(), cx);
+            state
+        });
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/root"), json!({ "file.rs": "let cursor = true;\n" }))
+            .await;
+
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+
+        let selected_buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer("first line\ncursor line\nlast line\n", None, false, cx)
+        });
+        let prompt_buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer("", None, false, cx)
+        });
+
+        let prompt_editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                let selected_editor = cx.new(|cx| {
+                    let mut editor = Editor::for_buffer(
+                        selected_buffer.clone(),
+                        Some(project.clone()),
+                        window,
+                        cx,
+                    );
+                    editor.change_selections(Default::default(), window, cx, |selections| {
+                        selections.select_ranges([Point::new(1, 3)..Point::new(1, 3)]);
+                    });
+                    editor
+                });
+
+                let wrapper = cx.new(|cx| EditorWrapperItem {
+                    editor: selected_editor,
+                    focus_handle: cx.focus_handle(),
+                });
+                workspace.add_item_to_active_pane(Box::new(wrapper), None, true, window, cx);
+
+                anyhow::Ok(cx.new(|cx| {
+                    Editor::for_buffer(prompt_buffer.clone(), Some(project.clone()), window, cx)
+                }))
+            })
+            .unwrap();
+
+        let mention_set = cx.new(|_cx| MentionSet::new(project.downgrade(), None));
+        let provider = PromptCompletionProvider::new(
+            TestCompletionSource,
+            prompt_editor.downgrade(),
+            mention_set,
+            workspace.downgrade(),
+        );
+
+        let entries = cx.update(|_, cx| provider.available_context_picker_entries(&workspace, cx));
+        assert!(
+            entries.contains(&PromptContextEntry::Action(
+                PromptContextAction::AddSelections
+            )),
+            "Selection context should be available for an active editor cursor"
+        );
+
+        let contains_selection_action = |matches: &[Match]| {
+            matches.iter().any(|mat| {
+                matches!(
+                    mat,
+                    Match::Entry(EntryMatch {
+                        entry: PromptContextEntry::Action(PromptContextAction::AddSelections),
+                        ..
+                    })
+                )
+            })
+        };
+
+        let selection_matches = cx
+            .update(|_window, cx| {
+                provider.search_mentions(
+                    None,
+                    "selection".into(),
+                    Arc::new(AtomicBool::default()),
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            contains_selection_action(&selection_matches),
+            "@selection should match the selection action when only a cursor is active"
+        );
+
+        let here_matches = cx
+            .update(|_window, cx| {
+                provider.search_mentions(None, "here".into(), Arc::new(AtomicBool::default()), cx)
+            })
+            .await;
+        assert!(
+            contains_selection_action(&here_matches),
+            "@here should match the selection action when only a cursor is active"
+        );
     }
 
     #[gpui::test]
