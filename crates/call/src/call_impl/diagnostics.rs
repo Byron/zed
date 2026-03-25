@@ -307,6 +307,7 @@ fn compute_network_stats(stats: &livekit_client::SessionStats) -> ComputedNetwor
 #[cfg(all(
     not(rust_analyzer),
     any(
+        not(feature = "webrtc"),
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
@@ -326,12 +327,15 @@ fn compute_remote_audio_stats(
 
 #[cfg(any(
     rust_analyzer,
-    not(any(
-        test,
-        feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
-    ))
+    all(
+        feature = "webrtc",
+        not(any(
+            test,
+            feature = "test-support",
+            all(target_os = "windows", target_env = "gnu"),
+            target_os = "freebsd"
+        ))
+    )
 ))]
 fn compute_remote_audio_stats(
     stats: &livekit_client::SessionStats,
@@ -460,6 +464,7 @@ fn compute_remote_audio_stats(
 #[cfg(all(
     not(rust_analyzer),
     any(
+        not(feature = "webrtc"),
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
@@ -477,12 +482,15 @@ fn extract_metrics(
 
 #[cfg(any(
     rust_analyzer,
-    not(any(
-        test,
-        feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
-    ))
+    all(
+        feature = "webrtc",
+        not(any(
+            test,
+            feature = "test-support",
+            all(target_os = "windows", target_env = "gnu"),
+            target_os = "freebsd"
+        ))
+    )
 ))]
 fn extract_metrics(
     stat: &livekit_client::RtcStats,
