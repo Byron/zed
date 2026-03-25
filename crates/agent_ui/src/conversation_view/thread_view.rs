@@ -6396,7 +6396,7 @@ impl ThreadView {
             .and_then(|ws| {
                 ws.read(cx)
                     .active_item(cx)
-                    .and_then(|item| item.downcast::<Editor>())
+                    .and_then(|item| item.act_as::<Editor>(cx))
             })
             .is_some_and(|editor| {
                 editor.update(cx, |editor, cx| {
@@ -14193,13 +14193,23 @@ mod tests {
         crate::test_support::init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/other"), json!({"other.txt": ""}))
+            .await;
         fs.insert_tree(
             path!("/project"),
-            json!({"src": {"main.rs": "first\nsecond\nthird\n"}}),
+            json!({
+                "src": {"main.rs": "first\nsecond\nthird\n"},
+                "README.md": "first\nsecond\nthird\n",
+            }),
         )
         .await;
 
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let project = Project::test(
+            fs,
+            [path!("/other").as_ref(), path!("/project").as_ref()],
+            cx,
+        )
+        .await;
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
@@ -14231,7 +14241,65 @@ mod tests {
         editor.update_in(cx, |editor, window, cx| {
             let snapshot = editor.snapshot(window, cx);
             assert_eq!(editor.selections.newest::<Point>(&snapshot).head().row, 1);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([Point::zero()..Point::zero()]);
+            });
         });
+
+        for (link, expected_path, expected_point) in [
+            (
+                "src/main.rs:2",
+                path!("/project/src/main.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                "src/main.rs:2:3",
+                path!("/project/src/main.rs"),
+                Point::new(1, 2),
+            ),
+            (
+                "project/src/main.rs:2",
+                path!("/project/src/main.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                "project/src/main.rs:2:3",
+                path!("/project/src/main.rs"),
+                Point::new(1, 2),
+            ),
+            ("README.md:2", path!("/project/README.md"), Point::new(1, 0)),
+            (
+                "project/README.md:2:3",
+                path!("/project/README.md"),
+                Point::new(1, 2),
+            ),
+        ] {
+            multi_workspace.update_in(cx, |_, window, cx| {
+                open_link(link.into(), &workspace_weak, window, cx);
+            });
+            cx.run_until_parked();
+            let editor = workspace.read_with(cx, |workspace, cx| {
+                let item = workspace.active_item(cx).expect("file should be open");
+                let project_path = item.project_path(cx).expect("file should have a path");
+                assert_eq!(
+                    project.read(cx).absolute_path(&project_path, cx).as_deref(),
+                    Some(Path::new(expected_path)),
+                    "{link}",
+                );
+                item.downcast::<Editor>().expect("file should be an editor")
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                assert_eq!(
+                    editor.selections.newest::<Point>(&snapshot).head(),
+                    expected_point,
+                    "{link}",
+                );
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([Point::zero()..Point::zero()]);
+                });
+            });
+        }
 
         // Absolute path
         let abs_path: SharedString = path!("/project/src/main.rs").to_string().into();
