@@ -17,7 +17,9 @@ doctest = false
 name = "test_app"
 
 [features]
+default = []
 test-support = ["collections/test-support", "gpui/test-support", "livekit_api/test-support"]
+webrtc = ["audio/webrtc", "dep:libwebrtc", "dep:livekit", "dep:webrtc-sys"]
 
 [dependencies]
 anyhow.workspace = true
@@ -44,12 +46,12 @@ ui.workspace = true
 util.workspace = true
 
 [target.'cfg(not(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd")))'.dependencies]
-libwebrtc.workspace = true
-livekit.workspace = true
+libwebrtc = { workspace = true, optional = true }
+livekit = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio = { workspace = true, features = ["time"] }
-webrtc-sys.workspace = true
+webrtc-sys = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies]
 scap.workspace = true

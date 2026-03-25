@@ -14,6 +14,7 @@ doctest = false
 
 [features]
 default = []
+webrtc = ["call/webrtc", "livekit_client/webrtc", "title_bar/webrtc"]
 test-support = [
     "call/test-support",
     "client/test-support",

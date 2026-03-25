@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export ZED_BUNDLE_BUILD_FLAG="--profile release-fast-small"
+export ZED_BUNDLE_TARGET_DIR="release-fast-small"
+export ZED_BUNDLE_STRIP_BINARIES="true"
+
+exec "${script_dir}/bundle-mac" "$@"
