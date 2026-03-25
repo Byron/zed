@@ -159,11 +159,18 @@ function ZipZedAndItsFriendsDebug {
         ".\$CargoOutDir\zed.pdb",
         ".\$CargoOutDir\cli.pdb",
         ".\$CargoOutDir\auto_update_helper.pdb",
-        ".\$CargoOutDir\explorer_command_injector.pdb",
-        ".\$CargoOutDir\remote_server.pdb"
+        ".\$CargoOutDir\explorer_command_injector.pdb"
     )
+    if (ShouldBundleRemoteServer) {
+        $items += ".\$CargoOutDir\remote_server.pdb"
+    }
 
     Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
+}
+
+function ShouldBundleRemoteServer {
+    $value = $env:ZED_BUNDLE_REMOTE_SERVER
+    return $value -in @("1", "true", "TRUE", "yes", "YES", "on", "ON")
 }
 
 
@@ -385,7 +392,12 @@ CheckEnvironmentVariables
 PrepareForBundle
 GenerateLicenses
 BuildZedAndItsFriends
-BuildRemoteServer
+if (ShouldBundleRemoteServer) {
+    BuildRemoteServer
+}
+else {
+    Write-Output "Skipping remote_server bundle artifact. Set ZED_BUNDLE_REMOTE_SERVER=1 to include it."
+}
 MakeAppx
 SignZedAndItsFriends
 ZipZedAndItsFriendsDebug

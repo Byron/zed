@@ -1094,6 +1094,19 @@ debug = "full"
 lto = false
 codegen-units = 16
 
+[profile.release-fast-small]
+inherits = "release-fast"
+panic = "abort"
+
+[profile.release-size]
+inherits = "release"
+debug = false
+strip = "symbols"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }
 

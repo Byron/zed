@@ -4,6 +4,7 @@ name: release_nightly
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
+  ZED_BUNDLE_REMOTE_SERVER: '1'
 on:
   schedule:
   - cron: 0 */4 * * *

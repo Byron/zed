@@ -12,28 +12,35 @@ pub use record::CaptureInput;
 
 #[cfg(any(
     rust_analyzer,
-    not(any(
-        test,
-        feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
-    ))
+    all(
+        feature = "webrtc",
+        not(any(
+            test,
+            feature = "test-support",
+            all(target_os = "windows", target_env = "gnu"),
+            target_os = "freebsd"
+        ))
+    )
 ))]
 mod livekit_client;
 #[cfg(any(
     rust_analyzer,
-    not(any(
-        test,
-        feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
-    ))
+    all(
+        feature = "webrtc",
+        not(any(
+            test,
+            feature = "test-support",
+            all(target_os = "windows", target_env = "gnu"),
+            target_os = "freebsd"
+        ))
+    )
 ))]
 pub use livekit_client::*;
 
 #[cfg(all(
     not(rust_analyzer),
     any(
+        not(feature = "webrtc"),
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
@@ -44,6 +51,7 @@ mod mock_client;
 #[cfg(all(
     not(rust_analyzer),
     any(
+        not(feature = "webrtc"),
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
@@ -54,6 +62,7 @@ pub mod test;
 #[cfg(all(
     not(rust_analyzer),
     any(
+        not(feature = "webrtc"),
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),

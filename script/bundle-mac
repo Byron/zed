@@ -3,8 +3,8 @@
 set -euo pipefail
 source script/lib/blob-store.sh
 
-build_flag="--release"
-target_dir="release"
+build_flag="${ZED_BUNDLE_BUILD_FLAG:---release}"
+target_dir="${ZED_BUNDLE_TARGET_DIR:-release}"
 open_result=false
 local_install=false
 can_code_sign=false
@@ -56,6 +56,24 @@ popd
 
 export ZED_BUNDLE=true
 
+function should_bundle_remote_server() {
+    case "${ZED_BUNDLE_REMOTE_SERVER:-}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+function should_strip_binaries() {
+    if [[ "$target_dir" = "debug" ]]; then
+        return 1
+    fi
+
+    case "${ZED_BUNDLE_STRIP_BINARIES:-}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
 if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
     cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
@@ -88,9 +106,13 @@ rustup target add $target_triple
 
 echo "Compiling zed binaries"
 cargo --config .cargo/bundle-config.toml build ${build_flag} --package zed --package cli --target $target_triple
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_server --target $target_triple
+if should_bundle_remote_server; then
+    # Build remote_server in separate invocation to prevent feature unification from other crates
+    # from influencing dynamic libraries required by it.
+    cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_server --target $target_triple
+else
+    echo "Skipping remote_server bundle artifact. Set ZED_BUNDLE_REMOTE_SERVER=1 to include it."
+fi
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -303,10 +325,21 @@ function extract_debug_symbols() {
         cat target/dsymutil.log
         exit 1
     fi
-    if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
-        echo "dsymutil failed"
-        cat target/dsymutil.log
-        exit 1
+    if should_bundle_remote_server; then
+        if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
+            echo "dsymutil failed"
+            cat target/dsymutil.log
+            exit 1
+        fi
+    fi
+}
+
+function strip_binary() {
+    local binary_path=$1
+
+    if should_strip_binaries; then
+        echo "Stripping executable $binary_path"
+        /usr/bin/strip -S -x "$binary_path"
     fi
 }
 
@@ -317,11 +350,14 @@ function upload_debug_symbols() {
         echo "Uploading zed debug symbols to sentry..."
         extract_debug_symbols
         # Try uploading up to 3 times
+        sentry_debug_files=("target/${target_triple}/${target_dir}/zed.dwarf")
+        if should_bundle_remote_server; then
+            sentry_debug_files+=("target/${target_triple}/${target_dir}/remote_server.dwarf")
+        fi
         for attempt in 1 2 3; do
             echo "Sentry upload attempt $attempt..."
             if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "target/${target_triple}/${target_dir}/zed.dwarf" \
-                "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
+                "${sentry_debug_files[@]}"; then
                 break
             else
                 echo "Sentry upload failed on attempt $attempt"
@@ -345,12 +381,19 @@ if [[ "$target_dir" == "release" && "$local_install" != true ]]; then
     extract_debug_symbols
     strip -x "target/${target_triple}/${target_dir}/zed"
     strip -x "target/${target_triple}/${target_dir}/cli"
-    strip -x "target/${target_triple}/${target_dir}/remote_server"
+    if should_bundle_remote_server; then
+        strip -x "target/${target_triple}/${target_dir}/remote_server"
+    fi
 fi
 
 cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+strip_binary "${app_path}/Contents/MacOS/zed"
+strip_binary "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+if should_bundle_remote_server; then
+    strip_binary "target/$target_triple/$target_dir/remote_server"
+    sign_binary "target/$target_triple/$target_dir/remote_server"
+    gzip -f --stdout --best target/$target_triple/$target_dir/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+fi
