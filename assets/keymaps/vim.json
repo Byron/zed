@@ -1072,7 +1072,7 @@
       "shift-g": "menu::SelectLast",
       "g g": "menu::SelectFirst",
       "-": "outline_panel::SelectParent",
-      "enter": "editor::ToggleFocus",
+      "enter": "outline_panel::OpenSelectedEntry",
       "/": "menu::Cancel",
       "ctrl-u": "outline_panel::ScrollUp",
       "ctrl-d": "outline_panel::ScrollDown",

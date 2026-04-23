@@ -26,7 +26,7 @@ use itertools::Itertools;
 use language::{Anchor, BufferId, BufferSnapshot, OffsetRangeExt, OutlineItem};
 use language::{LanguageAwareStyling, language_settings::LanguageSettings};
 
-use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
+use menu::{Cancel, Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use std::{
     cmp,
     collections::BTreeMap,
@@ -1036,6 +1036,14 @@ impl OutlinePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.confirm_selected_entry(window, cx);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_selected_entry(window, cx);
+    }
+
+    fn confirm_selected_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter_editor.focus_handle(cx).is_focused(window) {
             cx.propagate()
         } else if let Some(selected_entry) = self.selected_entry().cloned() {
@@ -1144,8 +1152,10 @@ impl OutlinePanel {
                 .anchor_in_excerpt(outline.range.start)
                 .or_else(|| multi_buffer_snapshot.anchor_in_excerpt(outline.range.end)),
             PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => {
-                change_selection = false;
-                change_focus = false;
+                if !prefer_focus_change {
+                    change_selection = false;
+                    change_focus = false;
+                }
                 multi_buffer_snapshot.anchor_in_excerpt(excerpt.context.start)
             }
             PanelEntry::Search(search_entry) => Some(search_entry.match_range.start),
@@ -2256,15 +2266,16 @@ impl OutlinePanel {
             }
             _ => false,
         };
-        let has_outlines = self
-            .buffers
-            .get(&excerpt.context.start.buffer_id)
-            .and_then(|buffer| match &buffer.outlines {
-                OutlineState::Outlines(outlines) => Some(outlines),
-                OutlineState::Invalidated(outlines) => Some(outlines),
-                OutlineState::NotFetched => None,
-            })
-            .is_some_and(|outlines| !outlines.is_empty());
+        let has_outlines = self.is_singleton_active(cx)
+            && self
+                .buffers
+                .get(&excerpt.context.start.buffer_id)
+                .and_then(|buffer| match &buffer.outlines {
+                    OutlineState::Outlines(outlines) => Some(outlines),
+                    OutlineState::Invalidated(outlines) => Some(outlines),
+                    OutlineState::NotFetched => None,
+                })
+                .is_some_and(|outlines| !outlines.is_empty());
         let is_expanded = !self
             .collapsed_entries
             .contains(&CollapsedEntry::Excerpt(excerpt.clone()));
@@ -4459,7 +4470,7 @@ impl OutlinePanel {
         parent_depth: usize,
         track_matches: bool,
         is_singleton: bool,
-        query: Option<&str>,
+        _query: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         let Some(buffer) = self.buffers.get(&buffer_id) else {
@@ -4478,16 +4489,14 @@ impl OutlinePanel {
                 cx,
             );
 
+            if !is_singleton {
+                continue;
+            }
+
             let mut outline_base_depth = excerpt_depth + 1;
             if is_singleton {
                 outline_base_depth = 0;
                 state.clear();
-            } else if query.is_none()
-                && self
-                    .collapsed_entries
-                    .contains(&CollapsedEntry::Excerpt(excerpt.clone()))
-            {
-                continue;
             }
 
             let mut last_depth_at_level: Vec<Option<Range<Anchor>>> = vec![None; 10];
@@ -5267,6 +5276,7 @@ impl Render for OutlinePanel {
             .relative()
             .key_context(self.dispatch_context(window, cx))
             .on_action(cx.listener(Self::open_selected_entry))
+            .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::scroll_up))
             .on_action(cx.listener(Self::scroll_down))
@@ -6147,6 +6157,261 @@ outline: fn hints_lifetimes_named  <==== selected"
                 "When opening the excerpt, should navigate to the place corresponding the outline entry"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_multibuffer_outline_shows_excerpt_rows_only(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/test",
+            json!({
+                "src": {
+                    "one.rs": indoc!("
+                        struct First {
+                            value: i32,
+                        }
+
+                        fn first_function() {}
+                    "),
+                    "two.rs": indoc!("
+                        enum Second {
+                            Ready,
+                        }
+
+                        fn second_function() {}
+                    "),
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
+        project.read_with(cx, |project, _| project.languages().add(rust_lang()));
+
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+
+        let first_editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from("/test/src/one.rs"),
+                    OpenOptions {
+                        visible: Some(OpenVisible::All),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        let second_editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from("/test/src/two.rs"),
+                    OpenOptions {
+                        visible: Some(OpenVisible::All),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+
+        let first_buffer = first_editor
+            .read_with(cx, |editor, cx| editor.buffer().read(cx).as_singleton())
+            .expect("first editor should have a singleton buffer");
+        let second_buffer = second_editor
+            .read_with(cx, |editor, cx| editor.buffer().read(cx).as_singleton())
+            .expect("second editor should have a singleton buffer");
+
+        let multibuffer = cx.new(|_| editor::MultiBuffer::new(language::Capability::ReadWrite));
+        multibuffer.update(cx, |multibuffer, cx| {
+            multibuffer.set_excerpts_for_buffer(
+                first_buffer.clone(),
+                [language::Point::new(0, 0)..language::Point::new(4, 0)],
+                0,
+                cx,
+            );
+            multibuffer.set_excerpts_for_buffer(
+                second_buffer.clone(),
+                [language::Point::new(0, 0)..language::Point::new(4, 0)],
+                0,
+                cx,
+            );
+        });
+
+        let multibuffer_editor = workspace.update_in(cx, |workspace, window, cx| {
+            let editor = cx.new(|cx| {
+                Editor::for_multibuffer(multibuffer.clone(), Some(project.clone()), window, cx)
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(500));
+        cx.run_until_parked();
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.update_non_fs_items(window, cx);
+            outline_panel.update_cached_entries(Some(UPDATE_DEBOUNCE), window, cx);
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(500));
+        cx.run_until_parked();
+
+        let excerpt_entries = outline_panel.read_with(cx, |outline_panel, cx| {
+            assert_eq!(
+                outline_panel.active_editor(),
+                Some(multibuffer_editor.clone()),
+                "The multibuffer editor should drive the outline panel"
+            );
+            assert!(
+                !outline_panel.is_singleton_active(cx),
+                "The outline should be rendering a non-singleton multibuffer"
+            );
+
+            let outline_entries = outline_entry_labels(outline_panel, cx);
+            assert_eq!(outline_entries.len(), 2);
+            assert!(
+                outline_entries
+                    .iter()
+                    .all(|entry| entry.starts_with("excerpt: Lines ")),
+                "Multi-buffer outline should stop at excerpt rows: {outline_entries:?}"
+            );
+            assert!(
+                outline_panel.cached_entries.iter().all(|entry| !matches!(
+                    entry.entry,
+                    PanelEntry::Outline(OutlineEntry::Outline(_))
+                )),
+                "Multi-buffer outline should not include syntax entries beneath excerpts"
+            );
+
+            outline_panel
+                .cached_entries
+                .iter()
+                .filter_map(|entry| match &entry.entry {
+                    PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => Some(excerpt.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            excerpt_entries.len(),
+            2,
+            "expected one excerpt entry for each multibuffer excerpt"
+        );
+        let first_excerpt_entry = excerpt_entries[0].clone();
+        let second_excerpt_entry = excerpt_entries[1].clone();
+
+        cx.update(|window, cx| {
+            let first_excerpt_anchor = multibuffer
+                .read(cx)
+                .snapshot(cx)
+                .anchor_in_excerpt(first_excerpt_entry.context.start)
+                .expect("first excerpt start should be in the multibuffer");
+            multibuffer_editor.update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges(Some(first_excerpt_anchor..first_excerpt_anchor))
+                });
+            });
+            outline_panel.update(cx, |outline_panel, cx| {
+                outline_panel.select_entry(
+                    PanelEntry::Outline(OutlineEntry::Excerpt(first_excerpt_entry.clone())),
+                    true,
+                    window,
+                    cx,
+                );
+                outline_panel.select_next(&SelectNext, window, cx);
+                outline_panel.select_next(&SelectNext, window, cx);
+            });
+        });
+        assert_eq!(
+            cx.update(|_, cx| selected_row_text(&multibuffer_editor, cx)),
+            "struct First {",
+            "Selecting another Lines entry should scroll without moving the editor cursor"
+        );
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            assert_eq!(
+                outline_panel.selected_entry(),
+                Some(&PanelEntry::Outline(OutlineEntry::Excerpt(
+                    second_excerpt_entry.clone()
+                )))
+            );
+            assert!(
+                !multibuffer_editor.read(cx).is_focused(window),
+                "Selecting a Lines entry should keep focus in the outline panel"
+            );
+            outline_panel.confirm(&Confirm, window, cx);
+            assert!(
+                multibuffer_editor.read(cx).is_focused(window),
+                "Confirming a Lines entry should focus the multi-editor"
+            );
+        });
+        assert_eq!(
+            cx.update(|_, cx| selected_row_text(&multibuffer_editor, cx)),
+            "enum Second {",
+            "Confirming a Lines entry should move the editor cursor to its start"
+        );
+
+        let multi_buffer_entries_before_collapse = outline_panel
+            .read_with(cx, |outline_panel, cx| {
+                outline_entry_labels(outline_panel, cx)
+            });
+
+        cx.update(|window, cx| {
+            outline_panel.update(cx, |outline_panel, cx| {
+                outline_panel.select_entry(
+                    PanelEntry::Outline(OutlineEntry::Excerpt(first_excerpt_entry.clone())),
+                    false,
+                    window,
+                    cx,
+                );
+                outline_panel.collapse_selected_entry(&CollapseSelectedEntry, window, cx);
+            });
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        let multi_buffer_entries_after_collapse = outline_panel
+            .read_with(cx, |outline_panel, cx| {
+                outline_entry_labels(outline_panel, cx)
+            });
+        assert_eq!(
+            multi_buffer_entries_after_collapse, multi_buffer_entries_before_collapse,
+            "Collapsing a multi-buffer excerpt should not reveal or hide syntax entries"
+        );
+
+        cx.update(|window, cx| {
+            outline_panel.update(cx, |outline_panel, cx| {
+                outline_panel.expand_selected_entry(&ExpandSelectedEntry, window, cx);
+            });
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        let multi_buffer_entries_after_expand = outline_panel.read_with(cx, |outline_panel, cx| {
+            outline_entry_labels(outline_panel, cx)
+        });
+        assert_eq!(
+            multi_buffer_entries_after_expand, multi_buffer_entries_before_collapse,
+            "Expanding a multi-buffer excerpt should keep the excerpt-only outline unchanged"
+        );
     }
 
     #[gpui::test]
@@ -7163,6 +7428,22 @@ outline: struct OutlineEntryExcerpt
             }
         }
         display_string
+    }
+
+    fn outline_entry_labels(outline_panel: &OutlinePanel, cx: &App) -> Vec<String> {
+        outline_panel
+            .cached_entries
+            .iter()
+            .filter_map(|entry| match &entry.entry {
+                PanelEntry::Outline(OutlineEntry::Excerpt(excerpt)) => outline_panel
+                    .excerpt_label(excerpt, cx)
+                    .map(|label| format!("excerpt: {label}")),
+                PanelEntry::Outline(OutlineEntry::Outline(outline)) => {
+                    Some(format!("outline: {}", outline.text))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn init_test(cx: &mut TestAppContext) {
