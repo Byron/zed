@@ -10740,6 +10740,63 @@ async fn test_sort_mode_directories_first(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_mod_rs_and_lib_rs_are_sorted_first_among_files_in_directories_first_mode(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "aardvark.rs": "",
+                "helpers": {},
+                "lib.rs": "",
+                "mod.rs": "",
+                "zebra.rs": "",
+            },
+            "tests": {},
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    toggle_expand_dir(&panel, "root/src", cx);
+
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..50, cx),
+        &[
+            "v root",
+            "    v src  <== selected",
+            "        > helpers",
+            "          mod.rs",
+            "          lib.rs",
+            "          aardvark.rs",
+            "          zebra.rs",
+            "    > tests",
+        ]
+    );
+    assert!(
+        find_project_entry(&panel, "root/src/mod.rs", cx).is_some(),
+        "mod.rs should remain nested under src"
+    );
+    assert_eq!(
+        find_project_entry(&panel, "root/mod.rs", cx),
+        None,
+        "mod.rs should not be promoted to the worktree root"
+    );
+}
+
+#[gpui::test]
 async fn test_sort_mode_mixed(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
@@ -10787,6 +10844,61 @@ async fn test_sort_mode_mixed(cx: &mut gpui::TestAppContext) {
             "      Banana.rs",
             "    > carrot",
             "      Zebra.txt",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_mod_rs_and_lib_rs_are_sorted_first_among_files_in_files_first_mode(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "apple": {},
+                "Aardvark.rs": "",
+                "lib.rs": "",
+                "mod.rs": "",
+                "Zebra.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    cx.update(|_, cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project_panel.get_or_insert_default().sort_mode =
+                    Some(settings::ProjectPanelSortMode::FilesFirst);
+            });
+        });
+    });
+
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    toggle_expand_dir(&panel, "root/src", cx);
+
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..50, cx),
+        &[
+            "v root",
+            "    v src  <== selected",
+            "          mod.rs",
+            "          lib.rs",
+            "          Aardvark.rs",
+            "          Zebra.rs",
+            "        > apple",
         ]
     );
 }

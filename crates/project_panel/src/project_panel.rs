@@ -7925,9 +7925,33 @@ fn cmp_worktree_entries(
     mode: &settings::ProjectPanelSortMode,
     order: &settings::ProjectPanelSortOrder,
 ) -> cmp::Ordering {
+    if *mode != settings::ProjectPanelSortMode::Mixed
+        && a.is_file()
+        && b.is_file()
+        && a.path.parent() == b.path.parent()
+        && let (Some(a_file_name), Some(b_file_name)) = (a.path.file_name(), b.path.file_name())
+    {
+        // In Mixed mode, a file-only override can produce comparison cycles with sibling
+        // directories, so keep the special case to grouped file modes.
+        let a_priority = rust_entrypoint_file_sort_priority(a_file_name);
+        let b_priority = rust_entrypoint_file_sort_priority(b_file_name);
+
+        if a_priority != b_priority {
+            return a_priority.cmp(&b_priority);
+        }
+    }
+
     let a = (&*a.path, a.is_file());
     let b = (&*b.path, b.is_file());
     util::paths::compare_rel_paths_by(a, b, (*mode).into(), (*order).into())
+}
+
+fn rust_entrypoint_file_sort_priority(file_name: &str) -> usize {
+    match file_name {
+        "mod.rs" => 0,
+        "lib.rs" => 1,
+        _ => 2,
+    }
 }
 
 pub fn sort_worktree_entries(
