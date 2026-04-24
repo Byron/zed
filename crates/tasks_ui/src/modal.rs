@@ -750,7 +750,9 @@ mod tests {
     use serde_json::json;
     use task::{TaskTemplate, TaskTemplates};
     use util::path;
-    use workspace::{CloseInactiveTabsAndPanes, MultiWorkspace, OpenOptions, OpenVisible};
+    use workspace::{
+        CloseInactiveTabsAndPanes, FocusCenterPane, MultiWorkspace, OpenOptions, OpenVisible,
+    };
 
     use crate::{modal::Spawn, tests::init_test};
 
@@ -927,6 +929,47 @@ mod tests {
             task_names(&tasks_picker, cx),
             vec!["echo 4", "another one", "example task"],
         );
+    }
+
+    #[gpui::test]
+    async fn test_focus_center_pane_dismisses_spawn_tasks_modal(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({ "a.ts": "a" })).await;
+
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let _item = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from(path!("/dir/a.ts")),
+                    OpenOptions {
+                        visible: Some(OpenVisible::All),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.executor().run_until_parked();
+
+        let _tasks_picker = open_spawn_tasks(&workspace, cx);
+        cx.executor().run_until_parked();
+        workspace.update(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<TasksModal>(cx).is_some());
+        });
+
+        cx.dispatch_action(FocusCenterPane);
+        cx.executor().run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<TasksModal>(cx).is_none());
+        });
     }
 
     #[gpui::test]
