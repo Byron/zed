@@ -37,6 +37,14 @@ pub trait ToolbarItemView: Render + EventEmitter<ToolbarItemEvent> {
     ) {
     }
 
+    fn dismiss_for_center_pane_focus(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        false
+    }
+
     fn contribute_context(&self, _context: &mut KeyContext, _cx: &App) {}
 }
 
@@ -50,6 +58,7 @@ trait ToolbarItemViewHandle: Send {
         cx: &mut App,
     ) -> ToolbarItemLocation;
     fn focus_changed(&mut self, pane_focused: bool, window: &mut Window, cx: &mut App);
+    fn dismiss_for_center_pane_focus(&mut self, window: &mut Window, cx: &mut App) -> bool;
     fn contribute_context(&self, context: &mut KeyContext, cx: &App);
 }
 
@@ -235,6 +244,16 @@ impl Toolbar {
         }
     }
 
+    pub fn dismiss_for_center_pane_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.items
+            .iter_mut()
+            .any(|(toolbar_item, _)| toolbar_item.dismiss_for_center_pane_focus(window, cx))
+    }
+
     pub fn item_of_type<T: ToolbarItemView>(&self) -> Option<Entity<T>> {
         self.items
             .iter()
@@ -279,6 +298,12 @@ impl<T: ToolbarItemView> ToolbarItemViewHandle for Entity<T> {
             this.pane_focus_update(pane_focused, window, cx);
             cx.notify();
         });
+    }
+
+    fn dismiss_for_center_pane_focus(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.update(cx, |this, cx| {
+            this.dismiss_for_center_pane_focus(window, cx)
+        })
     }
 
     fn contribute_context(&self, context: &mut KeyContext, cx: &App) {
