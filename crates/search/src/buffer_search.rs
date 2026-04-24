@@ -621,6 +621,19 @@ impl ToolbarItemView for BufferSearchBar {
         }
         ToolbarItemLocation::Hidden
     }
+
+    fn dismiss_for_center_pane_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.is_dismissed() {
+            return false;
+        }
+
+        self.dismiss(&Dismiss, window, cx);
+        true
+    }
 }
 
 impl BufferSearchBar {
@@ -1878,17 +1891,21 @@ mod tests {
         SELECTION_HIGHLIGHT_DEBOUNCE_TIMEOUT, SearchSettings, SelectionEffects, SoftWrap,
         display_map::DisplayRow, test::editor_test_context::EditorTestContext,
     };
+    use fs::FakeFs;
     use futures::stream::StreamExt as _;
     use gpui::{FocusHandle, Hsla, TestAppContext, UpdateGlobal, VisualTestContext};
     use language::{Buffer, Point};
-    #[cfg(target_os = "macos")]
     use project::Project;
+    use serde_json::json;
     use settings::{SearchSettingsContent, SettingsStore};
     use unindent::Unindent as _;
+    use util::{path, rel_path::rel_path};
     use util_macros::perf;
     #[cfg(target_os = "macos")]
-    use workspace::{AppState, MultiWorkspace, Workspace};
-    use workspace::{item::Item, searchable::SearchableItem};
+    use workspace::AppState;
+    use workspace::{
+        FocusCenterPane, MultiWorkspace, Workspace, item::Item, searchable::SearchableItem,
+    };
 
     fn init_globals(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2017,6 +2034,65 @@ mod tests {
         let cx = VisualTestContext::from_window(*window, cx).into_mut();
 
         (editor.unwrap(), search_bar, cx)
+    }
+
+    #[gpui::test]
+    async fn test_focus_center_pane_dismisses_buffer_search_bar(cx: &mut TestAppContext) {
+        init_globals(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({ "a.rs": "const A: usize = 1;" }))
+            .await;
+
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |workspace, _| workspace.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        let editor = workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        cx.run_until_parked();
+
+        let search_bar = cx.new_window_entity(|window, cx| {
+            let mut search_bar =
+                BufferSearchBar::new(Some(project.read(cx).languages().clone()), window, cx);
+            search_bar.set_active_pane_item(Some(&editor), window, cx);
+            search_bar.show(window, cx);
+            search_bar
+        });
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.toolbar().update(cx, |toolbar, cx| {
+                    toolbar.add_item(search_bar.clone(), window, cx)
+                })
+            });
+        });
+
+        search_bar.update_in(&mut cx, |search_bar, window, cx| {
+            search_bar.focus_handle(cx).focus(window, cx);
+            assert!(!search_bar.is_dismissed());
+        });
+
+        cx.dispatch_action(FocusCenterPane);
+        cx.run_until_parked();
+
+        search_bar.update_in(&mut cx, |search_bar, window, cx| {
+            assert!(search_bar.is_dismissed());
+            assert!(editor.focus_handle(cx).contains_focused(window, cx));
+        });
     }
 
     #[perf]

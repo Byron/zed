@@ -4522,11 +4522,31 @@ impl Workspace {
     }
 
     pub fn focus_center_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.prepare_to_focus_center_pane(window, cx) {
+            return;
+        }
+
         if let Some(item) = self.active_item(cx) {
             item.item_focus_handle(cx).focus(window, cx);
         } else {
             log::error!("Could not find a focus target when switching focus to the center panes",);
         }
+    }
+
+    fn prepare_to_focus_center_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.has_active_modal(window, cx) && !self.hide_modal(window, cx) {
+            return false;
+        }
+
+        !self.active_pane().update(cx, |pane, cx| {
+            pane.toolbar().update(cx, |toolbar, cx| {
+                toolbar.dismiss_for_center_pane_focus(window, cx)
+            })
+        })
     }
 
     pub fn activate_panel_for_proto_id(
@@ -15606,11 +15626,24 @@ mod tests {
         });
     }
 
-    struct TestModal(FocusHandle);
+    struct TestModal {
+        focus_handle: FocusHandle,
+        can_dismiss: bool,
+    }
 
     impl TestModal {
         fn new(_: &mut Window, cx: &mut Context<Self>) -> Self {
-            Self(cx.focus_handle())
+            Self {
+                focus_handle: cx.focus_handle(),
+                can_dismiss: true,
+            }
+        }
+
+        fn non_dismissible(_: &mut Window, cx: &mut Context<Self>) -> Self {
+            Self {
+                focus_handle: cx.focus_handle(),
+                can_dismiss: false,
+            }
         }
     }
 
@@ -15618,11 +15651,19 @@ mod tests {
 
     impl Focusable for TestModal {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
-            self.0.clone()
+            self.focus_handle.clone()
         }
     }
 
-    impl ModalView for TestModal {}
+    impl ModalView for TestModal {
+        fn on_before_dismiss(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> DismissDecision {
+            DismissDecision::Dismiss(self.can_dismiss)
+        }
+    }
 
     impl Render for TestModal {
         fn render(
@@ -15630,7 +15671,7 @@ mod tests {
             _window: &mut Window,
             _cx: &mut Context<TestModal>,
         ) -> impl IntoElement {
-            div().track_focus(&self.0)
+            div().track_focus(&self.focus_handle)
         }
     }
 
@@ -15825,6 +15866,64 @@ mod tests {
                 .is_some()),
             "reopen with an active modal that dismisses after the action should reveal the stash"
         );
+    }
+
+    #[gpui::test]
+    async fn test_focus_center_pane_dismisses_modal(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let item = cx.new(TestItem::new);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            workspace.toggle_modal(window, cx, TestModal::new);
+        });
+        cx.executor().run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<TestModal>(cx).is_some());
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_center_pane(window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.active_modal::<TestModal>(cx).is_none());
+            assert!(item.focus_handle(cx).contains_focused(window, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_focus_center_pane_respects_modal_dismissal_veto(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let item = cx.new(TestItem::new);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            workspace.toggle_modal(window, cx, TestModal::non_dismissible);
+        });
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.active_modal::<TestModal>(cx).is_some());
+            workspace.focus_center_pane(window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.active_modal::<TestModal>(cx).is_some());
+            assert!(!item.focus_handle(cx).contains_focused(window, cx));
+        });
     }
 
     #[gpui::test]
