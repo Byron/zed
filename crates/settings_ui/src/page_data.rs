@@ -899,6 +899,26 @@ fn appearance_page() -> SettingsPage {
         ]
     }
 
+    fn zoom_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Zoom"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Zoom",
+                description: "Scale all configured font sizes by an integer percentage.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("zoom"),
+                    pick: |settings_content| settings_content.theme.zoom.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.theme.zoom = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     fn buffer_font_section() -> [SettingsPageItem; 7] {
         [
             SettingsPageItem::SectionHeader("Buffer Font"),
@@ -1546,6 +1566,7 @@ fn appearance_page() -> SettingsPage {
 
     let items: Box<[SettingsPageItem]> = concat_sections!(
         theme_section(),
+        zoom_section(),
         buffer_font_section(),
         ui_font_section(),
         agent_panel_font_section(),

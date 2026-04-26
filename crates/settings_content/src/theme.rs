@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use settings_macros::{MergeFrom, with_fallible_options};
-use std::{borrow::Cow, fmt::Display, ops::Deref, sync::Arc};
+use std::{borrow::Cow, fmt::Display, ops::Deref, str::FromStr, sync::Arc};
 
 use crate::serialize_f32_with_two_decimal_places;
 
@@ -176,6 +176,9 @@ impl TryFrom<&ThemeColor> for gpui::Rgba {
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct ThemeSettingsContent {
+    /// Scales all configured font sizes by this integer percentage.
+    #[schemars(default = "default_zoom_percentage")]
+    pub zoom: Option<ZoomPercentage>,
     /// The default font size for text in the UI.
     pub ui_font_size: Option<FontSize>,
     /// The name of a font to use for rendering in the UI.
@@ -282,6 +285,63 @@ impl From<f32> for FontSize {
     }
 }
 
+/// A percentage used to scale configured font sizes.
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema, MergeFrom, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct ZoomPercentage(#[schemars(range(min = 1))] pub u32);
+
+impl Default for ZoomPercentage {
+    fn default() -> Self {
+        Self(100)
+    }
+}
+
+impl From<u32> for ZoomPercentage {
+    fn from(value: u32) -> Self {
+        Self(value.max(1))
+    }
+}
+
+impl<'de> Deserialize<'de> for ZoomPercentage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let percentage = u32::deserialize(deserializer)?;
+        if percentage == 0 {
+            return Err(Error::custom("zoom must be at least 1"));
+        }
+        Ok(Self(percentage))
+    }
+}
+
+impl FromStr for ZoomPercentage {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let percentage = value.parse::<u32>().map_err(|error| error.to_string())?;
+        if percentage == 0 {
+            return Err("zoom must be at least 1".to_string());
+        }
+        Ok(Self(percentage))
+    }
+}
+
+impl Display for ZoomPercentage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl ZoomPercentage {
+    /// Returns this percentage as a multiplier.
+    pub fn factor(self) -> f32 {
+        self.0 as f32 / 100.0
+    }
+}
+
 #[derive(
     Clone,
     Copy,
@@ -315,6 +375,10 @@ fn default_font_features() -> Option<FontFeaturesContent> {
 
 fn default_font_fallbacks() -> Option<Vec<FontFamilyName>> {
     Some(Vec::new())
+}
+
+fn default_zoom_percentage() -> Option<ZoomPercentage> {
+    Some(ZoomPercentage::default())
 }
 
 fn default_buffer_font_weight() -> Option<FontWeightContent> {
@@ -1489,6 +1553,27 @@ mod tests {
     }
 
     #[test]
+    fn test_zoom_percentage_deserialize_valid() {
+        assert_eq!(
+            serde_json::from_value::<ZoomPercentage>(json!(125)).unwrap(),
+            ZoomPercentage(125)
+        );
+    }
+
+    #[test]
+    fn test_zoom_percentage_deserialize_invalid() {
+        assert!(serde_json::from_value::<ZoomPercentage>(json!(100.5)).is_err());
+        assert!(
+            serde_json::from_value::<ZoomPercentage>(json!(0))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("zoom must be at least 1")
+        );
+        assert!("100.5".parse::<ZoomPercentage>().is_err());
+    }
+
+    #[test]
     fn test_buffer_font_weight_schema_has_default() {
         use schemars::schema_for;
 
@@ -1496,6 +1581,9 @@ mod tests {
         let schema_value = serde_json::to_value(&schema).unwrap();
 
         let properties = &schema_value["properties"];
+        let zoom = &properties["zoom"];
+        assert_eq!(zoom["default"].as_u64(), Some(100));
+
         let buffer_font_weight = &properties["buffer_font_weight"];
 
         assert!(

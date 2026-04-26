@@ -1,5 +1,5 @@
 use collections::HashMap;
-use gpui::{FontFallbacks, FontFeatures, FontWeight, Pixels};
+use gpui::{FontFallbacks, FontFeatures, FontWeight, Pixels, px};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,7 @@ use settings::{
     merge_from::MergeFrom,
 };
 use task::Shell;
-use theme_settings::FontFamilyName;
+use theme_settings::{FontFamilyName, clamp_font_size};
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Toolbar {
@@ -81,13 +81,16 @@ fn settings_shell_to_task_shell(shell: settings::Shell) -> Shell {
 impl settings::Settings for TerminalSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let user_content = content.terminal.clone().unwrap();
+        let zoom = content.theme.zoom.unwrap_or_default();
         // Note: we allow a subset of "terminal" settings in the project files.
         let mut project_content = user_content.project.clone();
         project_content.merge_from_option(content.project.terminal.as_ref());
         TerminalSettings {
             shell: settings_shell_to_task_shell(project_content.shell.unwrap()),
             working_directory: project_content.working_directory.unwrap(),
-            font_size: user_content.font_size.map(|s| s.into_gpui()),
+            font_size: user_content
+                .font_size
+                .map(|font_size| clamp_font_size(px(font_size.0 * zoom.factor()))),
             font_family: user_content.font_family,
             font_fallbacks: user_content.font_fallbacks.map(|fallbacks| {
                 FontFallbacks::from_fonts(
@@ -162,5 +165,27 @@ impl From<settings::CursorShapeContent> for CursorShape {
             settings::CursorShapeContent::Bar => CursorShape::Bar,
             settings::CursorShapeContent::Hollow => CursorShape::Hollow,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use settings::{RootUserSettings, Settings as _};
+
+    fn default_settings_content() -> settings::SettingsContent {
+        settings::SettingsContent::parse_json_with_comments(&settings::default_settings()).unwrap()
+    }
+
+    #[test]
+    fn zoom_scales_terminal_font_size() {
+        let mut content = default_settings_content();
+        content.theme.zoom = Some(settings::ZoomPercentage(125));
+        let terminal = content.terminal.as_mut().unwrap();
+        terminal.font_size = Some(settings::FontSize(13.5));
+
+        let terminal_settings = TerminalSettings::from_settings(&content);
+
+        assert_eq!(terminal_settings.font_size, Some(px(16.875)));
     }
 }

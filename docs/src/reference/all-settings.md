@@ -96,7 +96,7 @@ Non-negative `float` values
 
 **Options**
 
-`integer` values from `6` to `100` pixels (inclusive)
+Numeric values from `6` to `100` pixels (inclusive). Fractional values are allowed.
 
 ## Allow Rewrap
 
@@ -446,7 +446,7 @@ For example, to use `Nerd Font` as a fallback, add the following to your setting
 
 **Options**
 
-A font size from `6` to `100` pixels (inclusive)
+A font size from `6` to `100` pixels (inclusive). Fractional values are allowed.
 
 ## Buffer Font Weight
 
@@ -4384,7 +4384,7 @@ List of `integer` column numbers
 
 **Options**
 
-`integer` values
+Numeric values. Fractional values are allowed.
 
 ## Tasks
 
@@ -4719,7 +4719,7 @@ List of `integer` column numbers
 
 **Options**
 
-`integer` values
+Numeric values. Fractional values are allowed.
 
 ```json [settings]
 {
@@ -6017,7 +6017,7 @@ For example, to use `Nerd Font` as a fallback, add the following to your setting
 
 **Options**
 
-`integer` values from `6` to `100` pixels (inclusive)
+Numeric values from `6` to `100` pixels (inclusive). Fractional values are allowed.
 
 ## UI Font Weight
 
@@ -6028,6 +6028,16 @@ For example, to use `Nerd Font` as a fallback, add the following to your setting
 **Options**
 
 `integer` values between `100` and `900`
+
+## Zoom
+
+- Description: Scales all configured font sizes by this integer percentage.
+- Setting: `zoom`
+- Default: `100`
+
+**Options**
+
+Positive integer percentage values. `100` leaves font sizes unchanged, `125` makes them 25% larger, and `80` makes them 20% smaller. Scaled font sizes are still clamped to their valid pixel ranges.
 
 ## Settings Profiles
 
