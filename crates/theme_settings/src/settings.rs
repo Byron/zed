@@ -705,10 +705,11 @@ impl settings::Settings for ThemeSettings {
     fn from_settings(settings_content: &settings::SettingsContent) -> Self {
         let content = &settings_content.theme;
         let markdown_preview = settings_content.markdown_preview.as_ref();
+        let zoom = content.zoom.unwrap_or_default();
         let theme_selection: ThemeSelection = content.theme.clone().unwrap().into();
         let icon_theme_selection: IconThemeSelection = content.icon_theme.clone().unwrap().into();
         Self {
-            ui_font_size: clamp_font_size(content.ui_font_size.unwrap().into_gpui()),
+            ui_font_size: scaled_font_size(content.ui_font_size.unwrap(), zoom),
             ui_font: Font {
                 family: content.ui_font_family.as_ref().unwrap().0.clone().into(),
                 features: content.ui_font_features.clone().unwrap().into_gpui(),
@@ -729,7 +730,7 @@ impl settings::Settings for ThemeSettings {
                 weight: content.buffer_font_weight.unwrap().into_gpui(),
                 style: FontStyle::default(),
             },
-            buffer_font_size: clamp_font_size(content.buffer_font_size.unwrap().into_gpui()),
+            buffer_font_size: scaled_font_size(content.buffer_font_size.unwrap(), zoom),
             buffer_line_height: buffer_line_height_from_settings(
                 content.buffer_line_height.unwrap(),
             ),
@@ -737,13 +738,19 @@ impl settings::Settings for ThemeSettings {
                 .agent_ui_font_family
                 .as_ref()
                 .map(|font| font.0.clone().into()),
-            agent_ui_font_size: content.agent_ui_font_size.map(|s| s.into_gpui()),
+            agent_ui_font_size: content
+                .agent_ui_font_size
+                .map(|font_size| scaled_font_size(font_size, zoom)),
             agent_buffer_font_family: content
                 .agent_buffer_font_family
                 .as_ref()
                 .map(|font| font.0.clone().into()),
-            agent_buffer_font_size: content.agent_buffer_font_size.map(|s| s.into_gpui()),
-            git_commit_buffer_font_size: content.git_commit_buffer_font_size.map(|s| s.into_gpui()),
+            agent_buffer_font_size: content
+                .agent_buffer_font_size
+                .map(|font_size| scaled_font_size(font_size, zoom)),
+            git_commit_buffer_font_size: content
+                .git_commit_buffer_font_size
+                .map(|font_size| scaled_font_size(font_size, zoom)),
             markdown_preview_font_family: markdown_preview
                 .and_then(|preview| preview.font_family.as_ref())
                 .map(|f| f.0.clone().into()),
@@ -766,9 +773,14 @@ impl settings::Settings for ThemeSettings {
     }
 }
 
+fn scaled_font_size(font_size: settings::FontSize, zoom: settings::ZoomPercentage) -> Pixels {
+    clamp_font_size(px(font_size.0 * zoom.factor()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use settings::RootUserSettings;
 
     fn theme_with_colors(colors: ::settings::ThemeColorsContent) -> Theme {
         crate::refine_theme(&crate::ThemeContent {
@@ -861,5 +873,50 @@ mod tests {
                 .color(::theme::ThemeColorField::EditorCodeLensForeground),
             green
         );
+    }
+
+    fn default_settings_content() -> settings::SettingsContent {
+        settings::SettingsContent::parse_json_with_comments(&settings::default_settings()).unwrap()
+    }
+
+    #[test]
+    fn zoom_scales_theme_font_sizes() {
+        let mut content = default_settings_content();
+        content.theme.zoom = Some(settings::ZoomPercentage(125));
+        content.theme.ui_font_size = Some(settings::FontSize(16.5));
+        content.theme.buffer_font_size = Some(settings::FontSize(15.25));
+        content.theme.agent_ui_font_size = Some(settings::FontSize(13.5));
+        content.theme.agent_buffer_font_size = Some(settings::FontSize(12.25));
+        content.theme.git_commit_buffer_font_size = Some(settings::FontSize(11.25));
+
+        let theme_settings = ThemeSettings::from_settings(&content);
+
+        assert_eq!(theme_settings.ui_font_size_settings(), px(20.625));
+        assert_eq!(theme_settings.buffer_font_size_settings(), px(19.0625));
+        assert_eq!(
+            theme_settings.agent_ui_font_size_settings(),
+            Some(px(16.875))
+        );
+        assert_eq!(
+            theme_settings.agent_buffer_font_size_settings(),
+            Some(px(15.3125))
+        );
+        assert_eq!(
+            theme_settings.git_commit_buffer_font_size_settings(),
+            Some(px(14.0625))
+        );
+    }
+
+    #[test]
+    fn zoom_clamps_scaled_theme_font_sizes() {
+        let mut content = default_settings_content();
+        content.theme.zoom = Some(settings::ZoomPercentage(1000));
+        content.theme.ui_font_size = Some(settings::FontSize(16.0));
+        content.theme.buffer_font_size = Some(settings::FontSize(15.0));
+
+        let theme_settings = ThemeSettings::from_settings(&content);
+
+        assert_eq!(theme_settings.ui_font_size_settings(), px(100.0));
+        assert_eq!(theme_settings.buffer_font_size_settings(), px(100.0));
     }
 }
