@@ -833,48 +833,13 @@ pub(crate) fn render_buffer_header(
                                     _ => filename.as_str().to_string(),
                                 };
 
-                                path_header
-                                    .child(
-                                        ButtonLike::new("filename-button")
-                                            .when(ItemSettings::get_global(cx).file_icons, |this| {
-                                                let path = std::path::Path::new(filename.as_str());
-                                                let icon = FileIcons::get_icon(path, cx)
-                                                    .unwrap_or_default();
+                                let file_icon =
+                                    ItemSettings::get_global(cx).file_icons.then(|| {
+                                        let path = Path::new(filename.as_str());
+                                        FileIcons::get_icon(path, cx).unwrap_or_default()
+                                    });
 
-                                                this.child(
-                                                    Icon::from_path(icon).color(Color::Muted),
-                                                )
-                                            })
-                                            .child(
-                                                Label::new(filename)
-                                                    .single_line()
-                                                    .color(file_status_label_color(file_status))
-                                                    .buffer_font(cx)
-                                                    .when(
-                                                        file_status.is_some_and(|s| s.is_deleted()),
-                                                        |label| label.strikethrough(),
-                                                    ),
-                                            )
-                                            .tooltip(move |_, cx| {
-                                                Tooltip::with_meta(
-                                                    "Open File",
-                                                    None,
-                                                    full_path.clone(),
-                                                    cx,
-                                                )
-                                            })
-                                            .on_click(window.listener_for(editor, {
-                                                let jump_data = jump_data.clone();
-                                                move |editor, e: &ClickEvent, window, cx| {
-                                                    editor.open_excerpts_common(
-                                                        Some(jump_data.clone()),
-                                                        e.modifiers().secondary(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            })),
-                                    )
+                                path_header
                                     .when_some(parent_path, |then, path| {
                                         then.child(
                                             Label::new(path)
@@ -891,6 +856,46 @@ pub(crate) fn render_buffer_header(
                                                 ),
                                         )
                                     })
+                                    .child(
+                                        div().flex_none().child(
+                                            ButtonLike::new("filename-button")
+                                                .when_some(file_icon, |this, icon| {
+                                                    this.child(
+                                                        Icon::from_path(icon).color(Color::Muted),
+                                                    )
+                                                })
+                                                .child(
+                                                    Label::new(filename)
+                                                        .single_line()
+                                                        .color(file_status_label_color(file_status))
+                                                        .buffer_font(cx)
+                                                        .when(
+                                                            file_status
+                                                                .is_some_and(|s| s.is_deleted()),
+                                                            |label| label.strikethrough(),
+                                                        ),
+                                                )
+                                                .tooltip(move |_, cx| {
+                                                    Tooltip::with_meta(
+                                                        "Open File",
+                                                        None,
+                                                        full_path.clone(),
+                                                        cx,
+                                                    )
+                                                })
+                                                .on_click(window.listener_for(editor, {
+                                                    let jump_data = jump_data.clone();
+                                                    move |editor, e: &ClickEvent, window, cx| {
+                                                        editor.open_excerpts_common(
+                                                            Some(jump_data.clone()),
+                                                            e.modifiers().secondary(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                })),
+                                        ),
+                                    )
                                     .when(!buffer.capability.editable(), |el| {
                                         el.child(Icon::new(IconName::FileLock).color(Color::Muted))
                                     })
