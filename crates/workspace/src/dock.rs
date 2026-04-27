@@ -1268,10 +1268,14 @@ impl Dock {
 }
 
 impl Render for Dock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
+            let panel_is_focused = entry
+                .panel
+                .panel_focus_handle(cx)
+                .contains_focused(window, cx);
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1337,6 +1341,7 @@ impl Render for Dock {
                 .track_focus(&self.focus_handle(cx))
                 .focus_follows_mouse(self.focus_follows_mouse, cx)
                 .flex()
+                .relative()
                 .bg(cx.theme().colors().panel_background)
                 .border_color(cx.theme().colors().border)
                 .overflow_hidden()
@@ -1366,6 +1371,15 @@ impl Render for Dock {
                 )
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
+                })
+                .when(panel_is_focused, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .border_2()
+                            .border_color(cx.theme().colors().panel_focused_border),
+                    )
                 })
         } else {
             div()
