@@ -755,6 +755,10 @@ pub enum LogSource {
     #[default]
     All,
     Branch(SharedString),
+    BranchExcluding {
+        branch: SharedString,
+        excluding: SharedString,
+    },
     Sha(Oid),
     Path(RepoPath),
 }
@@ -770,6 +774,11 @@ impl LogSource {
                 Cow::Borrowed("HEAD"),
             ],
             LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
+            LogSource::BranchExcluding { branch, excluding } => vec![
+                Cow::Borrowed(branch.as_str()),
+                Cow::Borrowed("--not"),
+                Cow::Borrowed(excluding.as_str()),
+            ],
             LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
             LogSource::Path(path) => vec![
                 Cow::Borrowed("--follow"),
@@ -5510,6 +5519,32 @@ mod tests {
                 SharedString::from("refs/remotes/origin/main"),
             ]
         );
+    }
+
+    #[test]
+    fn test_log_source_appends_branch_exclusion_args() {
+        let log_source = LogSource::BranchExcluding {
+            branch: "feature".into(),
+            excluding: "origin/main".into(),
+        };
+        let mut args = Vec::new();
+
+        let source_args = log_source.get_args();
+        args.extend(source_args.iter().map(|arg| arg.as_ref()));
+
+        assert_eq!(args, ["feature", "--not", "origin/main"]);
+    }
+
+    #[test]
+    fn test_log_source_appends_sha_as_hex_arg() {
+        let sha = Oid::from_str("0000000000000000000000000000000000000001").unwrap();
+        let mut args = Vec::new();
+
+        let log_source = LogSource::Sha(sha);
+        let source_args = log_source.get_args();
+        args.extend(source_args.iter().map(|arg| arg.as_ref()));
+
+        assert_eq!(args, ["0000000000000000000000000000000000000001"]);
     }
 
     #[gpui::test]

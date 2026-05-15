@@ -1099,7 +1099,7 @@ pub fn init(cx: &mut App) {
                                         workspace,
                                         selected_repo_id,
                                         git_store,
-                                        LogSource::All,
+                                        default_git_graph_log_source(),
                                         None,
                                         window,
                                         cx,
@@ -1123,7 +1123,7 @@ pub fn init(cx: &mut App) {
                                     workspace,
                                     selected_repo_id,
                                     git_store,
-                                    LogSource::All,
+                                    default_git_graph_log_source(),
                                     Some(sha),
                                     window,
                                     cx,
@@ -1156,6 +1156,10 @@ pub fn resolve_file_history_target_from_project_path(
         LogSource::Path(repo_path)
     };
     Some((repo.read(cx).id, log_source))
+}
+
+fn default_git_graph_log_source() -> LogSource {
+    LogSource::Branch("HEAD".into())
 }
 
 fn resolve_file_history_target(
@@ -4435,6 +4439,7 @@ mod persistence {
     pub const LOG_SOURCE_BRANCH: i32 = 1;
     pub const LOG_SOURCE_SHA: i32 = 2;
     pub const LOG_SOURCE_PATH: i32 = 3;
+    pub const LOG_SOURCE_BRANCH_EXCLUDING: i32 = 4;
 
     pub const LOG_ORDER_DATE: i32 = 0;
     pub const LOG_ORDER_TOPO: i32 = 1;
@@ -4445,6 +4450,7 @@ mod persistence {
         match log_source {
             LogSource::All => LOG_SOURCE_ALL,
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
+            LogSource::BranchExcluding { .. } => LOG_SOURCE_BRANCH_EXCLUDING,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
         }
@@ -4454,6 +4460,9 @@ mod persistence {
         match log_source {
             LogSource::All => None,
             LogSource::Branch(branch) => Some(branch.to_string()),
+            LogSource::BranchExcluding { branch, excluding } => {
+                Some(format!("{branch}\0{excluding}"))
+            }
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
         }
@@ -4475,6 +4484,18 @@ mod persistence {
                 .log_source_value
                 .as_ref()
                 .map(|v| LogSource::Branch(v.clone().into()))
+                .unwrap_or_default(),
+            Some(LOG_SOURCE_BRANCH_EXCLUDING) => state
+                .log_source_value
+                .as_ref()
+                .and_then(|value| {
+                    value
+                        .split_once('\0')
+                        .map(|(branch, excluding)| LogSource::BranchExcluding {
+                            branch: branch.to_owned().into(),
+                            excluding: excluding.to_owned().into(),
+                        })
+                })
                 .unwrap_or_default(),
             Some(LOG_SOURCE_SHA) => state
                 .log_source_value
@@ -5398,6 +5419,87 @@ mod tests {
 
         assert_eq!(commit_count, 0);
         assert!(!is_loading, "empty graph data should stop loading");
+    }
+
+    #[gpui::test]
+    async fn test_git_graph_open_action_uses_head_log_source(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let commits = generate_random_commit_dag(&mut StdRng::seed_from_u64(1), 3, false);
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(Open), cx);
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(&*cx, |workspace, cx| {
+            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
+            assert_eq!(graphs.len(), 1);
+            assert_eq!(
+                graphs[0].read(cx).log_source,
+                LogSource::Branch("HEAD".into())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_git_graph_open_at_commit_action_uses_head_log_source(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let commits = generate_random_commit_dag(&mut StdRng::seed_from_u64(2), 3, false);
+        let selected_sha = commits[1].sha;
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            window.dispatch_action(
+                Box::new(OpenAtCommit {
+                    sha: selected_sha.to_string(),
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(&*cx, |workspace, cx| {
+            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
+            assert_eq!(graphs.len(), 1);
+            let graph = graphs[0].read(cx);
+            assert_eq!(graph.log_source, LogSource::Branch("HEAD".into()));
+            assert_eq!(graph.selected_entry_idx, Some(1));
+        });
     }
 
     #[gpui::test]

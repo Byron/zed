@@ -789,12 +789,18 @@ message GetCommitDataResponse {
 
 message GitLogSourceAll {}
 
+message GitLogSourceBranchExcluding {
+  string branch = 1;
+  string excluding = 2;
+}
+
 message GitLogSource {
   oneof source {
     GitLogSourceAll all = 1;
     string branch = 2;
     string sha = 3;
     string path = 4;
+    GitLogSourceBranchExcluding branch_excluding = 5;
   }
 }
 

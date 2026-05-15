@@ -11128,6 +11128,12 @@ fn log_source_to_proto(log_source: &LogSource) -> proto::GitLogSource {
         source: Some(match log_source {
             LogSource::All => proto::git_log_source::Source::All(proto::GitLogSourceAll {}),
             LogSource::Branch(branch) => proto::git_log_source::Source::Branch(branch.to_string()),
+            LogSource::BranchExcluding { branch, excluding } => {
+                proto::git_log_source::Source::BranchExcluding(proto::GitLogSourceBranchExcluding {
+                    branch: branch.to_string(),
+                    excluding: excluding.to_string(),
+                })
+            }
             LogSource::Sha(sha) => proto::git_log_source::Source::Sha(sha.to_string()),
             LogSource::Path(path) => {
                 proto::git_log_source::Source::Path(path.as_unix_str().to_owned())
@@ -11143,6 +11149,12 @@ fn log_source_from_proto(log_source: proto::GitLogSource) -> Result<LogSource> {
     {
         proto::git_log_source::Source::All(_) => Ok(LogSource::All),
         proto::git_log_source::Source::Branch(branch) => Ok(LogSource::Branch(branch.into())),
+        proto::git_log_source::Source::BranchExcluding(branch_excluding) => {
+            Ok(LogSource::BranchExcluding {
+                branch: branch_excluding.branch.into(),
+                excluding: branch_excluding.excluding.into(),
+            })
+        }
         proto::git_log_source::Source::Sha(sha) => Ok(LogSource::Sha(Oid::from_str(&sha)?)),
         proto::git_log_source::Source::Path(path) => {
             Ok(LogSource::Path(RepoPath::from_proto(&path)?))
@@ -12095,6 +12107,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fs.load(&path).await.unwrap(), "*.log\nbuild/\n");
+    }
+
+    #[test]
+    fn test_branch_excluding_log_source_proto_round_trip() {
+        let log_source = LogSource::BranchExcluding {
+            branch: "feature".into(),
+            excluding: "origin/main".into(),
+        };
+
+        assert_eq!(
+            log_source_from_proto(log_source_to_proto(&log_source)).unwrap(),
+            log_source
+        );
     }
 
     #[test]

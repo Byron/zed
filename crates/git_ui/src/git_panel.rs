@@ -501,6 +501,46 @@ pub(crate) enum RemoteOperationKind {
     Push,
 }
 
+fn branch_history_log_source(
+    branch_name: &str,
+    integration_branch: Option<SharedString>,
+) -> LogSource {
+    if let Some(integration_branch) = integration_branch
+        && !branch_names_match(branch_name, &integration_branch)
+    {
+        return LogSource::BranchExcluding {
+            branch: branch_name.to_owned().into(),
+            excluding: integration_branch,
+        };
+    }
+
+    LogSource::Branch(branch_name.to_owned().into())
+}
+
+fn branch_names_match(branch_name: &str, other_branch_name: &str) -> bool {
+    normalized_branch_name(branch_name) == normalized_branch_name(other_branch_name)
+}
+
+fn normalized_branch_name(branch_name: &str) -> &str {
+    let branch_name = branch_name
+        .strip_prefix("refs/heads/")
+        .or_else(|| branch_name.strip_prefix("refs/remotes/"))
+        .unwrap_or(branch_name);
+
+    branch_name
+        .strip_prefix("origin/")
+        .or_else(|| branch_name.strip_prefix("upstream/"))
+        .unwrap_or(branch_name)
+}
+
+fn log_source_includes_branch(log_source: &LogSource, branch_name: &str) -> bool {
+    match log_source {
+        LogSource::Branch(branch) => branch.as_ref() == branch_name,
+        LogSource::BranchExcluding { branch, .. } => branch.as_ref() == branch_name,
+        LogSource::All | LogSource::Sha(_) | LogSource::Path(_) => false,
+    }
+}
+
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
         workspace.toggle_panel_focus::<GitPanel>(window, cx);
@@ -1157,6 +1197,8 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
+    commit_history_log_source: Option<LogSource>,
+    commit_history_log_source_task: Task<()>,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
     _commit_message_buffer_subscription: Option<Subscription>,
@@ -1460,6 +1502,8 @@ impl GitPanel {
                 active_tab: GitPanelTab::Changes,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
+                commit_history_log_source: None,
+                commit_history_log_source_task: Task::ready(()),
                 focused_history_entry: None,
                 history_keyboard_nav: false,
                 _commit_message_buffer_subscription: None,
@@ -7093,6 +7137,8 @@ impl GitPanel {
             }
             GitPanelTab::Changes => {
                 self.set_commit_history(CommitHistory::Loading, cx);
+                self.commit_history_log_source = None;
+                self.commit_history_log_source_task = Task::ready(());
                 self._repo_subscriptions.clear();
             }
         }
@@ -7104,16 +7150,15 @@ impl GitPanel {
             return;
         };
 
-        let Some(log_source) = Self::commit_history_log_source(active_repository, cx) else {
-            return;
-        };
-        let log_order = LogOrder::DateOrder;
-
         // Kick off the git log fetch so data is ready when the user switches to History.
         // graph_data() is idempotent — if already loading/loaded, this is a no-op.
-        active_repository.update(cx, |repository, cx| {
-            repository.graph_data(log_source, log_order, 0..0, cx);
-        });
+        if active_repository.read(cx).branch.is_some() {
+            self.resolve_commit_history_log_source(false, cx);
+        } else if let Some(log_source) = Self::commit_history_log_source(active_repository, cx) {
+            active_repository.update(cx, |repository, cx| {
+                repository.graph_data(log_source, LogOrder::DateOrder, 0..0, cx);
+            });
+        }
     }
 
     fn load_commit_history(&mut self, cx: &mut Context<Self>) {
@@ -7138,7 +7183,11 @@ impl GitPanel {
                 }));
         }
 
-        self.fetch_commit_history_entries(cx);
+        if active_repository.read(cx).branch.is_some() {
+            self.resolve_commit_history_log_source(true, cx);
+        } else {
+            self.fetch_commit_history_entries(cx);
+        }
     }
 
     fn fetch_commit_history_entries(&mut self, cx: &mut Context<Self>) {
@@ -7146,10 +7195,27 @@ impl GitPanel {
             return;
         };
 
-        let Some(log_source) = Self::commit_history_log_source(&active_repository, cx) else {
-            // No HEAD commit at all (unborn/empty repository).
-            self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
-            return;
+        let log_source = if let Some(branch_name) = active_repository
+            .read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_string())
+        {
+            let Some(log_source) = self.commit_history_log_source.clone() else {
+                self.resolve_commit_history_log_source(true, cx);
+                return;
+            };
+            if !log_source_includes_branch(&log_source, &branch_name) {
+                self.resolve_commit_history_log_source(true, cx);
+                return;
+            }
+            log_source
+        } else {
+            let Some(log_source) = Self::commit_history_log_source(&active_repository, cx) else {
+                self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
+                return;
+            };
+            log_source
         };
         let log_order = LogOrder::DateOrder;
 
@@ -7189,6 +7255,73 @@ impl GitPanel {
         } else {
             Some(LogSource::Sha(head_commit.sha.as_ref().parse().ok()?))
         }
+    }
+
+    fn resolve_commit_history_log_source(
+        &mut self,
+        update_history_shas: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_repository) = self.active_repository.as_ref().cloned() else {
+            return;
+        };
+
+        let Some(branch_name) = active_repository
+            .read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_string())
+        else {
+            return;
+        };
+
+        let repo_id = active_repository.read(cx).id;
+        let default_branch = active_repository.update(cx, |repo, _| repo.default_branch(true));
+        self.commit_history_log_source_task = cx.spawn(async move |this, cx| {
+            let integration_branch = match default_branch.await {
+                Ok(Ok(branch)) => branch,
+                Ok(Err(error)) => {
+                    log::warn!("failed to determine default branch for commit history: {error:?}");
+                    None
+                }
+                Err(error) => {
+                    log::warn!("default branch request for commit history was canceled: {error:?}");
+                    None
+                }
+            };
+            let log_source = branch_history_log_source(&branch_name, integration_branch);
+            let log_order = LogOrder::DateOrder;
+
+            this.update(cx, |this, cx| {
+                let Some(active_repository) = this.active_repository.as_ref().cloned() else {
+                    return;
+                };
+                if active_repository.read(cx).id != repo_id {
+                    return;
+                }
+                let Some(current_branch_name) = active_repository
+                    .read(cx)
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.name().to_string())
+                else {
+                    return;
+                };
+                if current_branch_name != branch_name {
+                    return;
+                }
+
+                this.commit_history_log_source = Some(log_source.clone());
+                if update_history_shas {
+                    this.fetch_commit_history_entries(cx);
+                } else {
+                    active_repository.update(cx, |repository, cx| {
+                        repository.graph_data(log_source, log_order, 0..0, cx);
+                    });
+                }
+            })
+            .log_err();
+        });
     }
 
     fn git_remote(&self, cx: &mut App) -> Option<GitRemote> {
@@ -10275,6 +10408,29 @@ mod tests {
             !matches!(panel.commit_history, CommitHistory::Loading)
         })
         .await;
+    }
+
+    #[test]
+    fn test_branch_history_log_source_excludes_integration_branch() {
+        assert_eq!(
+            branch_history_log_source("feature", Some("origin/main".into())),
+            LogSource::BranchExcluding {
+                branch: "feature".into(),
+                excluding: "origin/main".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_branch_history_log_source_does_not_exclude_same_logical_branch() {
+        assert_eq!(
+            branch_history_log_source("main", Some("origin/main".into())),
+            LogSource::Branch("main".into())
+        );
+        assert_eq!(
+            branch_history_log_source("refs/heads/main", Some("refs/remotes/upstream/main".into())),
+            LogSource::Branch("refs/heads/main".into())
+        );
     }
 
     #[gpui::test]
