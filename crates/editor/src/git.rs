@@ -1515,7 +1515,25 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let permalink_task = self.get_permalink_to_line(cx);
+        self.copy_permalink_to_line_for_remote(None, window, cx);
+    }
+
+    pub(super) fn copy_permalink_to_line_on_origin(
+        &mut self,
+        _: &CopyPermalinkToLineOnOrigin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.copy_permalink_to_line_for_remote(Some("origin"), window, cx);
+    }
+
+    fn copy_permalink_to_line_for_remote(
+        &mut self,
+        remote_name: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let permalink_task = self.get_permalink_to_line(remote_name, cx);
         let workspace = self.workspace();
 
         cx.spawn_in(window, async move |_, cx| match permalink_task.await {
@@ -1556,7 +1574,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let permalink_task = self.get_permalink_to_line(cx);
+        let permalink_task = self.get_permalink_to_line(None, cx);
         let workspace = self.workspace();
 
         cx.spawn_in(window, async move |_, cx| match permalink_task.await {
@@ -2847,7 +2865,11 @@ impl Editor {
             })
     }
 
-    fn get_permalink_to_line(&self, cx: &mut Context<Self>) -> Task<Result<url::Url>> {
+    fn get_permalink_to_line(
+        &self,
+        remote_name: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<url::Url>> {
         let buffer_and_selection = maybe!({
             let selection = self.selections.newest::<Point>(&self.display_snapshot(cx));
             let selection_range = selection.range();
@@ -2887,8 +2909,13 @@ impl Editor {
             return Task::ready(Err(anyhow!("editor does not have project")));
         };
 
+        let remote_name = remote_name.map(str::to_string);
         project.update(cx, |project, cx| {
-            project.get_permalink_to_line(&buffer, selection, cx)
+            if let Some(remote_name) = remote_name {
+                project.get_permalink_to_line_on_remote(&buffer, selection, remote_name, cx)
+            } else {
+                project.get_permalink_to_line(&buffer, selection, cx)
+            }
         })
     }
 }
