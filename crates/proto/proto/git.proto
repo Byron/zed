@@ -73,6 +73,7 @@ message GetPermalinkToLine {
   uint64 project_id = 1;
   uint64 buffer_id = 2;
   Range selection = 3;
+  optional string remote_name = 4;
 }
 
 message GetPermalinkToLineResponse {

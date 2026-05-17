@@ -5381,6 +5381,18 @@ impl Project {
         })
     }
 
+    pub fn get_permalink_to_line_on_remote(
+        &self,
+        buffer: &Entity<Buffer>,
+        selection: Range<u32>,
+        remote_name: String,
+        cx: &mut App,
+    ) -> Task<Result<url::Url>> {
+        self.git_store.update(cx, |git_store, cx| {
+            git_store.get_permalink_to_line_on_remote(buffer, selection, remote_name, cx)
+        })
+    }
+
     // RPC message handlers
 
     async fn handle_unshare_project(

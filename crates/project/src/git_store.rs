@@ -2280,6 +2280,26 @@ impl GitStore {
         selection: Range<u32>,
         cx: &mut App,
     ) -> Task<Result<url::Url>> {
+        self.get_permalink_to_line_internal(buffer, selection, None, cx)
+    }
+
+    pub fn get_permalink_to_line_on_remote(
+        &self,
+        buffer: &Entity<Buffer>,
+        selection: Range<u32>,
+        remote_name: String,
+        cx: &mut App,
+    ) -> Task<Result<url::Url>> {
+        self.get_permalink_to_line_internal(buffer, selection, Some(remote_name), cx)
+    }
+
+    fn get_permalink_to_line_internal(
+        &self,
+        buffer: &Entity<Buffer>,
+        selection: Range<u32>,
+        remote_name: Option<String>,
+        cx: &mut App,
+    ) -> Task<Result<url::Url>> {
         let Some(file) = File::from_dyn(buffer.read(cx).file()) else {
             return Task::ready(Err(anyhow!("buffer has no file")));
         };
@@ -2299,8 +2319,13 @@ impl GitStore {
                     buffer_id: buffer.read(cx).remote_id(),
                     selection,
                 },
+                remote_name,
                 cx,
             );
+        }
+
+        if remote_name.is_some() {
+            return Task::ready(Err(anyhow!("no permalink available")));
         }
 
         // If we're not in a Git repo, check whether this is a Rust source
@@ -2335,6 +2360,7 @@ impl GitStore {
             repo,
             repo_path,
             PermalinkTarget::File(project_path.clone()),
+            None,
             cx,
         )
     }
@@ -2344,24 +2370,28 @@ impl GitStore {
         repo: Entity<Repository>,
         repo_path: RepoPath,
         target: PermalinkTarget,
+        remote_name: Option<String>,
         cx: &mut App,
     ) -> Task<Result<url::Url>> {
         let branch = repo.read(cx).branch.clone();
-        let remote = branch
-            .as_ref()
-            .and_then(|b| b.upstream.as_ref())
-            .and_then(|b| b.remote_name())
-            .unwrap_or("origin")
-            .to_string();
+        let explicit_remote_name = remote_name;
+        let local_remote_name = explicit_remote_name.clone().unwrap_or_else(|| {
+            branch
+                .as_ref()
+                .and_then(|b| b.upstream.as_ref())
+                .and_then(|b| b.remote_name())
+                .unwrap_or("origin")
+                .to_string()
+        });
 
         let rx = repo.update(cx, |repo, _| {
             repo.send_job("get_permalink", None, move |state, cx| async move {
                 match state {
                     RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                        let origin_url = backend
-                            .remote_url(&remote)
+                        let remote_url = backend
+                            .remote_url(&local_remote_name)
                             .await
-                            .with_context(|| format!("remote \"{remote}\" not found"))?;
+                            .with_context(|| format!("remote \"{local_remote_name}\" not found"))?;
 
                         let sha = backend.head_sha().await.context("reading HEAD SHA")?;
 
@@ -2369,7 +2399,7 @@ impl GitStore {
                             cx.update(GitHostingProviderRegistry::default_global);
 
                         let (provider, remote) =
-                            parse_git_remote_url(provider_registry, &origin_url)
+                            parse_git_remote_url(provider_registry, &remote_url)
                                 .context("parsing Git remote URL")?;
 
                         Ok(provider.build_permalink(
@@ -2391,6 +2421,7 @@ impl GitStore {
                                             start: selection.start as u64,
                                             end: selection.end as u64,
                                         }),
+                                        remote_name: explicit_remote_name,
                                     })
                                     .await?
                                     .permalink
@@ -5051,8 +5082,11 @@ impl GitStore {
             this.buffer_store.read(cx).get_existing(buffer_id)
         })?;
         let permalink = this
-            .update(&mut cx, |this, cx| {
-                this.get_permalink_to_line(&buffer, selection, cx)
+            .update(&mut cx, |this, cx| match envelope.payload.remote_name {
+                Some(remote_name) => {
+                    this.get_permalink_to_line_on_remote(&buffer, selection, remote_name, cx)
+                }
+                None => this.get_permalink_to_line(&buffer, selection, cx),
             })
             .await?;
 
@@ -11841,6 +11875,7 @@ mod tests {
                 Repository {
                     this: cx.weak_entity(),
                     git_store: WeakEntity::new_invalid(),
+                    unshallow_state: UnshallowState::default(),
                     snapshot: RepositorySnapshot::empty(
                         id,
                         stale_work_directory_abs_path,

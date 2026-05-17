@@ -489,6 +489,8 @@ actions!(
         CopyFileNameWithoutExtension,
         /// Copies a permalink to the current line or selection.
         CopyPermalinkToLine,
+        /// Copies a permalink to the current line using the origin remote.
+        CopyPermalinkToLineOnOrigin,
         /// Cuts selected text to the clipboard.
         Cut,
         /// Deletes the character after the cursor.
