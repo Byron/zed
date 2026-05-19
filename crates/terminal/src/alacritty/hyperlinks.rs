@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use url::Url;
-use util::paths::{PathStyle, UrlExt};
+use util::paths::{PathStyle, PathWithPosition, UrlExt};
 
 use crate::Range;
 
@@ -35,6 +35,12 @@ pub(crate) struct HyperlinkMatch {
     pub(crate) text: String,
     pub(crate) is_url: bool,
     pub(crate) range: Range,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PathSearchDirection {
+    Forward,
+    Backward,
 }
 
 impl From<(String, bool, Match)> for HyperlinkMatch {
@@ -148,6 +154,83 @@ pub(crate) fn find_from_grid_point<T: EventListener>(
     };
 
     found_word.map(|found_word| normalize_found_word(found_word, path_style))
+}
+
+pub(crate) fn find_path_from_grid_point<T: EventListener>(
+    term: &Term<T>,
+    point: AlacPoint,
+    regex_searches: &mut RegexSearches,
+    direction: PathSearchDirection,
+) -> Option<HyperlinkMatch> {
+    let mut matches = path_matches(
+        term,
+        &mut regex_searches.path_hyperlink_regexes,
+        regex_searches.path_hyperlink_timeout,
+    );
+    matches.retain(|(path, _)| is_path_jump_candidate(path));
+    matches.sort_by_key(|(_, path_match)| *path_match.start());
+
+    if matches.is_empty() {
+        return None;
+    }
+
+    if let Some(current_index) = matches
+        .iter()
+        .position(|(_, path_match)| path_match.contains(&point))
+    {
+        if matches.len() == 1 {
+            return None;
+        }
+
+        let index = match direction {
+            PathSearchDirection::Forward => (current_index + 1) % matches.len(),
+            PathSearchDirection::Backward => current_index
+                .checked_sub(1)
+                .unwrap_or_else(|| matches.len().saturating_sub(1)),
+        };
+        return matches
+            .into_iter()
+            .nth(index)
+            .map(|(path, path_match)| HyperlinkMatch {
+                text: path,
+                is_url: false,
+                range: Range::from_alacritty(path_match),
+            });
+    }
+
+    let candidate = match direction {
+        PathSearchDirection::Forward => matches
+            .iter()
+            .position(|(_, path_match)| path_match.start() > &point)
+            .unwrap_or(0),
+        PathSearchDirection::Backward => matches
+            .iter()
+            .rposition(|(_, path_match)| path_match.end() < &point)
+            .unwrap_or_else(|| matches.len().saturating_sub(1)),
+    };
+
+    matches
+        .into_iter()
+        .nth(candidate)
+        .map(|(path, path_match)| HyperlinkMatch {
+            text: path,
+            is_url: false,
+            range: Range::from_alacritty(path_match),
+        })
+}
+
+fn is_path_jump_candidate(path: &str) -> bool {
+    if let Ok(url) = Url::parse(path)
+        && url.scheme() != "file"
+    {
+        return false;
+    }
+
+    let path_with_position = PathWithPosition::parse_str(path);
+    path_with_position.row.is_some()
+        || path_with_position.path.extension().is_some()
+        || path.contains('/')
+        || path.contains('\\')
 }
 
 fn normalize_found_word(
@@ -312,6 +395,43 @@ fn first_unbalanced_open_paren(s: &str) -> Option<usize> {
     first_unmatched.filter(|_| balance > 0)
 }
 
+fn path_matches<T>(
+    term: &Term<T>,
+    path_hyperlink_regexes: &mut Vec<Regex>,
+    path_hyperlink_timeout: Duration,
+) -> Vec<(String, Match)> {
+    if path_hyperlink_regexes.is_empty() || path_hyperlink_timeout.as_millis() == 0 {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    let mut line_start = AlacPoint::new(term.topmost_line(), Column(0));
+    let bottommost_line = term.bottommost_line();
+
+    loop {
+        if line_start.line > bottommost_line {
+            break;
+        }
+
+        let line_end = term.line_search_right(line_start);
+        matches.extend(path_matches_in_line(
+            term,
+            line_start,
+            line_end,
+            path_hyperlink_regexes,
+            path_hyperlink_timeout,
+        ));
+
+        if line_end.line >= bottommost_line {
+            break;
+        }
+
+        line_start = AlacPoint::new(line_end.line + 1, Column(0));
+    }
+
+    matches
+}
+
 fn path_match<T>(
     term: &Term<T>,
     line_start: AlacPoint,
@@ -320,11 +440,30 @@ fn path_match<T>(
     path_hyperlink_regexes: &mut Vec<Regex>,
     path_hyperlink_timeout: Duration,
 ) -> Option<(String, Match)> {
-    if path_hyperlink_regexes.is_empty() || path_hyperlink_timeout.as_millis() == 0 {
-        return None;
-    }
     debug_assert!(line_start <= hovered);
     debug_assert!(line_end >= hovered);
+    path_matches_in_line(
+        term,
+        line_start,
+        line_end,
+        path_hyperlink_regexes,
+        path_hyperlink_timeout,
+    )
+    .into_iter()
+    .find(|(_, path_match)| path_match.contains(&hovered))
+}
+
+fn path_matches_in_line<T>(
+    term: &Term<T>,
+    line_start: AlacPoint,
+    line_end: AlacPoint,
+    path_hyperlink_regexes: &mut Vec<Regex>,
+    path_hyperlink_timeout: Duration,
+) -> Vec<(String, Match)> {
+    if path_hyperlink_regexes.is_empty() || path_hyperlink_timeout.as_millis() == 0 {
+        return Vec::new();
+    }
+
     let search_start_time = Instant::now();
 
     let timed_out = || {
@@ -341,13 +480,7 @@ fn path_match<T>(
         (line_end.line.0 - line_start.line.0 + 1) as usize * term.grid().columns(),
     );
     let first_cell = &term.grid()[line_start];
-    let mut prev_len = 0;
     line.push(first_cell.c);
-    let mut hovered_point_byte_offset = None;
-
-    if line_start == hovered {
-        hovered_point_byte_offset = Some(0);
-    }
 
     for cell in term.grid().iter_from(line_start) {
         if cell.point > line_end {
@@ -355,23 +488,13 @@ fn path_match<T>(
         }
 
         if !cell.flags.intersects(WIDE_CHAR_SPACERS) {
-            prev_len = line.len();
             match cell.c {
                 ' ' | '\t' => line.push(' '),
                 c => line.push(c),
             }
         }
-
-        if cell.point == hovered {
-            debug_assert!(hovered_point_byte_offset.is_none());
-            hovered_point_byte_offset = Some(prev_len);
-        }
     }
     let line = line.trim_ascii_end();
-    let hovered_point_byte_offset = hovered_point_byte_offset?;
-    if line.len() <= hovered_point_byte_offset {
-        return None;
-    }
     let found_from_range = |path_range: StdRange<usize>,
                             link_range: StdRange<usize>,
                             position: Option<(u32, Option<u32>)>| {
@@ -416,6 +539,7 @@ fn path_match<T>(
 
     for regex in path_hyperlink_regexes {
         let mut path_found = false;
+        let mut matches = Vec::new();
 
         for (line_start_offset, captures) in regex
             .captures_iter(&line)
@@ -456,29 +580,22 @@ fn path_match<T>(
                 link_range.start = link_range.start.max(path_range.start);
             }
 
-            if !link_range.contains(&hovered_point_byte_offset) {
-                // No match, just skip.
-                continue;
-            }
             let found = found_from_range(path_range, link_range, line_column);
-
-            if found.1.contains(&hovered) {
-                return Some(found);
-            }
+            matches.push(found);
         }
 
         if path_found {
-            return None;
+            return matches;
         }
 
         if let Some((timed_out_ms, timeout_ms)) = timed_out() {
             warn!("Timed out processing path hyperlink regexes after {timed_out_ms}ms");
             info!("{timeout_ms}ms time out specified in `terminal.path_hyperlink_timeout_ms`");
-            return None;
+            return Vec::new();
         }
     }
 
-    None
+    Vec::new()
 }
 
 #[cfg(test)]
