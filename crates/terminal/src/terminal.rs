@@ -63,11 +63,12 @@ use gpui::{
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
-    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
-    append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
-    display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
+    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PathSearchDirection, PtySender,
+    RegexSearches, append_text_to_term, apply_config, clear_saved_screen, content_text,
+    display_offset, display_only_term_config, find_from_terminal_point,
+    find_path_from_terminal_point, full_content_range, last_non_empty_lines, make_content,
+    new_term, open_pty, pty_options, pty_term_config, resize, screen_lines, scroll_display,
+    scroll_to_point, search_matches, selection_text, set_default_cursor_style,
     set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
     toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
     update_selection_to_vi_cursor, update_vi_cursor_for_scroll, used_lines, vi_goto_point,
@@ -714,6 +715,8 @@ enum InternalEvent {
     ToggleViMode,
     ViMotion(ViMotion),
     MoveViCursorToPoint(Point),
+    FindViPath(PathSearchDirection),
+    OpenViCursorTarget,
 }
 
 type ClipboardFormatter = Arc<dyn Fn(&str) -> String + Sync + Send + 'static>;
@@ -1037,6 +1040,7 @@ impl TerminalBuilder {
             selection_phase: SelectionPhase::Ended,
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
+            vi_selection_state: ViSelectionState::None,
             is_remote_terminal: false,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
@@ -1193,7 +1197,8 @@ impl TerminalBuilder {
             // supported remoting into windows.
             let shell_kind = shell.shell_kind(cfg!(windows));
 
-            let scrolling_history = if task.is_some() {
+            let auto_enable_vi_mode = task.is_some();
+            let scrolling_history = if auto_enable_vi_mode {
                 // Tasks like `cargo build --all` may produce a lot of output, ergo allow maximum scrolling.
                 // After the task finishes, we do not allow appending to that terminal, so small tasks output should not
                 // cause excessive memory usage over time.
@@ -1215,6 +1220,11 @@ impl TerminalBuilder {
                 events_tx.clone(),
                 alternate_scroll,
             );
+
+            if auto_enable_vi_mode {
+                let mut term = term.lock();
+                toggle_term_vi_mode(&mut term);
+            }
 
             // When `no_pty` is set (headless hosts), run the task as a plain
             // subprocess and pump its piped output into the same emulator the
@@ -1298,7 +1308,7 @@ impl TerminalBuilder {
                 )
             };
 
-            let no_task = task.is_none();
+            let no_task = !auto_enable_vi_mode;
             let terminal = Terminal {
                 task,
                 terminal_type,
@@ -1323,7 +1333,8 @@ impl TerminalBuilder {
                     &path_hyperlink_regexes,
                     path_hyperlink_timeout,
                 ),
-                vi_mode_enabled: false,
+                vi_mode_enabled: auto_enable_vi_mode,
+                vi_selection_state: ViSelectionState::None,
                 is_remote_terminal,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
@@ -1490,6 +1501,12 @@ enum PtyResources {
     Released,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViSelectionState {
+    None,
+    Visual,
+    PathSearch,
+}
 enum TerminalType {
     Pty {
         resources: PtyResources,
@@ -1525,6 +1542,7 @@ pub struct Terminal {
     hyperlink_regex_searches: RegexSearches,
     task: Option<TaskState>,
     vi_mode_enabled: bool,
+    vi_selection_state: ViSelectionState,
     is_remote_terminal: bool,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<GpuiPoint<Pixels>>,
@@ -1750,8 +1768,16 @@ impl Terminal {
                 self.refresh_hovered_word(window, cx);
 
                 if self.vi_mode_enabled {
+                    let should_update_selection =
+                        self.vi_selection_state == ViSelectionState::Visual;
+                    if !should_update_selection {
+                        self.clear_vi_selection(term, cx);
+                    }
+
                     update_vi_cursor_for_scroll(term, *scroll);
-                    if let Some(selection_head) = update_selection_to_vi_cursor(term) {
+                    if should_update_selection
+                        && let Some(selection_head) = update_selection_to_vi_cursor(term)
+                    {
                         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                         if let Some(selection_text) = selection_text(term) {
                             cx.write_to_primary(ClipboardItem::new_string(selection_text));
@@ -1764,6 +1790,10 @@ impl Terminal {
             }
             InternalEvent::SetSelection(selection) => {
                 trace!("Setting selection: selection={selection:?}");
+                let was_vi_path_search = self.vi_selection_state == ViSelectionState::PathSearch;
+                if selection.is_none() || self.vi_selection_state != ViSelectionState::Visual {
+                    self.vi_selection_state = ViSelectionState::None;
+                }
                 set_term_selection(term, selection.as_ref());
 
                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -1773,6 +1803,12 @@ impl Terminal {
 
                 if let Some(selection) = selection {
                     self.selection_head = Some(selection.head);
+                } else {
+                    self.selection_head = None;
+                    if was_vi_path_search && self.last_content.last_hovered_word.take().is_some() {
+                        cx.emit(Event::NewNavigationTarget(None));
+                        cx.notify();
+                    }
                 }
                 cx.emit(Event::SelectionsChanged)
             }
@@ -1819,12 +1855,60 @@ impl Terminal {
             }
             InternalEvent::ToggleViMode => {
                 trace!("Toggling vi mode");
+                if self.vi_mode_enabled {
+                    self.clear_vi_selection(term, cx);
+                } else {
+                    self.vi_selection_state = ViSelectionState::None;
+                }
                 self.vi_mode_enabled = !self.vi_mode_enabled;
                 toggle_term_vi_mode(term);
             }
             InternalEvent::ViMotion(motion) => {
                 trace!("Performing vi motion: motion={motion:?}");
+                if self.vi_selection_state != ViSelectionState::Visual {
+                    self.clear_vi_selection(term, cx);
+                }
                 vi_motion(term, *motion);
+            }
+            InternalEvent::FindViPath(direction) => {
+                trace!("Finding vi path: direction={direction:?}");
+                let point = self.last_content.cursor.point;
+                let hyperlink = find_path_from_terminal_point(
+                    term,
+                    point,
+                    &mut self.hyperlink_regex_searches,
+                    *direction,
+                );
+                if let Some(hyperlink) = hyperlink {
+                    let range = hyperlink.range;
+                    self.clear_vi_selection(term, cx);
+                    vi_goto_point(term, range.start());
+                    let selection = Selection::simple_range(range);
+                    set_term_selection(term, Some(&selection));
+                    self.vi_selection_state = ViSelectionState::PathSearch;
+                    self.selection_head = Some(range.end());
+
+                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    if let Some(selection_text) = selection_text(term) {
+                        cx.write_to_primary(ClipboardItem::new_string(selection_text));
+                    }
+
+                    cx.emit(Event::SelectionsChanged);
+                    self.process_hyperlink(hyperlink, false, term.history_size(), cx);
+                }
+            }
+            InternalEvent::OpenViCursorTarget => {
+                trace!("Opening vi cursor target");
+                let point = self.last_content.cursor.point;
+                let hyperlink = find_from_terminal_point(
+                    term,
+                    point,
+                    &mut self.hyperlink_regex_searches,
+                    self.path_style,
+                );
+                if let Some(hyperlink) = hyperlink {
+                    self.process_hyperlink(hyperlink, true, term.history_size(), cx);
+                }
             }
             InternalEvent::FindHyperlink(position, open) => {
                 trace!("Finding hyperlink at position: position={position:?}, open={open:?}");
@@ -1916,6 +2000,23 @@ impl Terminal {
             &mut self.hyperlink_regex_searches,
             self.path_style,
         )
+    }
+
+    fn clear_vi_selection(&mut self, term: &mut AlacrittyTerm, cx: &mut Context<Self>) {
+        self.vi_selection_state = ViSelectionState::None;
+
+        let had_selection = self.selection_head.take().is_some();
+        set_term_selection(term, None);
+        self.selection_head = None;
+
+        if self.last_content.last_hovered_word.take().is_some() {
+            cx.emit(Event::NewNavigationTarget(None));
+            cx.notify();
+        }
+
+        if had_selection {
+            cx.emit(Event::SelectionsChanged);
+        }
     }
 
     fn update_selected_word(
@@ -2302,13 +2403,15 @@ impl Terminal {
         };
 
         if let Some(motion) = motion {
-            let cursor = self.last_content.cursor.point;
-            let cursor_pos = GpuiPoint {
-                x: cursor.column as f32 * self.last_content.terminal_bounds.cell_width,
-                y: cursor.line as f32 * self.last_content.terminal_bounds.line_height,
-            };
-            self.events
-                .push_back(InternalEvent::UpdateSelection(cursor_pos));
+            if self.vi_selection_state == ViSelectionState::Visual {
+                let cursor = self.last_content.cursor.point;
+                let cursor_position = GpuiPoint {
+                    x: cursor.column as f32 * self.last_content.terminal_bounds.cell_width,
+                    y: cursor.line as f32 * self.last_content.terminal_bounds.line_height,
+                };
+                self.events
+                    .push_back(InternalEvent::UpdateSelection(cursor_position));
+            }
             self.events.push_back(InternalEvent::ViMotion(motion));
             return;
         }
@@ -2336,6 +2439,7 @@ impl Terminal {
 
         match key.as_ref() {
             "v" => {
+                self.vi_selection_state = ViSelectionState::Visual;
                 let point = self.last_content.cursor.point;
                 let selection_type = SelectionType::Simple;
                 let side = SelectionSide::Right;
@@ -2345,6 +2449,7 @@ impl Terminal {
             }
 
             "V" => {
+                self.vi_selection_state = ViSelectionState::Visual;
                 let point = self.last_content.cursor.point;
                 let selection_type = SelectionType::Lines;
                 let side = SelectionSide::Right;
@@ -2354,6 +2459,7 @@ impl Terminal {
             }
 
             "escape" => {
+                self.vi_selection_state = ViSelectionState::None;
                 self.events.push_back(InternalEvent::SetSelection(None));
             }
 
@@ -2361,7 +2467,22 @@ impl Terminal {
                 self.copy(Some(false));
             }
 
+            "/" if !keystroke.modifiers.shift => {
+                self.events
+                    .push_back(InternalEvent::FindViPath(PathSearchDirection::Forward));
+            }
+
+            "/" | "?" => {
+                self.events
+                    .push_back(InternalEvent::FindViPath(PathSearchDirection::Backward));
+            }
+
+            "enter" => {
+                self.events.push_back(InternalEvent::OpenViCursorTarget);
+            }
+
             "i" => {
+                self.vi_selection_state = ViSelectionState::None;
                 self.scroll_to_bottom();
                 self.toggle_vi_mode();
             }
@@ -3572,7 +3693,9 @@ mod tests {
     };
     use collections::HashMap;
     use gpui::{
-        ClipboardItem, Entity, Pixels, TestAppContext, VisualTestContext, bounds, point, size,
+        ClipboardItem, Entity, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+        MouseUpEvent, Pixels, TestAppContext, VisualContext, VisualTestContext, bounds, point,
+        size,
     };
     use parking_lot::Mutex;
     use rand::{Rng, distr, rngs::StdRng};
@@ -3876,6 +3999,83 @@ mod tests {
         terminal
     }
 
+    fn init_vi_path_hyperlink_test<'a>(
+        cx: &'a mut TestAppContext,
+        output: &[u8],
+    ) -> (&'a mut gpui::VisualTestContext, Entity<Terminal>) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let default_settings_content: std::rc::Rc<settings::SettingsContent> =
+            settings::parse_json_with_comments(&settings::default_settings())
+                .expect("default settings should parse");
+        let terminal_settings = TerminalSettings::from_settings(&default_settings_content);
+        let window = cx.add_empty_window();
+        let window_id = window.window_handle().window_id().as_u64();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                Some(100),
+                window_id,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.hyperlink_regex_searches = RegexSearches::new(
+                terminal_settings.path_hyperlink_regexes.clone(),
+                Duration::from_millis(terminal_settings.path_hyperlink_timeout_ms.max(100)),
+            );
+            terminal.write_output(output, cx);
+            let term_lock = terminal.term.lock();
+            terminal.last_content = make_content(&term_lock, &terminal.last_content);
+            drop(term_lock);
+
+            terminal.last_content.terminal_bounds = TerminalBounds::new(
+                px(20.0),
+                px(10.0),
+                bounds(point(px(0.0), px(0.0)), size(px(800.0), px(400.0))),
+            );
+            terminal.events.clear();
+        });
+
+        (window, terminal)
+    }
+
+    fn set_vi_cursor_to(
+        terminal: &mut Terminal,
+        point: Point,
+        window: &mut Window,
+        cx: &mut Context<Terminal>,
+    ) {
+        terminal.toggle_vi_mode();
+        terminal.sync(window, cx);
+        terminal
+            .events
+            .push_back(InternalEvent::MoveViCursorToPoint(point));
+        terminal.sync(window, cx);
+    }
+
+    fn ctrl_mouse_down_at(
+        terminal: &mut Terminal,
+        position: GpuiPoint<Pixels>,
+        cx: &mut Context<Terminal>,
+    ) {
+        let mouse_down = MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::secondary_key(),
+            click_count: 1,
+            first_mouse: true,
+        };
+        terminal.mouse_down(&mouse_down, cx);
+    }
+
     fn init_terminal_test_with_window<'a>(
         cx: &'a mut TestAppContext,
         initial_content: &[u8],
@@ -4145,6 +4345,17 @@ mod tests {
             exit_status.await.is_some(),
             "expected terminal completion after sleep exits"
         );
+    }
+
+    #[gpui::test]
+    async fn test_task_terminal_starts_in_vi_mode(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let terminal = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        terminal.update(cx, |terminal, _| {
+            assert!(terminal.vi_mode_enabled());
+        });
     }
 
     // TODO should be tested on Linux too, but does not work there well
@@ -5554,6 +5765,236 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[gpui::test]
+    async fn test_vi_path_search_forward_skips_current_path(cx: &mut TestAppContext) {
+        let (window, terminal) =
+            init_vi_path_hyperlink_test(cx, b"src/main.rs:10:2 other src/lib.rs:20:3\r\n");
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            set_vi_cursor_to(terminal, Point::new(0, 4), window, cx);
+            assert!(
+                terminal.try_keystroke(&Keystroke::parse("/").expect("valid keystroke"), false)
+            );
+            terminal.sync(window, cx);
+
+            let hovered_word = terminal
+                .last_content
+                .last_hovered_word
+                .as_ref()
+                .expect("expected vi path search to select a path");
+            assert_eq!(hovered_word.word, "src/lib.rs:20:3");
+
+            assert_eq!(
+                terminal.last_content.cursor.point,
+                hovered_word.word_match.start()
+            );
+
+            assert_eq!(
+                terminal.term.lock().selection_to_string(),
+                Some("src/lib.rs:20:3".to_string())
+            );
+            assert!(
+                terminal.try_keystroke(&Keystroke::parse("y").expect("valid keystroke"), false)
+            );
+            terminal.sync(window, cx);
+        });
+
+        cx.update(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("src/lib.rs:20:3".to_string())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_vi_path_search_backward_skips_current_path(cx: &mut TestAppContext) {
+        let (window, terminal) =
+            init_vi_path_hyperlink_test(cx, b"src/main.rs:10:2 other src/lib.rs:20:3\r\n");
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            set_vi_cursor_to(terminal, Point::new(0, 28), window, cx);
+            assert!(terminal.try_keystroke(
+                &Keystroke::parse("shift-/").expect("valid keystroke"),
+                false
+            ));
+            terminal.sync(window, cx);
+
+            let hovered_word = terminal
+                .last_content
+                .last_hovered_word
+                .as_ref()
+                .expect("expected reverse vi path search to select a path");
+            assert_eq!(hovered_word.word, "src/main.rs:10:2");
+
+            assert_eq!(
+                terminal.last_content.cursor.point,
+                hovered_word.word_match.start()
+            );
+            assert_eq!(
+                terminal.term.lock().selection_to_string(),
+                Some("src/main.rs:10:2".to_string())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_vi_path_search_selection_clears_on_motion(cx: &mut TestAppContext) {
+        let (window, terminal) =
+            init_vi_path_hyperlink_test(cx, b"src/main.rs:10:2 other src/lib.rs:20:3\r\n");
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            set_vi_cursor_to(terminal, Point::new(0, 4), window, cx);
+            assert!(
+                terminal.try_keystroke(&Keystroke::parse("/").expect("valid keystroke"), false)
+            );
+            terminal.sync(window, cx);
+
+            assert_eq!(
+                terminal.term.lock().selection_to_string(),
+                Some("src/lib.rs:20:3".to_string())
+            );
+
+            assert!(
+                terminal.try_keystroke(&Keystroke::parse("l").expect("valid keystroke"), false)
+            );
+            terminal.sync(window, cx);
+
+            assert_eq!(terminal.term.lock().selection_to_string(), None);
+            assert_eq!(terminal.last_content.cursor.point, Point::new(0, 24));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_vi_visual_selection_persists_on_motion(cx: &mut TestAppContext) {
+        let (window, terminal) = init_vi_path_hyperlink_test(cx, b"abcdef\r\n");
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            set_vi_cursor_to(terminal, Point::new(0, 0), window, cx);
+            assert!(
+                terminal.try_keystroke(&Keystroke::parse("v").expect("valid keystroke"), false)
+            );
+            terminal.sync(window, cx);
+
+            assert!(
+                terminal.try_keystroke(&Keystroke::parse("l").expect("valid keystroke"), false)
+            );
+            terminal.sync(window, cx);
+
+            let selection = terminal.term.lock().selection_to_string();
+            assert!(
+                selection
+                    .as_ref()
+                    .is_some_and(|selection| !selection.is_empty()),
+                "expected visual selection to persist, got {selection:?}"
+            );
+            assert_eq!(terminal.last_content.cursor.point, Point::new(0, 1));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_vi_path_search_wraps(cx: &mut TestAppContext) {
+        let (window, terminal) = init_vi_path_hyperlink_test(
+            cx,
+            b"first src/main.rs:10:2\r\nsecond src/lib.rs:20:3\r\n",
+        );
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            set_vi_cursor_to(terminal, Point::new(1, 24), window, cx);
+            assert!(
+                terminal.try_keystroke(&Keystroke::parse("/").expect("valid keystroke"), false)
+            );
+            terminal.sync(window, cx);
+
+            let hovered_word = terminal
+                .last_content
+                .last_hovered_word
+                .as_ref()
+                .expect("expected forward vi path search to wrap");
+            assert_eq!(hovered_word.word, "src/main.rs:10:2");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_vi_path_search_skips_urls(cx: &mut TestAppContext) {
+        let (window, terminal) =
+            init_vi_path_hyperlink_test(cx, b"https://zed.dev src/main.rs:10:2\r\n");
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            set_vi_cursor_to(terminal, Point::new(0, 0), window, cx);
+            assert!(
+                terminal.try_keystroke(&Keystroke::parse("/").expect("valid keystroke"), false)
+            );
+            terminal.sync(window, cx);
+
+            let hovered_word = terminal
+                .last_content
+                .last_hovered_word
+                .as_ref()
+                .expect("expected vi path search to skip URLs and select a path");
+            assert_eq!(hovered_word.word, "src/main.rs:10:2");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_vi_path_search_finds_plain_filename(cx: &mut TestAppContext) {
+        let (window, terminal) = init_vi_path_hyperlink_test(cx, b"prefix awesome.py suffix\r\n");
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            set_vi_cursor_to(terminal, Point::new(0, 24), window, cx);
+            assert!(terminal.try_keystroke(
+                &Keystroke::parse("shift-/").expect("valid keystroke"),
+                false
+            ));
+            terminal.sync(window, cx);
+
+            let hovered_word = terminal
+                .last_content
+                .last_hovered_word
+                .as_ref()
+                .expect("expected reverse vi path search to select a filename");
+            assert_eq!(hovered_word.word, "awesome.py");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_vi_enter_opens_path_under_cursor(cx: &mut TestAppContext) {
+        let (window, terminal) = init_vi_path_hyperlink_test(cx, b"src/main.rs:10:2\r\n");
+        let (event_tx, event_rx) = async_channel::unbounded::<Event>();
+        window
+            .update(|_, cx| {
+                cx.subscribe(&terminal, move |_, event, _| {
+                    event_tx
+                        .send_blocking(event.clone())
+                        .expect("event receiver should stay open");
+                })
+            })
+            .detach();
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            set_vi_cursor_to(terminal, Point::new(0, 0), window, cx);
+            assert!(
+                terminal.try_keystroke(&Keystroke::parse("enter").expect("valid keystroke"), false)
+            );
+            terminal.sync(window, cx);
+        });
+
+        let mut opened_target = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::Open(target) = event {
+                opened_target = Some(target);
+            }
+        }
+
+        assert_eq!(
+            opened_target,
+            Some(MaybeNavigationTarget::PathLike(PathLikeTarget {
+                maybe_path: "src/main.rs:10:2".to_string(),
+                working_directory: None,
+            }))
+        );
     }
 
     /// Polls the terminal content until `expected` appears, or panics after ~1s.

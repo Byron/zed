@@ -44,7 +44,7 @@ use crate::{
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
 
-pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
+pub(super) use hyperlinks::{HyperlinkMatch, PathSearchDirection, RegexSearches};
 
 pub(super) type AlacrittyPty = tty::Pty;
 pub(super) type AlacrittyTerm = Term<ZedListener>;
@@ -1011,6 +1011,16 @@ pub(super) fn find_from_terminal_point(
 ) -> Option<HyperlinkMatch> {
     let point = point.to_alacritty().grid_clamp(term, Boundary::Grid);
     hyperlinks::find_from_grid_point(term, point, regex_searches, path_style)
+}
+
+pub(super) fn find_path_from_terminal_point(
+    term: &AlacrittyTerm,
+    point: Point,
+    regex_searches: &mut RegexSearches,
+    direction: PathSearchDirection,
+) -> Option<HyperlinkMatch> {
+    let point = point.to_alacritty().grid_clamp(term, Boundary::Grid);
+    hyperlinks::find_path_from_grid_point(term, point, regex_searches, direction)
 }
 
 fn logical_line_for_row(grid: &Grid<AlacCell>, current: i32, topmost: i32) -> (i32, String) {
