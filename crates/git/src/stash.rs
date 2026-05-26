@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_parse_stash_line() {
-        let line = "stash@{0}\u{0000}abc123\u{0000}1234567890\u{0000}WIP on main: test commit";
+        let line = "stash@{0}\u{0000}abc1230000000000000000000000000000000000\u{0000}1234567890\u{0000}WIP on main: test commit";
         let entry = parse_stash_line(line).unwrap();
 
         assert_eq!(entry.index, 0);
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_git_stash_from_str() {
-        let input = "stash@{0}\u{0000}abc123\u{0000}1234567890\u{0000}WIP on main: first stash\nstash@{1}\u{0000}def456\u{0000}1234567891\u{0000}On feature: second stash";
+        let input = "stash@{0}\u{0000}abc1230000000000000000000000000000000000\u{0000}1234567890\u{0000}WIP on main: first stash\nstash@{1}\u{0000}def4560000000000000000000000000000000000\u{0000}1234567891\u{0000}On feature: second stash";
         let stash = GitStash::from_str(input).unwrap();
 
         assert_eq!(stash.entries.len(), 2);
