@@ -17,7 +17,7 @@ test-support = ["settings", "dep:pretty_assertions"]
 
 [dependencies]
 clock.workspace = true
-imara-diff.workspace = true
+gix.workspace = true
 gpui.workspace = true
 language.workspace = true
 log.workspace = true

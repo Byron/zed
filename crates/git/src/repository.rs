@@ -12,6 +12,7 @@ use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::io::BufWriter;
 use futures::{AsyncWriteExt, FutureExt as _, select_biased};
+use gix::bstr::ByteSlice;
 use gpui::{AppContext as _, AsyncApp, BackgroundExecutor, SharedString, Task};
 use parking_lot::Mutex;
 use rope::Rope;
@@ -378,6 +379,28 @@ impl Worktree {
 
         dir_name.to_string()
     }
+}
+
+fn worktree_from_gix_repository(
+    repository: &gix::Repository,
+    path: PathBuf,
+    is_main: bool,
+) -> Result<Option<Worktree>> {
+    let head = repository.head().context("reading worktree HEAD")?;
+    let Some(sha) = head.id() else {
+        return Ok(None);
+    };
+    let ref_name = head
+        .referent_name()
+        .map(|name| name.as_bstr().to_str_lossy().into_owned().into());
+
+    Ok(Some(Worktree {
+        path,
+        ref_name,
+        sha: sha.to_string().into(),
+        is_main,
+        is_bare: repository.is_bare(),
+    }))
 }
 
 pub fn parse_worktrees_from_str<T: AsRef<str>>(
@@ -787,6 +810,17 @@ pub fn delete_branch_flag(is_remote_tracking_ref: bool, force: bool) -> &'static
 }
 
 pub trait GitRepository: Send + Sync {
+    fn monitor(&self) -> Result<Option<gix::notify::RepositoryMonitor>> {
+        Ok(None)
+    }
+
+    fn service_monitor(
+        &self,
+        monitor: &mut gix::notify::RepositoryMonitor,
+    ) -> gix::notify::Outcome {
+        monitor.service(std::time::Instant::now(), || gix::open(self.path()))
+    }
+
     /// Returns the contents of an entry in the repository's index, or None if there is no entry for the given path.
     ///
     /// Also returns `None` for symlinks.
@@ -947,6 +981,8 @@ pub trait GitRepository: Send + Sync {
     fn path(&self) -> PathBuf;
 
     fn main_repository_path(&self) -> PathBuf;
+
+    fn working_directory_path(&self) -> Option<PathBuf>;
 
     /// Updates the index to match the worktree at the given paths.
     ///
@@ -1158,6 +1194,7 @@ pub struct RealGitRepository {
     pub common_dir: PathBuf,
     /// `None` only for bare repositories, which do not have a working directory.
     pub working_directory: Option<PathBuf>,
+    pub repository: gix::ThreadSafeRepository,
     pub system_git_binary_path: Option<PathBuf>,
     pub any_git_binary_path: PathBuf,
     any_git_binary_help_output: Arc<Mutex<Option<SharedString>>>,
@@ -1194,6 +1231,29 @@ impl RefEdit {
 }
 
 impl RealGitRepository {
+    fn open_gix_repository(path: &Path) -> Result<gix::ThreadSafeRepository> {
+        match gix::ThreadSafeRepository::open_opts(path, Self::gix_open_options()) {
+            Ok(repository) => Ok(repository),
+            Err(open_error) if path.is_dir() => {
+                let trust_map = gix::sec::trust::Mapping {
+                    full: Self::gix_open_options(),
+                    reduced: Self::gix_open_options(),
+                };
+                gix::ThreadSafeRepository::discover_opts(
+                    path,
+                    gix::discover::upwards::Options::default(),
+                    trust_map,
+                )
+                .with_context(|| {
+                    format!(
+                        "discovering gitoxide repository from {path:?} after direct open failed: {open_error}"
+                    )
+                })
+            }
+            Err(open_error) => Err(open_error).context("creating gitoxide repository"),
+        }
+    }
+
     pub fn new(
         dotgit_path: &Path,
         bundled_git_binary_path: Option<PathBuf>,
@@ -1207,61 +1267,36 @@ impl RealGitRepository {
         log::info!(
             "opening git repository at {dotgit_path:?} using git binary {any_git_binary_path:?}"
         );
-        let dotgit_parent = dotgit_path.parent().context(".git has no parent")?;
-        let has_working_directory =
-            dotgit_path.is_file() || dotgit_path.file_name() == Some(OsStr::new(".git"));
-        let working_directory = if has_working_directory {
-            Some(normalize_git_metadata_path(dotgit_parent.to_path_buf())?)
-        } else {
-            None
-        };
-
-        let git_dir = if dotgit_path.is_file() {
-            let content =
-                std::fs::read_to_string(dotgit_path).context("reading .git worktree file")?;
-            let path_str = content
-                .strip_prefix("gitdir: ")
-                .context("expected .git file to start with 'gitdir: '")?
-                .trim();
-            let resolved = PathBuf::from(path_str);
-            let resolved = if resolved.is_absolute() {
-                resolved
-            } else {
-                dotgit_parent.join(resolved)
-            };
-            normalize_git_metadata_path(resolved)?
-        } else {
-            normalize_git_metadata_path(dotgit_path.to_path_buf())?
-        };
-
-        let common_dir = {
-            let commondir_file = git_dir.join("commondir");
-            if commondir_file.is_file() {
-                let content =
-                    std::fs::read_to_string(&commondir_file).context("reading commondir file")?;
-                let path_str = content.trim();
-                let resolved = PathBuf::from(path_str);
-                let resolved = if resolved.is_absolute() {
-                    resolved
-                } else {
-                    git_dir.join(resolved)
-                };
-                normalize_git_metadata_path(resolved)?
-            } else {
-                git_dir.clone()
-            }
-        };
+        let repository = Self::open_gix_repository(dotgit_path)?;
+        let git_dir = normalize_git_metadata_path(repository.git_dir().to_path_buf())?;
+        let working_directory = repository
+            .work_dir()
+            .map(|path| normalize_git_metadata_path(path.to_path_buf()))
+            .transpose()?;
+        let common_dir =
+            normalize_git_metadata_path(repository.to_thread_local().common_dir().to_path_buf())?;
 
         Ok(Self {
             git_dir,
             common_dir,
             working_directory,
+            repository,
             system_git_binary_path,
             any_git_binary_path,
             executor,
             any_git_binary_help_output: Arc::new(Mutex::new(None)),
             is_trusted: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    fn gix_open_options() -> gix::open::Options {
+        let mut options = if cfg!(debug_assertions) {
+            gix::open::Options::isolated()
+        } else {
+            gix::open::Options::default()
+        };
+        options.permissions.config.includes = true;
+        options
     }
 
     fn working_directory(&self) -> Result<PathBuf> {
@@ -1376,26 +1411,201 @@ pub async fn get_git_committer(cx: &AsyncApp) -> GitCommitter {
     .await
 }
 
-fn parse_remote_urls(stdout: &str) -> HashMap<String, String> {
-    let mut urls = HashMap::default();
-    for line in stdout.lines() {
-        if let Some((line, suffix)) = line.rsplit_once(" (fetch)")
-            && (suffix.is_empty() || suffix.starts_with(" [") && suffix.ends_with(']'))
-            && let Some((name, url)) = line.split_once(char::is_whitespace)
-        {
-            urls.insert(name.to_string(), url.trim_start().to_string());
-        }
-    }
-    urls
-}
-
 impl GitRepository for RealGitRepository {
+    fn monitor(&self) -> Result<Option<gix::notify::RepositoryMonitor>> {
+        let repository = Self::open_gix_repository(&self.git_dir)?.to_thread_local();
+        let monitor = repository.monitor(gix::notify::Options::default())?;
+        let mut options = monitor.options().clone();
+        let mut dependencies = monitor.layout().dependencies.clone();
+        let permissions = repository.open_options().permissions;
+        let snapshot = repository.config_snapshot();
+        let mut configuration_paths = snapshot
+            .sections()
+            .filter_map(|section| section.meta().path.clone())
+            .collect::<Vec<_>>();
+        for (source, enabled) in [
+            (
+                gix::config::Source::GitInstallation,
+                permissions.config.git_binary,
+            ),
+            (gix::config::Source::System, permissions.config.system),
+            (gix::config::Source::Git, permissions.config.git),
+            (gix::config::Source::User, permissions.config.user),
+        ] {
+            if enabled {
+                match repository.config_path(source) {
+                    Ok(path) => configuration_paths.push(path),
+                    // Permitted global sources can still be disabled by Git environment overrides or lack a home directory.
+                    Err(_) => continue,
+                }
+            }
+        }
+        let home = gix::path::env::home_dir().and_then(|path| permissions.env.home.check_opt(path));
+        if permissions.config.includes {
+            let head = repository.head()?;
+            let install_dir = repository.install_dir().log_err();
+            // File and environment includes resolve separately, before CLI and API overrides can affect their conditions.
+            // Environment includes must not see file configuration when evaluating hasconfig conditions.
+            for environment in [false, true] {
+                let mut configuration = snapshot.plumbing().clone();
+                let omitted_sections = configuration
+                    .sections_and_ids()
+                    .filter_map(|(section, id)| {
+                        let metadata = section.meta();
+                        let selected = match metadata.source {
+                            gix::config::Source::Env => environment,
+                            gix::config::Source::GitInstallation
+                            | gix::config::Source::System
+                            | gix::config::Source::Git
+                            | gix::config::Source::User
+                            | gix::config::Source::Local
+                            | gix::config::Source::Worktree => !environment,
+                            _ => false,
+                        };
+                        (metadata.level > 0 || !selected).then_some(id)
+                    })
+                    .collect::<Vec<_>>();
+                for section_id in omitted_sections {
+                    configuration
+                        .remove_section_by_id(section_id)
+                        .context("removing previously resolved configuration include")?;
+                }
+                configuration.resolve_includes_with_observer(
+                    gix::config::file::init::Options {
+                        includes: gix::config::file::includes::Options::follow(
+                            gix::config::path::interpolate::Context {
+                                git_install_dir: install_dir.as_deref(),
+                                home_dir: home.as_deref(),
+                                home_for_user: Some(gix::config::path::interpolate::home_for_user),
+                            },
+                            gix::config::file::includes::conditional::Context {
+                                git_dir: Some(repository.git_dir()),
+                                branch_name: head.referent_name(),
+                            },
+                        ),
+                        ignore_io_errors: true,
+                        ..Default::default()
+                    },
+                    |path| configuration_paths.push(path.to_path_buf()),
+                )?;
+            }
+        }
+        dependencies.extend(
+            configuration_paths
+                .into_iter()
+                .map(|path| gix::notify::Dependency {
+                    path,
+                    kind: gix::notify::DependencyKind::Configuration,
+                }),
+        );
+        let configured_attributes = snapshot
+            .path_filter("core.attributesFile", gix::config::section::is_trusted)
+            .filter(|path| !path.is_empty());
+        let use_attribute_fallback = configured_attributes
+            .as_ref()
+            .is_none_or(|path| path.is_optional);
+        if let Some(path) = configured_attributes {
+            dependencies.push(gix::notify::Dependency {
+                path: repository
+                    .current_dir()
+                    .join(repository.interpolate_path(path)?),
+                kind: gix::notify::DependencyKind::Attributes,
+            });
+        }
+        let mut source_environment = |name: &str| {
+            let permission = match name {
+                "HOME" => return home.clone().map(PathBuf::into_os_string),
+                "XDG_CONFIG_HOME" => permissions.env.xdg_config_home,
+                name if name.starts_with("GIT_") => permissions.env.git_prefix,
+                _ => return None,
+            };
+            permission.check_opt(name).and_then(gix::path::env::var)
+        };
+        for (source, enabled) in [
+            (
+                gix::attrs::Source::GitInstallation,
+                permissions.attributes.git_binary,
+            ),
+            (gix::attrs::Source::System, permissions.attributes.system),
+            (
+                gix::attrs::Source::Git,
+                permissions.attributes.git && use_attribute_fallback,
+            ),
+        ] {
+            if enabled && let Some(path) = source.storage_location(&mut source_environment) {
+                dependencies.push(gix::notify::Dependency {
+                    path,
+                    kind: gix::notify::DependencyKind::Attributes,
+                });
+            }
+        }
+        let dependencies = dependencies.into_iter().filter_map(|dependency| {
+            let changes = match dependency.kind {
+                gix::notify::DependencyKind::Configuration => gix::notify::Changes {
+                    configuration: true,
+                    ..Default::default()
+                },
+                gix::notify::DependencyKind::Attributes => gix::notify::Changes {
+                    attributes: true,
+                    ..Default::default()
+                },
+                gix::notify::DependencyKind::Ignore => return None,
+            };
+            Some(gix::notify::InvalidationPath {
+                path: dependency.path,
+                changes,
+            })
+        });
+        // Dropping a non-top stash changes only its reflog, which gitoxide does not watch by default.
+        let stash_log = gix::notify::InvalidationPath {
+            path: monitor.layout().common_dir.join("logs/refs/stash"),
+            changes: gix::notify::Changes {
+                references: true,
+                ..Default::default()
+            },
+        };
+        for dependency in dependencies.chain(std::iter::once(stash_log)) {
+            if let Some(existing) = options
+                .additional_paths
+                .iter_mut()
+                .find(|path| path.path == dependency.path)
+            {
+                existing.changes.configuration |= dependency.changes.configuration;
+                existing.changes.attributes |= dependency.changes.attributes;
+                existing.changes.references |= dependency.changes.references;
+            } else {
+                options.additional_paths.push(dependency);
+            }
+        }
+        options
+            .additional_paths
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        if options.additional_paths == monitor.options().additional_paths {
+            return Ok(Some(monitor));
+        }
+        drop(monitor);
+        Ok(Some(repository.monitor(options)?))
+    }
+
+    fn service_monitor(
+        &self,
+        monitor: &mut gix::notify::RepositoryMonitor,
+    ) -> gix::notify::Outcome {
+        monitor.service(std::time::Instant::now(), || {
+            gix::open_opts(&self.git_dir, Self::gix_open_options())
+        })
+    }
+
     fn path(&self) -> PathBuf {
         self.git_dir.clone()
     }
 
     fn main_repository_path(&self) -> PathBuf {
         self.common_dir.clone()
+    }
+
+    fn working_directory_path(&self) -> Option<PathBuf> {
+        self.working_directory.clone()
     }
 
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
@@ -1612,22 +1822,69 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
-    fn load_blob_content(&self, oid: Oid) -> BoxFuture<'_, Result<Vec<u8>>> {
-        let git_binary = self.git_binary();
-        let oid_str = oid.to_string();
+    fn load_index_text(&self, path: RepoPath) -> BoxFuture<'_, Option<Vec<u8>>> {
+        let repo = self.repository.clone();
         self.executor
             .spawn(async move {
-                let mut command = git_binary.build_command(&["cat-file", "blob", &oid_str]);
-                let output = command.output().await?;
-                anyhow::ensure!(
-                    output.status.success(),
-                    GitBinaryCommandError {
-                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                        status: output.status,
+                fn logic(repo: gix::Repository, path: &RepoPath) -> Result<Option<Vec<u8>>> {
+                    if path.is_empty() {
+                        bail!("empty path has no index text");
                     }
-                );
-                Ok(output.stdout)
+                    let index = repo.index()?;
+                    let path = path.as_unix_str().as_bytes().as_bstr();
+                    let Some(entry) =
+                        index.entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
+                    else {
+                        return Ok(None);
+                    };
+                    if entry.mode == gix::index::entry::Mode::SYMLINK {
+                        return Ok(None);
+                    }
+
+                    Ok(Some(repo.find_blob(entry.id)?.data.clone()))
+                }
+
+                logic(repo.to_thread_local(), &path)
+                    .context("loading index text")
+                    .log_err()
+                    .flatten()
+            })
+            .boxed()
+    }
+
+    fn load_committed_text(&self, path: RepoPath) -> BoxFuture<'_, Option<Vec<u8>>> {
+        let repo = self.repository.clone();
+        self.executor
+            .spawn(async move {
+                fn logic(repo: gix::Repository, path: &RepoPath) -> Result<Option<Vec<u8>>> {
+                    if path.is_empty() {
+                        return Err(anyhow!("empty path has no committed text"));
+                    }
+                    let tree = repo.head()?.peel_to_commit()?.tree()?;
+                    let Some(entry) = tree.lookup_entry_by_path(path.as_std_path())? else {
+                        return Ok(None);
+                    };
+                    if entry.mode().is_link() {
+                        return Ok(None);
+                    }
+                    Ok(Some(repo.find_blob(entry.object_id())?.data.clone()))
+                }
+
+                logic(repo.to_thread_local(), &path)
+                    .context("loading committed text")
+                    .log_err()
+                    .flatten()
+            })
+            .boxed()
+    }
+
+    fn load_blob_content(&self, oid: Oid) -> BoxFuture<'_, Result<Vec<u8>>> {
+        let repo = self.repository.clone();
+        self.executor
+            .spawn(async move {
+                let repo = repo.to_thread_local();
+                let oid = gix::ObjectId::try_from(oid.as_bytes())?;
+                Ok(repo.find_blob(oid)?.data.clone())
             })
             .boxed()
     }
@@ -1750,14 +2007,31 @@ impl GitRepository for RealGitRepository {
     }
 
     fn remote_urls(&self) -> BoxFuture<'_, HashMap<String, String>> {
-        let git = self.git_binary();
+        let repository_root = self
+            .working_directory
+            .clone()
+            .unwrap_or(self.git_dir.clone());
         self.executor
             .spawn(async move {
-                if let Ok(stdout) = git.run(&["remote", "-v"]).await {
-                    parse_remote_urls(&stdout)
-                } else {
-                    HashMap::default()
+                fn logic(repository_root: PathBuf) -> Result<HashMap<String, String>> {
+                    let repo =
+                        gix::open_opts(repository_root, RealGitRepository::gix_open_options())
+                            .context("opening gitoxide repository")?;
+                    let mut urls = HashMap::default();
+                    for name in repo.remote_names() {
+                        if let Ok(remote) = repo.find_remote(name.as_bstr())
+                            && let Some(url) = remote.url(gix::remote::Direction::Fetch)
+                        {
+                            urls.insert(name.to_string(), url.to_string());
+                        }
+                    }
+                    Ok(urls)
                 }
+
+                logic(repository_root)
+                    .context("loading remote URLs")
+                    .log_err()
+                    .unwrap_or_default()
             })
             .boxed()
     }
@@ -1886,6 +2160,10 @@ impl GitRepository for RealGitRepository {
     }
 
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>> {
+        if self.working_directory.is_none() {
+            return Task::ready(Ok(GitStatus::default()));
+        }
+
         let git = self.git_binary_in_worktree();
         let args = git_status_args(path_prefixes);
         log::debug!("Checking for git status in {path_prefixes:?}");
@@ -2113,6 +2391,10 @@ impl GitRepository for RealGitRepository {
     }
 
     fn stash_entries(&self) -> BoxFuture<'static, Result<GitStash>> {
+        if self.working_directory.is_none() {
+            return async { Ok(GitStash::default()) }.boxed();
+        }
+
         let git = self.git_binary_in_worktree();
         self.executor
             .spawn(async move {
@@ -2224,24 +2506,43 @@ impl GitRepository for RealGitRepository {
     }
 
     fn worktrees(&self) -> BoxFuture<'_, Result<Vec<Worktree>>> {
-        let git = self.git_binary();
-        let main_worktree_path = original_repo_path_from_common_dir(&self.common_dir);
+        let repository = self.repository.clone();
         self.executor
             .spawn(async move {
-                let output = git
-                    .build_command(&["worktree", "list", "--porcelain"])
-                    .output()
-                    .await?;
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    Ok(parse_worktrees_from_str(
-                        &stdout,
-                        main_worktree_path.as_deref(),
-                    ))
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    anyhow::bail!("git worktree list failed: {stderr}");
+                let repository = repository.to_thread_local();
+                let main_repository = repository
+                    .main_repo()
+                    .context("opening main git repository")?;
+                let mut worktrees = Vec::new();
+
+                if let Some(main_worktree) = main_repository.worktree()
+                    && let Some(worktree) = worktree_from_gix_repository(
+                        &main_repository,
+                        main_worktree.base().to_path_buf(),
+                        true,
+                    )?
+                {
+                    worktrees.push(worktree);
                 }
+
+                for linked_worktree in main_repository
+                    .worktrees()
+                    .context("listing linked git worktrees")?
+                {
+                    let path = linked_worktree
+                        .base()
+                        .context("reading linked worktree path")?;
+                    let linked_repository = linked_worktree
+                        .into_repo_with_possibly_inaccessible_worktree()
+                        .context("opening linked git worktree repository")?;
+                    if let Some(worktree) =
+                        worktree_from_gix_repository(&linked_repository, path, false)?
+                    {
+                        worktrees.push(worktree);
+                    }
+                }
+
+                Ok(worktrees)
             })
             .boxed()
     }
@@ -2555,6 +2856,10 @@ impl GitRepository for RealGitRepository {
         diff: DiffStatType,
         path_prefixes: &[RepoPath],
     ) -> BoxFuture<'static, Result<crate::status::GitDiffStat>> {
+        if self.working_directory.is_none() {
+            return async { Ok(crate::status::GitDiffStat::default()) }.boxed();
+        }
+
         let path_prefixes = path_prefixes.to_vec();
         let git_binary = self.git_binary_in_worktree();
 
@@ -3363,22 +3668,26 @@ impl GitRepository for RealGitRepository {
 
         async move {
             let log_source_args = log_source.get_args();
-            let mut args = vec!["log", SEARCH_COMMIT_FORMAT];
+            let mut args: Vec<OsString> = vec!["log".into(), SEARCH_COMMIT_FORMAT.into()];
             let hash_query = commit_hash_search_query(search_args.query.as_str())
                 .map(|query| query.to_ascii_lowercase());
 
             if hash_query.is_none() {
-                args.push("--fixed-strings");
+                args.push("--fixed-strings".into());
 
                 if !search_args.case_sensitive {
-                    args.push("--regexp-ignore-case");
+                    args.push("--regexp-ignore-case".into());
                 }
 
-                args.push("--grep");
-                args.push(search_args.query.as_str());
+                args.push("--grep".into());
+                args.push(search_args.query.as_str().into());
             }
 
-            args.extend(log_source_args.iter().map(|arg| arg.as_ref()));
+            args.extend(
+                log_source_args
+                    .into_iter()
+                    .map(|arg| OsString::from(arg.as_ref())),
+            );
             let mut command = git.build_command(&args);
             command.stdout(Stdio::piped());
             command.stderr(Stdio::null());
@@ -4898,11 +5207,33 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_real_git_repository_new_discovers_from_nested_directory(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let nested_dir = repo_dir.path().join("gix").join("src");
+        fs::create_dir_all(&nested_dir).unwrap();
+
+        let repository =
+            RealGitRepository::new(&nested_dir, None, Some("git".into()), cx.executor()).unwrap();
+
+        assert_same_path(&repository.git_dir, repo_dir.path().join(".git"));
+        assert_same_path(&repository.common_dir, repo_dir.path().join(".git"));
+        assert_same_path(
+            repository.working_directory.as_ref().unwrap(),
+            repo_dir.path(),
+        );
+    }
+
+    #[gpui::test]
     async fn test_check_access(cx: &mut TestAppContext) {
         disable_git_global_config();
         cx.executor().allow_parking();
 
         let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
         let repository = RealGitRepository::new(
             &repo_dir.path().join(".git"),
             None,
@@ -4911,6 +5242,7 @@ mod tests {
         )
         .unwrap();
 
+        fs::remove_dir_all(repo_dir.path().join(".git")).expect("failed to remove repository");
         assert!(repository.check_access().await.is_err());
         git_init_repo(repo_dir.path());
         assert!(repository.check_access().await.is_ok());
@@ -4954,7 +5286,122 @@ mod tests {
         assert_same_path(&repository.common_dir, repo_dir.join(".git"));
         assert_same_path(
             original_repo_path_from_common_dir(&repository.common_dir).unwrap(),
-            repo_dir,
+            &repo_dir,
+        );
+
+        let worktree_git_dir = linked_worktree_git_dir(&worktree_dir).unwrap();
+        let repository =
+            RealGitRepository::new(&worktree_git_dir, None, Some("git".into()), cx.executor())
+                .unwrap();
+
+        assert_same_path(
+            repository.working_directory.as_ref().unwrap(),
+            &worktree_dir,
+        );
+        assert_same_path(&repository.git_dir, &worktree_git_dir);
+        assert_same_path(&repository.common_dir, repo_dir.join(".git"));
+
+        fs::write(worktree_dir.join("file.txt"), "changed").unwrap();
+        let status = repository.status(&[]).await.unwrap();
+        assert!(
+            !status.entries.is_empty(),
+            "status should report changes when opening from linked worktree metadata"
+        );
+        let diff_stat = repository
+            .diff_stat(DiffStatType::HeadToWorktree, &[])
+            .await
+            .unwrap();
+        assert!(
+            !diff_stat.entries.is_empty(),
+            "diff stat should report changes when opening from linked worktree metadata"
+        );
+
+        let bare_repo_dir = temp_dir.path().join("repo.git");
+        let bare_worktree_dir = temp_dir.path().join("bare-worktree");
+        git_command(
+            temp_dir.path(),
+            [
+                OsString::from("clone"),
+                OsString::from("--bare"),
+                repo_dir.as_os_str().into(),
+                bare_repo_dir.as_os_str().into(),
+            ],
+        );
+        git_command(
+            temp_dir.path(),
+            [
+                OsString::from("--git-dir"),
+                bare_repo_dir.as_os_str().into(),
+                OsString::from("worktree"),
+                OsString::from("add"),
+                OsString::from("-b"),
+                OsString::from("bare-feature"),
+                bare_worktree_dir.as_os_str().into(),
+                OsString::from("main"),
+            ],
+        );
+
+        let bare_worktree_git_dir = linked_worktree_git_dir(&bare_worktree_dir).unwrap();
+        let repository = RealGitRepository::new(
+            &bare_worktree_git_dir,
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        assert_same_path(
+            repository.working_directory.as_ref().unwrap(),
+            &bare_worktree_dir,
+        );
+        assert_same_path(&repository.git_dir, &bare_worktree_git_dir);
+        assert_same_path(&repository.common_dir, &bare_repo_dir);
+
+        let worktrees = repository.worktrees().await.unwrap();
+        assert_eq!(worktrees.len(), 1);
+        assert!(!worktrees[0].is_main);
+        assert_same_path(&worktrees[0].path, &bare_worktree_dir);
+    }
+
+    #[gpui::test]
+    async fn test_real_git_repository_new_resolves_separate_git_dir_gitfile(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let git_dir = temp_dir.path().join("repo-gitdir");
+        git_command(
+            temp_dir.path(),
+            [
+                OsString::from("init"),
+                OsString::from("--separate-git-dir"),
+                git_dir.as_os_str().into(),
+                repo_dir.as_os_str().into(),
+            ],
+        );
+
+        let repository = RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        assert_same_path(repository.working_directory.as_ref().unwrap(), &repo_dir);
+        assert_same_path(&repository.git_dir, &git_dir);
+        assert_same_path(&repository.common_dir, &git_dir);
+        assert_eq!(
+            repository
+                .git_binary_in_worktree()
+                .unwrap()
+                .run(&["rev-parse", "--is-bare-repository"])
+                .await
+                .unwrap(),
+            "false"
         );
     }
 
@@ -4989,6 +5436,16 @@ mod tests {
                 .unwrap(),
             "true"
         );
+        assert!(repository.status(&[]).await.unwrap().entries.is_empty());
+        assert!(
+            repository
+                .diff_stat(DiffStatType::HeadToWorktree, &[])
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(repository.stash_entries().await.unwrap().entries.is_empty());
     }
 
     #[gpui::test]
@@ -5193,9 +5650,7 @@ mod tests {
         };
 
         assert!(
-            error
-                .to_string()
-                .contains("expected .git file to start with 'gitdir: '"),
+            error.to_string().contains("creating gitoxide repository"),
             "unexpected error: {error:#}"
         );
     }
@@ -6324,6 +6779,53 @@ mod tests {
             worktree_path.canonicalize().unwrap(),
         );
 
+        let repo_from_linked_worktree = RealGitRepository::new(
+            &worktree_path.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let worktrees_from_linked_worktree = repo_from_linked_worktree.worktrees().await.unwrap();
+        assert_eq!(worktrees_from_linked_worktree.len(), 2);
+        assert!(
+            worktrees_from_linked_worktree
+                .iter()
+                .any(|worktree| worktree.is_main
+                    && worktree.path.canonicalize().unwrap() == repo_dir.canonicalize().unwrap())
+        );
+        assert!(
+            worktrees_from_linked_worktree
+                .iter()
+                .any(|worktree| !worktree.is_main
+                    && worktree.path.canonicalize().unwrap()
+                        == worktree_path.canonicalize().unwrap())
+        );
+
+        let detached_worktree_path = worktrees_dir.join("detached-worktree");
+        repo.create_worktree(
+            CreateWorktreeTarget::Detached {
+                base_sha: Some("HEAD".to_string()),
+            },
+            detached_worktree_path.clone(),
+        )
+        .await
+        .unwrap();
+        let worktrees = repo.worktrees().await.unwrap();
+        assert_eq!(worktrees.len(), 3);
+        let detached_worktree = worktrees
+            .iter()
+            .find(|worktree| {
+                worktree.path.canonicalize().unwrap()
+                    == detached_worktree_path.canonicalize().unwrap()
+            })
+            .expect("should find detached worktree");
+        assert_eq!(detached_worktree.ref_name, None);
+        assert_eq!(
+            detached_worktree.display_name(),
+            &detached_worktree.sha[..SHORT_SHA_LENGTH]
+        );
+
         // The new worktree's git metadata directory should report a creation
         // time, resolved via the worktree's `.git` file.
         let created_at = repo
@@ -6791,39 +7293,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_remote_urls() {
-        let stdout = concat!(
-            "origin\thttps://github.com/zed-industries/zed.git (fetch) [blob:none]\n",
-            "origin\thttps://github.com/zed-industries/zed.git (push)\n",
-            "upstream\t/Users/user/My Projects/upstream.git (fetch)\n",
-            "upstream\t/Users/user/My Projects/upstream.git (push)\n",
-            "a\t/x (fetch) dir (fetch)\n",
-            "a\t/x (fetch) dir (push)\n",
-            "archive\t/tmp/remote [archive].git (fetch)\n",
-            "archive\t/tmp/remote [archive].git (push)\n",
-        );
-
-        let remote_urls = parse_remote_urls(stdout);
-        assert_eq!(remote_urls.len(), 4);
-        assert_eq!(
-            remote_urls.get("origin").map(String::as_str),
-            Some("https://github.com/zed-industries/zed.git")
-        );
-        assert_eq!(
-            remote_urls.get("upstream").map(String::as_str),
-            Some("/Users/user/My Projects/upstream.git")
-        );
-        assert_eq!(
-            remote_urls.get("a").map(String::as_str),
-            Some("/x (fetch) dir")
-        );
-        assert_eq!(
-            remote_urls.get("archive").map(String::as_str),
-            Some("/tmp/remote [archive].git")
-        );
-    }
-
     #[gpui::test]
     async fn test_remote_urls(cx: &mut TestAppContext) {
         disable_git_global_config();
@@ -6867,8 +7336,25 @@ mod tests {
             .await
             .unwrap();
 
+        for (name, url) in [
+            ("a", "/x (fetch) dir"),
+            ("archive", "/tmp/remote [archive].git"),
+        ] {
+            git.run(&["remote", "add", name, url])
+                .await
+                .expect("failed to add remote");
+        }
+
         let remote_urls = repo.remote_urls().await;
-        assert_eq!(remote_urls.len(), 2);
+        assert_eq!(remote_urls.len(), 4);
+        assert_eq!(
+            remote_urls.get("a").map(String::as_str),
+            Some("/x (fetch) dir")
+        );
+        assert_eq!(
+            remote_urls.get("archive").map(String::as_str),
+            Some("/tmp/remote [archive].git")
+        );
         assert_eq!(
             remote_urls.get("origin").unwrap(),
             "https://github.com/zed-industries/zed.git"

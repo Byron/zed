@@ -56,6 +56,7 @@ futures.workspace = true
 fuzzy.workspace = true
 fuzzy_nucleo.workspace = true
 git.workspace = true
+gix.workspace = true
 git_hosting_providers.workspace = true
 github_releases.workspace = true
 globset.workspace = true

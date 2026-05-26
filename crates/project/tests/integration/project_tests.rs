@@ -18924,6 +18924,267 @@ async fn test_repository_subfolder_git_status(
     });
 }
 
+#[gpui::test]
+async fn test_linked_worktree_real_git_status_updates_after_external_change(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let root = TempTree::new(json!({
+        "main": {
+            "src": {
+                "changed.txt": "original\n",
+            },
+        },
+    }));
+    let main_worktree = root.path().join("main");
+    let repo = git_init(&main_worktree);
+    git_add("src/changed.txt", &repo);
+    git_commit("init", &repo);
+
+    let linked_worktree = root.path().join("linked");
+    let output = smol::process::Command::new("git")
+        .current_dir(&repo)
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_SYSTEM", "")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+        .args(["worktree", "add", "-b", "linked"])
+        .arg(&linked_worktree)
+        .output()
+        .await
+        .expect("Failed to run git worktree add");
+    assert!(
+        output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let project = Project::test(
+        RealFs::new(None, cx.executor()),
+        [linked_worktree.as_path()],
+        cx,
+    )
+    .await;
+
+    let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    cx.executor().run_until_parked();
+
+    let repository = project.read_with(cx, |project, cx| {
+        project.repositories(cx).values().next().unwrap().clone()
+    });
+    // Monitor registration can finish after the initial scan barrier.
+    cx.condition(&repository, |repository, _| {
+        repository.snapshot().scan_id >= 4
+    })
+    .await;
+    cx.executor().run_until_parked();
+    repository.read_with(cx, |repository, _cx| {
+        assert_eq!(
+            repository.work_directory_abs_path.as_ref(),
+            linked_worktree.as_path()
+        );
+        assert!(
+            repository.linked_worktree_path().is_some(),
+            "linked worktree should be detected as a linked worktree"
+        );
+        assert_eq!(
+            repository.status_for_path(&repo_path("src/changed.txt")),
+            None
+        );
+    });
+
+    let repository_events = Arc::new(Mutex::new(Vec::new()));
+    let transient_statuses = Arc::new(Mutex::new(Vec::new()));
+    let _subscription = project.update(cx, |_, cx| {
+        cx.subscribe(&repository, {
+            let repository_events = repository_events.clone();
+            let transient_statuses = transient_statuses.clone();
+            move |_, repository, event: &RepositoryEvent, cx| {
+                repository_events.lock().push(event.clone());
+                if *event == RepositoryEvent::StatusesChanged {
+                    transient_statuses.lock().push(
+                        repository
+                            .read(cx)
+                            .status_for_path(&repo_path("src/transient.txt"))
+                            .map(|entry| entry.status),
+                    );
+                }
+            }
+        })
+    });
+
+    std::fs::write(linked_worktree.join("src/changed.txt"), "changed\n")
+        .expect("write external worktree change");
+    cx.condition(&repository, |repository, _| {
+        repository
+            .status_for_path(&repo_path("src/changed.txt"))
+            .map(|entry| entry.status)
+            == Some(StatusCode::Modified.worktree())
+    })
+    .await;
+    assert_eq!(
+        *repository_events.lock(),
+        vec![RepositoryEvent::StatusesChanged],
+        "a worktree edit should only update statuses"
+    );
+
+    std::fs::write(linked_worktree.join("src/transient.txt"), "temporary\n")
+        .expect("create transient worktree file");
+    std::fs::write(linked_worktree.join("src/untracked.txt"), "persistent\n")
+        .expect("create persistent worktree file");
+    std::fs::remove_file(linked_worktree.join("src/transient.txt"))
+        .expect("remove transient file before collecting changes");
+    cx.condition(&repository, |repository, _| {
+        repository
+            .status_for_path(&repo_path("src/untracked.txt"))
+            .map(|entry| entry.status)
+            == Some(FileStatus::Untracked)
+    })
+    .await;
+    assert!(
+        transient_statuses.lock().iter().all(Option::is_none),
+        "collected status updates must not show a file removed during the batch"
+    );
+
+    git_add("src/changed.txt", &linked_worktree);
+    cx.condition(&repository, |repository, _| {
+        repository
+            .status_for_path(&repo_path("src/changed.txt"))
+            .map(|entry| entry.status)
+            == Some(StatusCode::Modified.index())
+    })
+    .await;
+
+    let output = smol::process::Command::from(git_cmd(&main_worktree))
+        .args(["branch", "external"])
+        .output()
+        .await
+        .expect("create an external branch in the common repository");
+    assert!(output.status.success(), "external branch creation failed");
+    cx.condition(&repository, |repository, _| {
+        repository
+            .snapshot()
+            .branch_list
+            .iter()
+            .any(|branch| branch.ref_name.as_ref() == "refs/heads/external")
+    })
+    .await;
+
+    let output = smol::process::Command::from(git_cmd(&main_worktree))
+        .args([
+            "config",
+            "remote.origin.url",
+            "https://example.com/external.git",
+        ])
+        .output()
+        .await
+        .expect("change shared repository configuration externally");
+    assert!(
+        output.status.success(),
+        "external configuration change failed"
+    );
+    cx.condition(&repository, |repository, _| {
+        repository.snapshot().remote_origin_url.as_deref()
+            == Some("https://example.com/external.git")
+    })
+    .await;
+
+    let external_config = root.path().join("extra.gitconfig");
+    std::fs::write(
+        &external_config,
+        "[remote \"upstream\"]\n\turl = https://example.com/included.git\n",
+    )
+    .expect("write external configuration include");
+    let output = smol::process::Command::from(git_cmd(&main_worktree))
+        .args(["config", "include.path"])
+        .arg(&external_config)
+        .output()
+        .await
+        .expect("add an external configuration dependency");
+    assert!(
+        output.status.success(),
+        "external include configuration failed"
+    );
+    cx.condition(&repository, |repository, _| {
+        repository.snapshot().remote_upstream_url.as_deref()
+            == Some("https://example.com/included.git")
+    })
+    .await;
+
+    std::fs::write(
+        &external_config,
+        "[remote \"upstream\"]\n\turl = https://example.com/reconfigured.git\n",
+    )
+    .expect("change the newly monitored configuration include");
+    cx.condition(&repository, |repository, _| {
+        repository.snapshot().remote_upstream_url.as_deref()
+            == Some("https://example.com/reconfigured.git")
+    })
+    .await;
+    repository.read_with(cx, |repository, _| {
+        assert_eq!(
+            repository.snapshot().remote_origin_url.as_deref(),
+            Some("https://example.com/external.git")
+        );
+    });
+
+    for (message, contents, count) in [
+        ("first", "first stash\n", 1),
+        ("second", "second stash\n", 2),
+    ] {
+        std::fs::write(linked_worktree.join("src/changed.txt"), contents)
+            .expect("modify a tracked file before stashing");
+        let output = smol::process::Command::from(git_cmd(&linked_worktree))
+            .args(["stash", "push", "-m", message])
+            .output()
+            .await
+            .expect("create an external stash entry");
+        assert!(output.status.success(), "external stash creation failed");
+        cx.condition(&repository, |repository, _| {
+            repository.snapshot().stash_entries.entries.len() == count
+        })
+        .await;
+    }
+    let newest_stash_oid = repository.read_with(cx, |repository, _| {
+        repository
+            .snapshot()
+            .stash_entries
+            .entries
+            .first()
+            .map(|entry| entry.oid)
+    });
+    let output = smol::process::Command::from(git_cmd(&linked_worktree))
+        .args(["stash", "drop", "stash@{1}"])
+        .output()
+        .await
+        .expect("drop an older stash without changing refs/stash");
+    assert!(output.status.success(), "external stash drop failed");
+    cx.condition(&repository, |repository, _| {
+        repository.snapshot().stash_entries.entries.len() == 1
+    })
+    .await;
+    repository.read_with(cx, |repository, _| {
+        assert_eq!(
+            repository
+                .snapshot()
+                .stash_entries
+                .entries
+                .first()
+                .map(|entry| entry.oid),
+            newest_stash_oid,
+            "dropping an older stash only changes its reflog"
+        );
+    });
+}
+
 // TODO: this test is flaky (especially on Windows but at least sometimes on all platforms).
 #[cfg(any())]
 #[gpui::test]

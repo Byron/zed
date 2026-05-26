@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::tokenize::tokenize;
-use imara_diff::{Algorithm, Diff, InternedInput, Token, sources::lines};
+use gix::diff::blob::{Algorithm, Diff, InternedInput, Token, sources::lines};
 use zeta_prompt::udiff::apply_diff_to_string;
 
 fn text_diff(old_text: &str, new_text: &str) -> Vec<(Range<usize>, Arc<str>)> {
