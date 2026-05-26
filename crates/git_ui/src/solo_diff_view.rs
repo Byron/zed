@@ -6,6 +6,7 @@ use editor::{
     ToggleSplitDiff,
     actions::{GoToHunk, GoToPreviousHunk},
     file_status_label_color,
+    scroll::Autoscroll,
 };
 use git::{
     Commit, Restore, StageAndNext, StageFile, ToggleStaged, UnstageAndNext, UnstageFile,
@@ -150,6 +151,7 @@ impl SoloDiffView {
                     language::Point::new(0, 0),
                     Direction::Next,
                     true,
+                    Autoscroll::center(),
                     window,
                     cx,
                 );

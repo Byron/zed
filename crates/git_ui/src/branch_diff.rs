@@ -1,4 +1,5 @@
 use crate::{
+    active_diff_tree::ActiveDiffEntry,
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
     project_diff::{
@@ -12,7 +13,10 @@ use editor::{
     Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
     actions::SendReviewToAgent,
 };
-use git::{repository::DiffType, status::FileStatus};
+use git::{
+    repository::{DiffType, RepoPath},
+    status::FileStatus,
+};
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity,
@@ -378,6 +382,48 @@ impl BranchDiff {
 
     pub(crate) fn repo(&self, cx: &App) -> Option<Entity<Repository>> {
         self.diff.read(cx).repo(cx)
+    }
+
+    pub(crate) fn immutable_diff_entries(&self, cx: &App) -> Vec<ActiveDiffEntry> {
+        let diff = self.diff.read(cx);
+        let diff_stats = diff.diff_stats_by_repo_path(cx);
+        let mut entries = diff
+            .branch_diff()
+            .read(cx)
+            .changed_entries(cx)
+            .into_iter()
+            .map(|entry| ActiveDiffEntry {
+                diff_stat: diff_stats
+                    .get(&entry.repo_path)
+                    .copied()
+                    .or(entry.diff_stat),
+                repo_path: entry.repo_path,
+                status: entry.file_status,
+            })
+            .collect::<Vec<_>>();
+
+        if !diff_stats.is_empty() {
+            entries.retain(|entry| diff_stats.contains_key(&entry.repo_path));
+        }
+
+        entries
+    }
+
+    pub(crate) fn active_repo_path(&self, cx: &App) -> Option<RepoPath> {
+        let project_path = self.diff.read(cx).active_project_path(cx)?;
+        self.repo(cx)?
+            .read(cx)
+            .project_path_to_repo_path(&project_path, cx)
+    }
+
+    pub(crate) fn move_to_repo_path(
+        &mut self,
+        repo_path: RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.move_to_repo_path(repo_path, window, cx));
     }
 
     fn set_merge_base(&mut self, base_ref: SharedString, cx: &mut Context<Self>) {
