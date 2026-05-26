@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
-imara-diff.workspace = true
+gix.workspace = true
 serde.workspace = true
 strum.workspace = true
 

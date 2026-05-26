@@ -1,6 +1,6 @@
 use crate::{CharClassifier, CharKind, CharScopeContext, LanguageScope};
 use anyhow::{Context, anyhow};
-use imara_diff::{Algorithm, Diff, InternedInput, Interner, Token, sources::lines};
+use gix::diff::blob::{Algorithm, Diff, InternedInput, Interner, Token, sources::lines};
 use std::{fmt::Write, iter, ops::Range, sync::Arc};
 
 const MAX_WORD_DIFF_LEN: usize = 512;
@@ -33,7 +33,7 @@ pub fn unified_diff_with_context(
     context_lines: u32,
 ) -> String {
     // The builder appends its own line terminators, so tokenize without them.
-    let mut input = InternedInput::default();
+    let mut input: InternedInput<&str> = InternedInput::default();
     input.update_before(old_text.lines());
     input.update_after(new_text.lines());
     let diff = Diff::compute(Algorithm::Histogram, &input);
