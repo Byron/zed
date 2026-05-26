@@ -4003,6 +4003,72 @@ async fn test_autoscroll_horizontally_fitting_selection_reveals_full_span(cx: &m
 }
 
 #[gpui::test]
+async fn test_autoscroll_center_if_needed(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+
+    let line_height = cx.update_editor(|editor, window, cx| {
+        editor.set_vertical_scroll_margin(0, cx);
+        editor
+            .style(cx)
+            .text
+            .line_height_in_pixels(window.rem_size())
+    });
+    let window = cx.window;
+    cx.simulate_window_resize(window, size(px(1000.), 6. * line_height));
+
+    cx.set_state(
+        r#"ˇone
+            two
+            three
+            four
+            five
+            six
+            seven
+            eight
+            nine
+            ten
+            eleven
+            twelve
+            thirteen
+            fourteen
+            fifteen
+        "#,
+    );
+
+    cx.update_editor(|editor, window, cx| {
+        editor.set_scroll_position(gpui::Point::new(0., 2.), window, cx);
+        editor.change_selections(
+            SelectionEffects::scroll(Autoscroll::center_if_needed()),
+            window,
+            cx,
+            |selections| selections.select_ranges([Point::new(4, 0)..Point::new(4, 0)]),
+        );
+    });
+    cx.update_editor(|editor, window, cx| {
+        assert_eq!(
+            editor.snapshot(window, cx).scroll_position(),
+            gpui::Point::new(0., 2.0)
+        );
+    });
+
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(
+            SelectionEffects::scroll(Autoscroll::center_if_needed()),
+            window,
+            cx,
+            |selections| selections.select_ranges([Point::new(12, 0)..Point::new(12, 0)]),
+        );
+    });
+    cx.update_editor(|editor, window, cx| {
+        assert_eq!(
+            editor.snapshot(window, cx).scroll_position(),
+            gpui::Point::new(0., 10.0)
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_exclude_overscroll_margin_clamps_scroll_position(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     update_test_editor_settings(cx, &|settings| {

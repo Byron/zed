@@ -883,6 +883,7 @@ fn render_diff_hunk_controls(
                                         position,
                                         Direction::Next,
                                         true,
+                                        Autoscroll::center(),
                                         window,
                                         cx,
                                     );
@@ -919,6 +920,7 @@ fn render_diff_hunk_controls(
                                         point,
                                         Direction::Prev,
                                         true,
+                                        Autoscroll::center(),
                                         window,
                                         cx,
                                     );

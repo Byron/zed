@@ -5140,6 +5140,10 @@ async fn test_linked_worktree_event_in_unregistered_common_git_dir_does_not_pani
     .await
     .unwrap();
     tree.flush_fs_events(cx).await;
+    tree.read_with(cx, |tree, _| {
+        let local_worktree = tree.as_local().unwrap();
+        assert!(local_worktree.repositories().is_empty());
+    });
 
     // Deliver the kind of Rescan event `FsWatcher` emits when the kernel
     // signals `need_rescan` for the commondir.

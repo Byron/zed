@@ -4,7 +4,9 @@ use collections::{HashMap, HashSet};
 use futures::StreamExt;
 use git::{
     repository::RepoPath,
-    status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus},
+    status::{
+        DiffStat, DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus,
+    },
 };
 use gpui::{
     App, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task, WeakEntity,
@@ -56,6 +58,13 @@ pub enum BranchDiffEvent {
 }
 
 impl EventEmitter<BranchDiffEvent> for DiffBufferList {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchDiffEntry {
+    pub repo_path: RepoPath,
+    pub file_status: FileStatus,
+    pub diff_stat: Option<DiffStat>,
+}
 
 impl DiffBufferList {
     pub fn new(
@@ -288,6 +297,47 @@ impl DiffBufferList {
 
     pub fn repo(&self) -> Option<&Entity<Repository>> {
         self.repo.as_ref()
+    }
+
+    pub fn changed_entries(&self, cx: &App) -> Vec<BranchDiffEntry> {
+        let mut output = Vec::new();
+        let Some(repo) = self.repo.as_ref() else {
+            return output;
+        };
+
+        let repo = repo.read(cx);
+        let mut seen = HashSet::default();
+
+        for item in repo.cached_status() {
+            seen.insert(item.repo_path.clone());
+            let Some(status) = self.status_for_path(&item.repo_path, cx) else {
+                continue;
+            };
+            if status.has_changes() {
+                output.push(BranchDiffEntry {
+                    repo_path: item.repo_path.clone(),
+                    file_status: status,
+                    diff_stat: item.diff_stat,
+                });
+            }
+        }
+
+        let Some(tree_diff) = self.tree_diff.as_ref() else {
+            return output;
+        };
+
+        for (path, branch_diff) in tree_diff.entries.iter() {
+            if seen.contains(path) {
+                continue;
+            }
+            output.push(BranchDiffEntry {
+                repo_path: path.clone(),
+                file_status: diff_status_to_file_status(branch_diff),
+                diff_stat: None,
+            });
+        }
+
+        output
     }
 
     #[instrument(skip_all)]

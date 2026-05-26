@@ -516,6 +516,7 @@ impl Editor {
         position: Point,
         direction: Direction,
         wrap_around: bool,
+        autoscroll: Autoscroll,
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
@@ -528,7 +529,6 @@ impl Editor {
 
         if let Some(row) = row {
             let destination = Point::new(row.0, 0);
-            let autoscroll = Autoscroll::center();
 
             self.unfold_ranges(&[destination..destination], false, false, cx);
             self.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
@@ -914,6 +914,7 @@ impl Editor {
             position,
             Direction::Next,
             wrap_around,
+            Autoscroll::center_if_needed(),
             window,
             cx,
         );
@@ -974,6 +975,7 @@ impl Editor {
             selection.head(),
             Direction::Next,
             true,
+            Autoscroll::center(),
             window,
             cx,
         );
@@ -2073,6 +2075,7 @@ impl Editor {
             selection.head(),
             Direction::Prev,
             true,
+            Autoscroll::center(),
             window,
             cx,
         );
@@ -2256,6 +2259,7 @@ impl Editor {
             position,
             Direction::Next,
             wrap_around,
+            Autoscroll::center_if_needed(),
             window,
             cx,
         );
@@ -3212,6 +3216,7 @@ pub fn render_diff_hunk_controls(
                                         position,
                                         Direction::Next,
                                         true,
+                                        Autoscroll::center(),
                                         window,
                                         cx,
                                     );
@@ -3248,6 +3253,7 @@ pub fn render_diff_hunk_controls(
                                         point,
                                         Direction::Prev,
                                         true,
+                                        Autoscroll::center(),
                                         window,
                                         cx,
                                     );

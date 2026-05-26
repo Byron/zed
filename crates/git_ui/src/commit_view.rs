@@ -3,13 +3,14 @@ use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
-    SplittableEditor,
+    SelectionEffects, SplittableEditor,
     display_map::{BlockPlacement, BlockProperties, BlockStyle},
     hover_markdown_style, multibuffer_context_lines,
+    scroll::Autoscroll,
 };
 use futures_lite::future::yield_now;
-use git::repository::{CommitDetails, RepoPath};
-use git::status::{FileStatus, StatusCode, TrackedStatus};
+use git::repository::{CommitDetails, CommitFileStatus, RepoPath};
+use git::status::{DiffStat as GitDiffStat, FileStatus, StatusCode, TrackedStatus};
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
     parse_git_remote_url,
@@ -28,7 +29,7 @@ use markdown::{Markdown, MarkdownElement};
 use multi_buffer::{Anchor, PathKey};
 use project::{
     Project, ProjectPath, WorktreeId,
-    git_store::{CommitDiff, Repository, UnshallowState},
+    git_store::{CommitDiff, CommitFile, Repository, UnshallowState},
 };
 use settings::{DiffViewStyle, Settings};
 use std::{
@@ -47,6 +48,7 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
+use crate::active_diff_tree::ActiveDiffEntry;
 use crate::commit_tooltip::CommitAvatar;
 use crate::git_panel::GitPanel;
 
@@ -83,6 +85,7 @@ pub struct CommitView {
     repository: Entity<Repository>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
+    changed_entries: Vec<ActiveDiffEntry>,
     remote: Option<GitRemote>,
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
@@ -341,6 +344,11 @@ impl CommitView {
 
         let repository_clone = repository.clone();
         let project_clone = project.clone();
+        let changed_entries = commit_diff
+            .files
+            .iter()
+            .map(active_diff_entry_for_commit_file)
+            .collect::<Vec<_>>();
 
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
@@ -522,6 +530,7 @@ impl CommitView {
             repository,
             project,
             workspace,
+            changed_entries,
             remote,
             is_shallow_boundary,
             file_filter,
@@ -670,6 +679,71 @@ impl CommitView {
                 );
             });
         });
+    }
+
+    pub(crate) fn immutable_diff_entries(&self, cx: &App) -> Vec<ActiveDiffEntry> {
+        let diff_stats = self.diff_stats_by_repo_path(cx);
+        self.changed_entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                if let Some(diff_stat) = diff_stats.get(&entry.repo_path).copied() {
+                    entry.diff_stat = Some(diff_stat);
+                }
+                entry
+            })
+            .collect()
+    }
+
+    pub(crate) fn active_repo_path(&self, cx: &App) -> Option<RepoPath> {
+        let focused_editor = self.editor.read(cx).focused_editor().clone();
+        let editor = focused_editor.read(cx);
+        let multibuffer = editor.buffer().read(cx);
+        let position = editor.selections.newest_anchor().head();
+        let snapshot = multibuffer.snapshot(cx);
+        let (text_anchor, _) = snapshot.anchor_to_buffer_anchor(position)?;
+        let buffer = multibuffer.buffer(text_anchor.buffer_id)?;
+        let file = buffer.read(cx).file()?;
+        Some(RepoPath::from_rel_path(file.path().as_ref()))
+    }
+
+    pub(crate) fn move_to_repo_path(
+        &mut self,
+        repo_path: RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path_key =
+            PathKey::with_sort_prefix(FILE_NAMESPACE_SORT_PREFIX, repo_path.as_ref().clone());
+        if let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
+            self.editor.update(cx, |editor, cx| {
+                let editor = editor.focused_editor().clone();
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::focused()),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([position..position]),
+                    );
+                });
+            });
+        }
+    }
+
+    fn diff_stats_by_repo_path(&self, cx: &App) -> HashMap<RepoPath, GitDiffStat> {
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        snapshot
+            .buffers_with_paths()
+            .filter(|(_, path_key)| path_key.sort_prefix == Some(FILE_NAMESPACE_SORT_PREFIX))
+            .filter_map(|(buffer, path_key)| {
+                let diff = snapshot.diff_for_buffer_id(buffer.remote_id())?;
+                let (added, deleted) = diff.changed_row_counts();
+                Some((
+                    RepoPath::from_rel_path(&path_key.path),
+                    GitDiffStat { added, deleted },
+                ))
+            })
+            .collect()
     }
 
     fn render_commit_avatar(
@@ -1349,12 +1423,51 @@ impl Item for CommitView {
                 repository: self.repository.clone(),
                 project: self.project.clone(),
                 workspace: self.workspace.clone(),
+                changed_entries: self.changed_entries.clone(),
                 remote: self.remote.clone(),
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
                 _load_diff_task: Task::ready(Ok(())),
             }
         })))
+    }
+}
+
+fn active_diff_entry_for_commit_file(file: &CommitFile) -> ActiveDiffEntry {
+    let status_code = match file.status() {
+        CommitFileStatus::Added => StatusCode::Added,
+        CommitFileStatus::Modified => StatusCode::Modified,
+        CommitFileStatus::Deleted => StatusCode::Deleted,
+    };
+    ActiveDiffEntry {
+        repo_path: file.path.clone(),
+        status: FileStatus::Tracked(TrackedStatus {
+            index_status: status_code,
+            worktree_status: status_code,
+        }),
+        diff_stat: diff_stat_for_commit_file(file),
+    }
+}
+
+fn diff_stat_for_commit_file(file: &CommitFile) -> Option<GitDiffStat> {
+    match file.status() {
+        CommitFileStatus::Added => Some(GitDiffStat {
+            added: file.new_text.as_deref().map_or(0, line_count),
+            deleted: 0,
+        }),
+        CommitFileStatus::Deleted => Some(GitDiffStat {
+            added: 0,
+            deleted: file.old_text.as_deref().map_or(0, line_count),
+        }),
+        CommitFileStatus::Modified => None,
+    }
+}
+
+fn line_count(text: &str) -> u32 {
+    if text.is_empty() {
+        0
+    } else {
+        text.lines().count().try_into().unwrap_or(u32::MAX)
     }
 }
 

@@ -34,6 +34,11 @@ impl Autoscroll {
         Self::Strategy(AutoscrollStrategy::Center, None)
     }
 
+    /// scrolls so the newest cursor is vertically centered only if it is not already visible
+    pub fn center_if_needed() -> Self {
+        Self::Strategy(AutoscrollStrategy::CenterIfNeeded, None)
+    }
+
     /// Returns the autoscroll strategy configured for navigation to definitions
     /// and references, based on `go_to_definition_scroll_strategy`.
     pub fn for_go_to_definition(offset: Option<ScrollOffset>, cx: &App) -> Self {
@@ -102,6 +107,7 @@ pub enum AutoscrollStrategy {
     Newest,
     #[default]
     Center,
+    CenterIfNeeded,
     Focused,
     Top,
     Bottom,
@@ -259,6 +265,20 @@ impl Editor {
             AutoscrollStrategy::Center => {
                 scroll_position.y = (target_top - margin).max(0.0);
                 self.set_scroll_position_internal(scroll_position, local, true, window, cx)
+            }
+            AutoscrollStrategy::CenterIfNeeded => {
+                let start_row = scroll_position.y;
+                let end_row = start_row + visible_lines;
+                let needs_scroll_up =
+                    (target_top - visible_sticky_headers as f64).max(0.0) < start_row;
+                let needs_scroll_down = target_bottom >= end_row;
+
+                if needs_scroll_up || needs_scroll_down {
+                    scroll_position.y = (target_top - margin).max(0.0);
+                    self.set_scroll_position_internal(scroll_position, local, true, window, cx)
+                } else {
+                    WasScrolled(false)
+                }
             }
             AutoscrollStrategy::Focused => {
                 let margin = margin.min(self.scroll_manager.vertical_scroll_margin);

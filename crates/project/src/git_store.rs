@@ -443,7 +443,7 @@ impl language::File for IndexTextFile {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitAccess {
     /// Either:
     /// - the user owns `.git`
@@ -456,6 +456,9 @@ pub enum GitAccess {
     /// - the directory is not marked as safe (git config safe.directory)
     /// - the user does not have OS-level read permissions to `.git`
     No,
+
+    /// Git could not be queried for a reason other than dubious ownership.
+    Error(SharedString),
 }
 
 enum GitStoreState {
@@ -10722,7 +10725,14 @@ impl Repository {
                 RepositoryState::Remote(..) => GitAccess::Yes,
                 RepositoryState::Local(state) => match state.backend.check_access().await {
                     Ok(_) => GitAccess::Yes,
-                    Err(_) => GitAccess::No,
+                    Err(error) => {
+                        let message = error.to_string();
+                        if is_dubious_ownership_error(&message) {
+                            GitAccess::No
+                        } else {
+                            GitAccess::Error(message.into())
+                        }
+                    }
                 },
             }
         })
@@ -10733,6 +10743,10 @@ impl Repository {
             .clone()
             .or(self.remote_origin_url.clone())
     }
+}
+
+fn is_dubious_ownership_error(message: &str) -> bool {
+    message.contains("detected dubious ownership")
 }
 
 fn format_job_key(key: &GitJobKey) -> SharedString {

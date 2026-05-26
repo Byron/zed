@@ -33,6 +33,7 @@ use crate::{
     text_diff_view::TextDiffView,
 };
 
+mod active_diff_tree;
 pub mod branch_diff;
 pub mod branch_picker;
 mod commit_context_menu;

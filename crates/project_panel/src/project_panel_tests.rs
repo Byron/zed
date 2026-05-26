@@ -5866,6 +5866,94 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_project_panel_follows_uncommitted_project_diff_cursor(cx: &mut gpui::TestAppContext) {
+    init_test_with_editor(cx);
+    cx.update(|cx| {
+        git_ui::init(cx);
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .project_panel
+                    .get_or_insert_default()
+                    .auto_reveal_entries = Some(true);
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            ".git": {},
+            "src": {
+                "one.rs": "one modified\n",
+                "two.rs": "two modified\n",
+            },
+        }),
+    )
+    .await;
+    fs.set_head_and_index_for_repo(
+        path!("/project/.git").as_ref(),
+        &[
+            ("src/one.rs", "one original\n".into()),
+            ("src/two.rs", "two original\n".into()),
+        ],
+    );
+
+    let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..20, cx),
+        &["v project", "    > .git", "    > src"],
+    );
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        git_ui::project_diff::ProjectDiff::deploy_at(workspace, None, window, cx);
+    });
+    cx.run_until_parked();
+
+    let two_entry = find_project_entry(&panel, "project/src/two.rs", cx)
+        .expect("two.rs should have a project entry");
+    let two_project_path = project.read_with(cx, |project, cx| {
+        project
+            .path_for_entry(two_entry, cx)
+            .expect("two.rs should have a project path")
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        let project_diff = workspace
+            .active_item_as::<git_ui::project_diff::ProjectDiff>(cx)
+            .expect("ProjectDiff should be active");
+        project_diff.update(cx, |project_diff, cx| {
+            project_diff.move_to_project_path(&two_project_path, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        project.read_with(cx, |project, _| project.active_entry()),
+        Some(two_entry)
+    );
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..20, cx),
+        &[
+            "v project",
+            "    > .git",
+            "    v src",
+            "          one.rs",
+            "          two.rs  <== selected  <== marked",
+        ],
+    );
+}
+
+#[gpui::test]
 async fn test_gitignored_and_always_included(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
     cx.update(|cx| {

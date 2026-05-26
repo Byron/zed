@@ -1,4 +1,5 @@
 use crate::{
+    active_diff_tree::ActiveDiffEntry,
     branch_diff::BranchDiff,
     diff_multibuffer::DiffMultibuffer,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
@@ -11,7 +12,9 @@ use editor::{
     DefaultDiffHunkRenderer, Editor, EditorEvent, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
 };
-use git::{Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext};
+use git::{
+    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext, repository::RepoPath,
+};
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
     Subscription, Task, WeakEntity, actions,
@@ -71,6 +74,7 @@ pub struct ProjectDiff {
     workspace: WeakEntity<Workspace>,
     diff: Entity<DiffMultibuffer>,
     _diff_observation: Subscription,
+    _diff_event_subscription: Subscription,
 }
 
 impl ProjectDiff {
@@ -266,12 +270,16 @@ impl ProjectDiff {
         workspace: Entity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observation = cx.observe(&diff, |_, _, cx| cx.notify());
+        let diff_observation = cx.observe(&diff, |_, _, cx| cx.notify());
+        let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
+            cx.emit(event.clone());
+        });
         Self {
             project,
             workspace: workspace.downgrade(),
             diff,
-            _diff_observation: observation,
+            _diff_observation: diff_observation,
+            _diff_event_subscription: diff_event_subscription,
         }
     }
 
@@ -286,6 +294,66 @@ impl ProjectDiff {
     pub(crate) fn set_repo(&mut self, repo: Option<Entity<Repository>>, cx: &mut Context<Self>) {
         self.diff
             .update(cx, |diff, cx| diff.set_repo(repo.clone(), cx));
+    }
+
+    pub(crate) fn is_uncommitted_diff_for_repo(&self, repo: &Entity<Repository>, cx: &App) -> bool {
+        matches!(self.diff_base(cx), DiffBase::Head)
+            && self
+                .repo(cx)
+                .is_some_and(|current| current.read(cx).id == repo.read(cx).id)
+    }
+
+    pub(crate) fn immutable_diff_repository(&self, cx: &App) -> Option<Entity<Repository>> {
+        if matches!(self.diff_base(cx), DiffBase::Head) {
+            return None;
+        }
+        self.repo(cx)
+    }
+
+    pub(crate) fn immutable_diff_entries(&self, cx: &App) -> Option<Vec<ActiveDiffEntry>> {
+        if matches!(self.diff_base(cx), DiffBase::Head) {
+            return None;
+        }
+
+        let diff = self.diff.read(cx);
+        let diff_stats = diff.diff_stats_by_repo_path(cx);
+        let mut entries = diff
+            .branch_diff()
+            .read(cx)
+            .changed_entries(cx)
+            .into_iter()
+            .map(|entry| ActiveDiffEntry {
+                diff_stat: diff_stats
+                    .get(&entry.repo_path)
+                    .copied()
+                    .or(entry.diff_stat),
+                repo_path: entry.repo_path,
+                status: entry.file_status,
+            })
+            .collect::<Vec<_>>();
+
+        if !diff_stats.is_empty() {
+            entries.retain(|entry| diff_stats.contains_key(&entry.repo_path));
+        }
+
+        Some(entries)
+    }
+
+    pub(crate) fn active_repo_path(&self, cx: &App) -> Option<RepoPath> {
+        let project_path = self.diff.read(cx).active_project_path(cx)?;
+        let repo = self.repo(cx)?;
+        let repo = repo.read(cx);
+        repo.project_path_to_repo_path(&project_path, cx)
+    }
+
+    pub(crate) fn move_to_repo_path(
+        &mut self,
+        repo_path: RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.move_to_repo_path(repo_path, window, cx));
     }
 
     pub fn move_to_entry(

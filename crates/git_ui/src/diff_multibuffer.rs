@@ -204,6 +204,27 @@ impl DiffMultibuffer {
         &self.multibuffer
     }
 
+    pub(crate) fn diff_stats_by_repo_path(
+        &self,
+        cx: &App,
+    ) -> HashMap<RepoPath, git::status::DiffStat> {
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        snapshot
+            .buffers_with_paths()
+            .filter_map(|(buffer_snapshot, _)| {
+                let buffer_id = buffer_snapshot.remote_id();
+                let diff = snapshot.diff_for_buffer_id(buffer_id)?;
+                let (added, deleted) = diff.changed_row_counts();
+                let buffer = self.multibuffer.read(cx).buffer(buffer_id)?;
+                let repo_path = buffer
+                    .read(cx)
+                    .file()
+                    .map(|file| RepoPath::from_rel_path(file.path().as_ref()))?;
+                Some((repo_path, git::status::DiffStat { added, deleted }))
+            })
+            .collect()
+    }
+
     pub(crate) fn move_to_entry(
         &mut self,
         entry: GitStatusEntry,
@@ -243,6 +264,33 @@ impl DiffMultibuffer {
         self.move_to_path(path_key, window, cx)
     }
 
+    pub(crate) fn move_to_repo_path(
+        &mut self,
+        repo_path: RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(git_repo) = self.branch_diff.read(cx).repo().cloned() else {
+            return;
+        };
+        let status = self
+            .branch_diff
+            .read(cx)
+            .changed_entries(cx)
+            .into_iter()
+            .find(|entry| entry.repo_path == repo_path)
+            .map(|entry| entry.file_status)
+            .or_else(|| {
+                git_repo
+                    .read(cx)
+                    .status_for_path(&repo_path)
+                    .map(|entry| entry.status)
+            })
+            .unwrap_or(FileStatus::Untracked);
+        let path_key = project_diff_path_key(&git_repo.read(cx), &repo_path, status, cx);
+        self.move_to_path(path_key, window, cx);
+    }
+
     pub(crate) fn move_to_beginning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             editor.rhs_editor().update(cx, |editor, cx| {
@@ -260,8 +308,17 @@ impl DiffMultibuffer {
         cx: &mut Context<Self>,
     ) {
         if let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
+            let buffer_id = self
+                .multibuffer
+                .read(cx)
+                .snapshot(cx)
+                .anchor_to_buffer_anchor(position)
+                .map(|(anchor, _)| anchor.buffer_id);
             self.editor.update(cx, |editor, cx| {
                 editor.rhs_editor().update(cx, |editor, cx| {
+                    if let Some(buffer_id) = buffer_id {
+                        editor.unfold_buffer(buffer_id, cx);
+                    }
                     editor.change_selections(
                         SelectionEffects::scroll(Autoscroll::focused()),
                         window,
@@ -405,15 +462,21 @@ impl DiffMultibuffer {
                 let Some(project_path) = self.active_project_path(cx) else {
                     return;
                 };
-                self.workspace
-                    .update(cx, |workspace, cx| {
-                        if let Some(git_panel) = workspace.panel::<GitPanel>(cx) {
-                            git_panel.update(cx, |git_panel, cx| {
-                                git_panel.select_entry_by_path(project_path, window, cx)
-                            })
-                        }
-                    })
-                    .ok();
+                let git_panel = self
+                    .workspace
+                    .read_with(cx, |workspace, cx| workspace.panel::<GitPanel>(cx))
+                    .ok()
+                    .flatten();
+                if let Some(git_panel) = git_panel {
+                    window.defer(cx, move |window, cx| {
+                        git_panel.update(cx, |git_panel, cx| {
+                            if !git_panel.select_entry_by_path(project_path, window, cx) {
+                                git_panel.follow_active_immutable_diff(window, cx);
+                            }
+                        });
+                    });
+                }
+                cx.emit(event.clone());
             }
             EditorEvent::Saved => {
                 self._task =
