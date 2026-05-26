@@ -18191,6 +18191,109 @@ async fn test_repository_subfolder_git_status(
     });
 }
 
+#[gpui::test]
+async fn test_linked_worktree_real_git_status_updates_after_external_change(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let root = TempTree::new(json!({
+        "main": {
+            "src": {
+                "changed.txt": "original\n",
+            },
+        },
+    }));
+    let main_worktree = root.path().join("main");
+    let repo = git_init(&main_worktree);
+    git_add("src/changed.txt", &repo);
+    git_commit("init", &repo);
+
+    let linked_worktree = root.path().join("linked");
+    let output = smol::process::Command::new("git")
+        .current_dir(&repo)
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_SYSTEM", "")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+        .args(["worktree", "add", "-b", "linked"])
+        .arg(&linked_worktree)
+        .output()
+        .await
+        .expect("Failed to run git worktree add");
+    assert!(
+        output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let project = Project::test(
+        Arc::new(RealFs::new(None, cx.executor())),
+        [linked_worktree.as_path()],
+        cx,
+    )
+    .await;
+
+    let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    cx.executor().run_until_parked();
+
+    let repository = project.read_with(cx, |project, cx| {
+        project.repositories(cx).values().next().unwrap().clone()
+    });
+    repository.read_with(cx, |repository, _cx| {
+        assert_eq!(
+            repository.work_directory_abs_path.as_ref(),
+            linked_worktree.as_path()
+        );
+        assert!(
+            repository.linked_worktree_path().is_some(),
+            "linked worktree should be detected as a linked worktree"
+        );
+        assert_eq!(
+            repository.status_for_path(&repo_path("src/changed.txt")),
+            None
+        );
+    });
+
+    let worktree_id = tree.read_with(cx, |tree, _| tree.id());
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("src/changed.txt")), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    std::fs::write(linked_worktree.join("src/changed.txt"), "changed\n").unwrap();
+    project
+        .update(cx, |project, cx| {
+            project.reload_buffers([buffer.clone()].into_iter().collect(), false, cx)
+        })
+        .await
+        .unwrap();
+    repository
+        .update(cx, |repository, _cx| repository.barrier())
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    repository.read_with(cx, |repository, _cx| {
+        assert_eq!(
+            repository
+                .status_for_path(&repo_path("src/changed.txt"))
+                .map(|entry| entry.status),
+            Some(StatusCode::Modified.worktree())
+        );
+    });
+}
+
 // TODO: this test is flaky (especially on Windows but at least sometimes on all platforms).
 #[cfg(any())]
 #[gpui::test]

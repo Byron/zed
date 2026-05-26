@@ -385,6 +385,10 @@ impl GitRepository for FakeGitRepository {
         self.common_dir_path.clone()
     }
 
+    fn working_directory_path(&self) -> Option<PathBuf> {
+        self.dot_git_path.parent().map(Path::to_path_buf)
+    }
+
     fn merge_message(&self) -> BoxFuture<'_, Option<String>> {
         async move { None }.boxed()
     }

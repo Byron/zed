@@ -1014,6 +1014,7 @@ mod tests {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.editor.diff_view_style = Some(DiffViewStyle::Unified);
+                    settings.editor.excerpt_context_lines = Some(2);
                 });
             });
             theme_settings::init(theme::LoadThemes::JustBase, cx);
