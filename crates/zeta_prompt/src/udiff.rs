@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use imara_diff::{Algorithm, Diff, InternedInput, Interner, Token};
+use gix::diff::blob::{Algorithm, Diff, InternedInput, Interner, Token};
 
 pub fn strip_diff_path_prefix<'a>(diff: &'a str, prefix: &str) -> Cow<'a, str> {
     if prefix.is_empty() {
@@ -214,7 +214,7 @@ pub fn unified_diff_with_context(
     context_lines: u32,
 ) -> String {
     // The builder appends its own line terminators, so tokenize without them.
-    let mut input = InternedInput::default();
+    let mut input: InternedInput<&str> = InternedInput::default();
     input.update_before(old_text.lines());
     input.update_after(new_text.lines());
     let diff = Diff::compute(Algorithm::Histogram, &input);
