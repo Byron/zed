@@ -6,6 +6,21 @@ if [[ ! " $* " == *" -p "* && ! " $* " == *" --package "* ]]; then
     set -- "$@" --workspace
 fi
 
+if [[ -z "${LK_CUSTOM_WEBRTC:-}" ]]; then
+    shopt -s nullglob
+    for webrtc_artifact in "$HOME"/.cache/livekit-webrtc/*/*; do
+        if [[ -d "$webrtc_artifact/include" \
+            && -f "$webrtc_artifact/lib/libwebrtc.a" \
+            && -f "$webrtc_artifact/webrtc.ninja" \
+            && -f "$webrtc_artifact/desktop_capture.ninja" ]]; then
+            export LK_CUSTOM_WEBRTC="$webrtc_artifact"
+            echo "Using cached LiveKit WebRTC artifact: $LK_CUSTOM_WEBRTC" >&2
+            break
+        fi
+    done
+    shopt -u nullglob
+fi
+
 set -x
 "${CARGO:-cargo}" clippy "$@" --release --all-targets --all-features -- --deny warnings
 
