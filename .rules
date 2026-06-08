@@ -135,6 +135,8 @@ Other entities can then register a callback to handle these events by doing `cx.
 ## Build guidelines
 
 - Use `./script/clippy` instead of `cargo clippy`
+- `webrtc-sys` downloads a large LiveKit WebRTC artifact unless `LK_CUSTOM_WEBRTC` points at an existing extracted artifact directory. `./script/clippy` auto-detects this cache when possible. On Apple Silicon, the expected directory is the one containing `include/`, `lib/libwebrtc.a`, `webrtc.ninja`, and `desktop_capture.ninja`, for example:
+  `LK_CUSTOM_WEBRTC=/Users/byron/.cache/livekit-webrtc/webrtc-0001d84-4/mac-arm64-release`.
 
 # Pull request hygiene
 
