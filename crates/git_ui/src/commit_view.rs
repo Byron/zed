@@ -3,7 +3,9 @@ use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
-    SplittableEditor, hover_markdown_style, multibuffer_context_lines,
+    SplittableEditor,
+    display_map::{BlockPlacement, BlockProperties, BlockStyle},
+    hover_markdown_style, multibuffer_context_lines,
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, RepoPath};
@@ -23,7 +25,7 @@ use language::{
     ReplicaId, Rope, TextBuffer,
 };
 use markdown::{Markdown, MarkdownElement};
-use multi_buffer::PathKey;
+use multi_buffer::{Anchor, PathKey};
 use project::{
     Project, ProjectPath, WorktreeId,
     git_store::{CommitDiff, Repository, UnshallowState},
@@ -36,7 +38,7 @@ use std::{
     sync::Arc,
 };
 use theme::ActiveTheme;
-use ui::{ContextMenu, DiffStat, Disclosure, Divider, Tooltip, WithScrollbar, prelude::*};
+use ui::{ContextMenu, DiffStat, Divider, Tooltip, prelude::*};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath, truncate_and_trailoff};
 use workspace::item::TabTooltipContent;
 use workspace::{
@@ -76,9 +78,6 @@ pub fn init(cx: &mut App) {
 pub struct CommitView {
     commit: CommitDetails,
     editor: Entity<SplittableEditor>,
-    message: Entity<Markdown>,
-    message_expanded: bool,
-    message_scroll_handle: ScrollHandle,
     stash: Option<usize>,
     multibuffer: Entity<MultiBuffer>,
     repository: Entity<Repository>,
@@ -178,6 +177,7 @@ impl Addon for CommitDiffAddon {
 }
 
 const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
+const COMMIT_MESSAGE_BLOCK_MAX_LINES: u32 = 12;
 
 impl CommitView {
     pub fn open(
@@ -336,6 +336,7 @@ impl CommitView {
 
             editor
         });
+        Self::insert_commit_message_block(&editor, message, commit.message.as_ref(), cx);
         let commit_sha = Arc::<str>::from(commit.sha.as_ref());
 
         let repository_clone = repository.clone();
@@ -516,9 +517,6 @@ impl CommitView {
         Self {
             commit,
             editor,
-            message,
-            message_expanded: false,
-            message_scroll_handle: ScrollHandle::new(),
             multibuffer,
             stash,
             repository,
@@ -640,6 +638,40 @@ impl CommitView {
             )
     }
 
+    fn has_commit_message_block(&self) -> bool {
+        commit_message_has_body(self.commit.message.as_ref())
+    }
+
+    fn insert_commit_message_block(
+        editor: &Entity<SplittableEditor>,
+        message: Entity<Markdown>,
+        commit_message: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !commit_message_has_body(commit_message) {
+            return;
+        }
+
+        editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.insert_blocks(
+                    [BlockProperties {
+                        placement: BlockPlacement::Above(Anchor::Min),
+                        height: Some(1),
+                        style: BlockStyle::Fixed,
+                        render: Arc::new({
+                            let message = message.clone();
+                            move |cx| render_commit_message_block(message.clone(), cx)
+                        }),
+                        priority: 0,
+                    }],
+                    None,
+                    cx,
+                );
+            });
+        });
+    }
+
     fn render_commit_avatar(
         &self,
         sha: &SharedString,
@@ -752,14 +784,6 @@ impl CommitView {
             (IconName::Copy, Color::Muted)
         };
 
-        let has_more = self.commit.message.trim().contains('\n');
-        let is_expanded = self.message_expanded;
-        let expand_tooltip = if is_expanded {
-            "Fold Commit Description"
-        } else {
-            "Expand Commit Description"
-        };
-
         v_flex()
             .w_full()
             .py_2p5()
@@ -788,24 +812,7 @@ impl CommitView {
                             )
                             .child(
                                 v_flex()
-                                    .child(h_flex().gap_1().child(Label::new(author_name)).when(
-                                        has_more,
-                                        |this| {
-                                            this.child(
-                                                Disclosure::new(
-                                                    "commit-message-disclosure",
-                                                    is_expanded,
-                                                )
-                                                .closed_icon(IconName::ExpandVertical)
-                                                .opened_icon(IconName::FoldVertical)
-                                                .tooltip(Tooltip::text(expand_tooltip))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.message_expanded = !this.message_expanded;
-                                                    cx.notify();
-                                                })),
-                                            )
-                                        },
-                                    ))
+                                    .child(h_flex().gap_1().child(Label::new(author_name)))
                                     .child(
                                         h_flex()
                                             .gap_1p5()
@@ -856,28 +863,14 @@ impl CommitView {
                         )
                     }),
             )
-            .children(self.render_commit_message(avatar_container_width, window, cx))
+            .children(self.render_commit_subject(avatar_container_width))
     }
 
-    fn render_commit_message(
-        &self,
-        avatar_spacer: Pixels,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        let message = self.commit.message.trim();
-        if message.is_empty() {
+    fn render_commit_subject(&self, avatar_spacer: Pixels) -> Option<impl IntoElement> {
+        let subject = self.commit.message.lines().next().unwrap_or("").trim();
+        if subject.is_empty() {
             return None;
         }
-
-        let markdown_style = hover_markdown_style(window, cx);
-
-        let is_expanded = self.message_expanded;
-
-        let has_more = message.contains('\n');
-        let collapsed = has_more && !is_expanded;
-        let collapsed_height = window.line_height();
-        let max_expanded_height = window.line_height() * 12.;
 
         Some(
             h_flex()
@@ -885,24 +878,11 @@ impl CommitView {
                 .pr_2p5()
                 .child(h_flex().flex_none().w(avatar_spacer))
                 .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .id("commit-message")
-                                .size_full()
-                                .text_sm()
-                                .when(collapsed, |this| this.h(collapsed_height).overflow_hidden())
-                                .when(!collapsed, |this| {
-                                    this.max_h(max_expanded_height)
-                                        .overflow_y_scroll()
-                                        .track_scroll(&self.message_scroll_handle)
-                                })
-                                .child(MarkdownElement::new(self.message.clone(), markdown_style)),
-                        )
-                        .vertical_scrollbar_for(&self.message_scroll_handle, window, cx),
+                    div().relative().flex_1().min_w_0().child(
+                        Label::new(subject.to_string())
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    ),
                 ),
         )
     }
@@ -1360,11 +1340,9 @@ impl Item for CommitView {
                     cx,
                 )
             });
+            Self::insert_commit_message_block(&editor, message, self.commit.message.as_ref(), cx);
             Self {
                 editor,
-                message,
-                message_expanded: self.message_expanded,
-                message_scroll_handle: ScrollHandle::new(),
                 multibuffer: self.multibuffer.clone(),
                 commit: self.commit.clone(),
                 stash: self.stash,
@@ -1391,13 +1369,77 @@ impl Render for CommitView {
             .bg(cx.theme().colors().editor_background)
             .child(self.render_header(window, cx))
             .when(
-                !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
+                self.has_commit_message_block()
+                    || !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
                 |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
             )
             .when(self.is_shallow_boundary, |this| {
                 this.child(self.render_shallow_boundary_notice(cx))
             })
     }
+}
+
+fn commit_message_has_body(commit_message: &str) -> bool {
+    commit_message.trim().contains('\n')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_message_block_is_only_used_for_messages_with_a_body() {
+        assert!(!commit_message_has_body(""));
+        assert!(!commit_message_has_body("Subject only"));
+        assert!(!commit_message_has_body("Subject only\n\n"));
+        assert!(commit_message_has_body("Subject\n\nBody"));
+        assert!(commit_message_has_body("Subject\nBody"));
+    }
+}
+
+fn render_commit_message_block(
+    message: Entity<Markdown>,
+    cx: &mut editor::display_map::BlockContext,
+) -> AnyElement {
+    let markdown_style = hover_markdown_style(cx.window, cx);
+    let max_height = cx.line_height * COMMIT_MESSAGE_BLOCK_MAX_LINES as f32;
+    let scroll_handle = ScrollHandle::new();
+
+    div()
+        .id("commit-message-block")
+        .w_full()
+        .pl(cx.margins.gutter.width)
+        .pr(cx.margins.right)
+        .py_2()
+        .border_b_1()
+        .border_color(cx.theme().colors().border_variant)
+        .bg(cx.theme().colors().editor_background)
+        .child(
+            div()
+                .id("commit-message-block-scroll")
+                .overflow_y_scroll()
+                .track_scroll(&scroll_handle)
+                .max_h(max_height)
+                .text_sm()
+                .child(
+                    MarkdownElement::new(message, markdown_style)
+                        .code_block_renderer(markdown::CodeBlockRenderer::Default {
+                            copy_button_visibility: markdown::CopyButtonVisibility::Hidden,
+                            wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
+                            border: false,
+                        })
+                        .on_url_click(|link, window, cx| {
+                            if let Some(workspace) = Workspace::for_window(window, cx) {
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.open_url_or_file(&link, None, window, cx);
+                                });
+                            } else {
+                                cx.open_url(&link);
+                            }
+                        }),
+                ),
+        )
+        .into_any_element()
 }
 
 pub struct CommitViewToolbar {
