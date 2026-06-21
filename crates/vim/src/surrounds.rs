@@ -4,7 +4,7 @@ use crate::{
     object::{Object, surrounding_markers},
     state::Mode,
 };
-use editor::{Anchor, Bias, MultiBufferOffset, ToOffset, movement};
+use editor::{Anchor, Bias, MultiBufferOffset, ToOffset, display_map::ToDisplayPoint, movement};
 use gpui::{Context, Window};
 use language::BracketPair;
 
@@ -100,7 +100,12 @@ impl Vim {
                 editor.set_clip_at_line_ends(false, cx);
 
                 let pair = bracket_pair_for_str_vim(&text);
-                let surround = pair.end != surround_alias((*text).as_ref());
+                let compact_backquoted_brackets = matches!(
+                    (&target, text.as_ref()),
+                    (SurroundsType::Object(Object::BackQuotes, true), "[")
+                );
+                let surround =
+                    pair.end != surround_alias((*text).as_ref()) && !compact_backquoted_brackets;
                 let display_map = editor.display_snapshot(cx);
                 let display_selections = editor.selections.all_adjusted_display(&display_map);
                 let mut edits = Vec::new();
@@ -139,7 +144,16 @@ impl Vim {
                         SurroundsType::Selection => Some(selection.range()),
                     };
 
-                    if let Some(range) = range {
+                    if let Some(mut range) = range {
+                        if compact_backquoted_brackets {
+                            let range_end = range.end.to_offset(&display_map, Bias::Left);
+                            for (ch, char_range) in movement::chars_before(&display_map, range_end)
+                                .take_while(|(ch, _)| ch.is_whitespace() && *ch != '\n')
+                            {
+                                debug_assert!(ch.is_whitespace());
+                                range.end = char_range.start.to_display_point(&display_map);
+                            }
+                        }
                         let start = range.start.to_offset(&display_map, Bias::Right);
                         let end = range.end.to_offset(&display_map, Bias::Left);
                         let (start_cursor_str, end_cursor_str) = if mode == Mode::VisualLine {
@@ -1582,6 +1596,10 @@ mod test {
             the lazy dog."},
             Mode::Normal,
         );
+
+        cx.set_state("The `vaˇr` value", Mode::Normal);
+        cx.simulate_keystrokes("y s a ` [");
+        cx.assert_state("The ˇ[`var`] value", Mode::Normal);
     }
 
     #[gpui::test]
