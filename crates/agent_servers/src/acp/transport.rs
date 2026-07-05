@@ -11,6 +11,8 @@ use std::{io, pin::Pin, process::Stdio};
 use task::{Shell, ShellBuilder};
 use util::{ResultExt as _, process::Child};
 
+const ACP_STDIO_BUFFER_SIZE: usize = 64 * 1024;
+
 pub(super) struct OwnedChild(pub Child);
 
 impl Drop for OwnedChild {
@@ -90,7 +92,7 @@ pub(super) fn spawn_stdio(
     log::trace!("Spawned (pid: {})", child.id());
 
     let debug_log = AcpDebugLog::default();
-    let incoming = BufReader::new(stdout)
+    let incoming = BufReader::with_capacity(ACP_STDIO_BUFFER_SIZE, stdout)
         .lines()
         .inspect({
             let debug_log = debug_log.clone();
@@ -120,7 +122,7 @@ pub(super) fn spawn_stdio(
     let stderr = {
         let debug_log = debug_log.clone();
         async move {
-            let mut stderr = BufReader::new(stderr);
+            let mut stderr = BufReader::with_capacity(ACP_STDIO_BUFFER_SIZE, stderr);
             let mut line = String::new();
             while let Ok(bytes_read) = stderr.read_line(&mut line).await
                 && bytes_read > 0
@@ -186,6 +188,7 @@ mod tests {
                 debug_log,
             } = spawn_stdio(&project, command.clone(), &cx.to_async())
                 .expect("spawn fresh transport");
+            let (_backlog, _receiver) = debug_log.subscribe();
             let stderr_task = cx.background_executor.spawn(stderr);
             let params = serde_json::json!({ "attempt": attempt });
             let request = serde_json::json!({
