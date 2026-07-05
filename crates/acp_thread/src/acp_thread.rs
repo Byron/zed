@@ -2128,6 +2128,8 @@ struct StreamingTextBuffer {
     pending: String,
     /// The number of bytes to reveal per timer turn.
     bytes_to_reveal_per_tick: usize,
+    /// The thread entry whose Markdown source is being revealed.
+    entry_index: usize,
     /// The Markdown entity being streamed into.
     target: Entity<Markdown>,
     /// Timer task that periodically moves text from `pending` into `source`.
@@ -2137,7 +2139,7 @@ struct StreamingTextBuffer {
 impl StreamingTextBuffer {
     /// The number of milliseconds between each timer tick, controlling how quickly
     /// text is revealed.
-    const TASK_UPDATE_MS: u64 = 16;
+    const TASK_UPDATE_MS: u64 = 250;
     /// The time in milliseconds to reveal the entire pending text.
     const REVEAL_TARGET: f32 = 200.0;
 }
@@ -2783,9 +2785,8 @@ impl AcpThread {
             if let Some(markdown) =
                 self.streaming_markdown_target(message_id.as_ref(), is_thought, indented)
             {
-                let entries_len = self.entries.len();
-                cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
-                self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
+                let entry_index = self.entries.len() - 1;
+                self.buffer_streaming_text(&markdown, entry_index, text_content.text.clone(), cx);
                 return;
             }
         }
@@ -2910,11 +2911,14 @@ impl AcpThread {
     fn buffer_streaming_text(
         &mut self,
         markdown: &Entity<Markdown>,
+        entry_index: usize,
         text: String,
         cx: &mut Context<Self>,
     ) {
         if let Some(buffer) = &mut self.streaming_text_buffer {
-            if buffer.target.entity_id() == markdown.entity_id() {
+            if buffer.target.entity_id() == markdown.entity_id()
+                && buffer.entry_index == entry_index
+            {
                 buffer.pending.push_str(&text);
 
                 buffer.bytes_to_reveal_per_tick = (buffer.pending.len() as f32
@@ -2935,6 +2939,7 @@ impl AcpThread {
         self.streaming_text_buffer = Some(StreamingTextBuffer {
             pending: text,
             bytes_to_reveal_per_tick: bytes_to_reveal,
+            entry_index,
             target,
             _reveal_task,
         });
@@ -2950,6 +2955,7 @@ impl AcpThread {
                 buffer
                     .target
                     .update(cx, |markdown, cx| markdown.append(&buffer.pending, cx));
+                cx.emit(AcpThreadEvent::EntryUpdated(buffer.entry_index));
             }
         }
     }
@@ -2985,6 +2991,7 @@ impl AcpThread {
                             markdown.append(&buffer.pending[..byte_boundary], cx);
                             buffer.pending.drain(..byte_boundary);
                         });
+                        cx.emit(AcpThreadEvent::EntryUpdated(buffer.entry_index));
 
                         true
                     })
@@ -5793,6 +5800,258 @@ mod tests {
                 id.as_ref().map(ToString::to_string).as_deref(),
                 Some("msg_agent_2")
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_streaming_text_chunks_are_buffered_until_revealed(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let thread = new_test_thread(cx).await;
+        let entry_updates = Rc::new(RefCell::new(Vec::new()));
+        let new_entries = Rc::new(RefCell::new(0usize));
+        thread.update(cx, |_thread, cx| {
+            let entry_updates = entry_updates.clone();
+            let new_entries = new_entries.clone();
+            cx.subscribe(
+                &thread,
+                move |_thread, _event_thread, event: &AcpThreadEvent, _cx| match event {
+                    AcpThreadEvent::EntryUpdated(index) => entry_updates.borrow_mut().push(*index),
+                    AcpThreadEvent::NewEntry => *new_entries.borrow_mut() += 1,
+                    _ => {}
+                },
+            )
+            .detach();
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("start".into()).message_id("message"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            for chunk in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(
+                            acp::ContentChunk::new(chunk.into()).message_id("message"),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            }
+        });
+
+        assert_eq!(*new_entries.borrow(), 1);
+        assert!(
+            entry_updates.borrow().is_empty(),
+            "buffered chunks should not emit EntryUpdated until text is revealed"
+        );
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.entries.len(), 1);
+            let AgentThreadEntry::AssistantMessage(message) = &thread.entries[0] else {
+                panic!("expected assistant entry")
+            };
+            let AssistantMessageChunk::Message { block, .. } = &message.chunks[0] else {
+                panic!("expected assistant message chunk")
+            };
+            assert_eq!(block.to_markdown(cx), "start");
+        });
+
+        cx.executor()
+            .advance_clock(Duration::from_millis(StreamingTextBuffer::TASK_UPDATE_MS));
+        cx.run_until_parked();
+
+        assert_eq!(
+            entry_updates.borrow().as_slice(),
+            &[0],
+            "one reveal tick should emit one entry update"
+        );
+        thread.read_with(cx, |thread, cx| {
+            let AgentThreadEntry::AssistantMessage(message) = &thread.entries[0] else {
+                panic!("expected assistant entry")
+            };
+            let AssistantMessageChunk::Message { block, .. } = &message.chunks[0] else {
+                panic!("expected assistant message chunk")
+            };
+            assert_eq!(block.to_markdown(cx), "start1234567890");
+        });
+
+        for _ in 0..3 {
+            cx.executor()
+                .advance_clock(Duration::from_millis(StreamingTextBuffer::TASK_UPDATE_MS));
+            cx.run_until_parked();
+        }
+
+        thread.read_with(cx, |thread, cx| {
+            let AgentThreadEntry::AssistantMessage(message) = &thread.entries[0] else {
+                panic!("expected assistant entry")
+            };
+            let AssistantMessageChunk::Message { block, .. } = &message.chunks[0] else {
+                panic!("expected assistant message chunk")
+            };
+            assert_eq!(block.to_markdown(cx), "start1234567890");
+        });
+        assert_eq!(
+            entry_updates.borrow().as_slice(),
+            &[0],
+            "ten buffered chunks should be revealed in one bounded timer update"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_flush_streaming_text_emits_one_final_update(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let thread = new_test_thread(cx).await;
+        let entry_updates = Rc::new(RefCell::new(Vec::new()));
+        let new_entries = Rc::new(RefCell::new(0usize));
+        thread.update(cx, |_thread, cx| {
+            let entry_updates = entry_updates.clone();
+            let new_entries = new_entries.clone();
+            cx.subscribe(
+                &thread,
+                move |_thread, _event_thread, event: &AcpThreadEvent, _cx| match event {
+                    AcpThreadEvent::EntryUpdated(index) => entry_updates.borrow_mut().push(*index),
+                    AcpThreadEvent::NewEntry => *new_entries.borrow_mut() += 1,
+                    _ => {}
+                },
+            )
+            .detach();
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("A".into()).message_id("message"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("bc".into()).message_id("message"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("de".into()).message_id("message"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        assert!(
+            entry_updates.borrow().is_empty(),
+            "streaming chunks should remain buffered before a flush"
+        );
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new("tool-1", "Tool")
+                            .kind(acp::ToolKind::Fetch)
+                            .status(acp::ToolCallStatus::InProgress),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        assert_eq!(
+            entry_updates.borrow().as_slice(),
+            &[0],
+            "flushing pending streamed text should emit one final update"
+        );
+        assert_eq!(*new_entries.borrow(), 2);
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.to_markdown(cx),
+                "## Assistant\n\nAbcde\n\n**Tool Call: Tool**\nStatus: In Progress\n\n"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_mixed_thought_and_message_streaming_flushes_changed_targets(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let thread = new_test_thread(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentThoughtChunk(
+                        acp::ContentChunk::new("Thinking ".into()).message_id("thought-1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentThoughtChunk(
+                        acp::ContentChunk::new("hard".into()).message_id("thought-1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Answer ".into()).message_id("message-1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("done".into()).message_id("message-1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentThoughtChunk(
+                        acp::ContentChunk::new("Second thought".into()).message_id("thought-2"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let [AgentThreadEntry::AssistantMessage(message)] = thread.entries() else {
+                panic!("expected one assistant entry, got {:?}", thread.entries());
+            };
+            assert_eq!(message.chunks.len(), 3);
+
+            let AssistantMessageChunk::Thought { block, .. } = &message.chunks[0] else {
+                panic!("expected first chunk to be a thought")
+            };
+            assert_eq!(block.to_markdown(cx), "Thinking hard");
+
+            let AssistantMessageChunk::Message { block, .. } = &message.chunks[1] else {
+                panic!("expected second chunk to be a message")
+            };
+            assert_eq!(block.to_markdown(cx), "Answer done");
+
+            let AssistantMessageChunk::Thought { block, .. } = &message.chunks[2] else {
+                panic!("expected third chunk to be a thought")
+            };
+            assert_eq!(block.to_markdown(cx), "Second thought");
         });
     }
 

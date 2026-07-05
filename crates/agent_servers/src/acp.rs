@@ -46,6 +46,7 @@ use crate::{CURSOR_ID, GEMINI_ID};
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
+const ACP_STDIO_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcpDebugMessageDirection {
@@ -165,6 +166,7 @@ impl AcpDebugMessage {
 #[derive(Default)]
 struct AcpDebugLogState {
     messages: VecDeque<AcpDebugMessage>,
+    trailing_stderr: VecDeque<Arc<str>>,
     subscribers: Vec<async_channel::Sender<AcpDebugMessage>>,
 }
 
@@ -191,11 +193,27 @@ impl AcpDebugLog {
     }
 
     fn record_line(&self, direction: AcpDebugMessageDirection, line: &str) {
+        if direction != AcpDebugMessageDirection::Stderr && !self.should_record_json_rpc_messages()
+        {
+            return;
+        }
+
         let messages = AcpDebugMessage::parse_line(direction, line);
         if messages.is_empty() {
             return;
         }
         self.record_messages(messages);
+    }
+
+    fn should_record_json_rpc_messages(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        state.trailing_stderr.clear();
+        state.subscribers.retain(|sender| !sender.is_closed());
+        !state.subscribers.is_empty()
     }
 
     fn record_messages(&self, messages: Vec<AcpDebugMessage>) {
@@ -206,6 +224,16 @@ impl AcpDebugLog {
 
         state.subscribers.retain(|sender| !sender.is_closed());
         for message in messages {
+            match &message.message {
+                AcpDebugMessageContent::Stderr { line } => {
+                    if state.trailing_stderr.len() == MAX_DEBUG_BACKLOG_MESSAGES {
+                        state.trailing_stderr.pop_front();
+                    }
+                    state.trailing_stderr.push_back(line.clone());
+                }
+                _ => state.trailing_stderr.clear(),
+            }
+
             if state.messages.len() == MAX_DEBUG_BACKLOG_MESSAGES {
                 state.messages.pop_front();
             }
@@ -219,22 +247,17 @@ impl AcpDebugLog {
 
     fn trailing_stderr(&self) -> Option<String> {
         let state = self.state.lock().ok()?;
-        let mut lines = state
-            .messages
+        let lines = state
+            .trailing_stderr
             .iter()
-            .rev()
-            .take_while(|message| matches!(&message.message, AcpDebugMessageContent::Stderr { .. }))
-            .filter_map(|message| match &message.message {
-                AcpDebugMessageContent::Stderr { line } if !line.is_empty() => Some(line.as_ref()),
-                _ => None,
-            })
+            .filter(|line| !line.is_empty())
+            .map(|line| line.as_ref())
             .collect::<Vec<_>>();
 
         if lines.is_empty() {
             return None;
         }
 
-        lines.reverse();
         Some(lines.join("\n"))
     }
 }
@@ -885,7 +908,8 @@ impl AcpConnection {
         // closures to the !Send foreground thread.
         let (dispatch_tx, dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
 
-        let incoming_lines = futures::io::BufReader::new(stdout).lines();
+        let incoming_lines =
+            futures::io::BufReader::with_capacity(ACP_STDIO_BUFFER_SIZE, stdout).lines();
         let tapped_incoming = incoming_lines.inspect({
             let debug_log = debug_log.clone();
             move |result| match result {
@@ -913,7 +937,7 @@ impl AcpConnection {
         let stderr_task = cx.background_spawn({
             let debug_log = debug_log.clone();
             async move {
-                let mut stderr = BufReader::new(stderr);
+                let mut stderr = BufReader::with_capacity(ACP_STDIO_BUFFER_SIZE, stderr);
                 let mut line = String::new();
                 while let Ok(n) = stderr.read_line(&mut line).await
                     && n > 0
@@ -3199,6 +3223,7 @@ mod tests {
     #[test]
     fn debug_log_records_each_json_rpc_batch_entry() {
         let debug_log = AcpDebugLog::default();
+        let (_backlog, _receiver) = debug_log.subscribe();
         debug_log.record_line(
             AcpDebugMessageDirection::Incoming,
             r#"{"jsonrpc":"2.0","method":"legacy/update"}"#,
@@ -3266,6 +3291,49 @@ mod tests {
             }) if id == &acp::RequestId::Null
         ));
         assert!(messages.next().is_none());
+    }
+
+    #[test]
+    fn debug_log_skips_json_rpc_messages_without_subscribers() {
+        let debug_log = AcpDebugLog::default();
+        debug_log.record_line(
+            AcpDebugMessageDirection::Incoming,
+            r#"{"method":"initialized"}"#,
+        );
+
+        let (backlog, receiver) = debug_log.subscribe();
+        assert!(backlog.is_empty());
+
+        debug_log.record_line(
+            AcpDebugMessageDirection::Incoming,
+            r#"{"method":"initialized"}"#,
+        );
+
+        let message = receiver
+            .try_recv()
+            .expect("expected subscribed debug log to receive message");
+        assert_eq!(message.direction, AcpDebugMessageDirection::Incoming);
+        match message.message {
+            AcpDebugMessageContent::Notification { method, .. } => {
+                assert_eq!(method.as_ref(), "initialized");
+            }
+            _ => panic!("expected initialized notification"),
+        }
+    }
+
+    #[test]
+    fn debug_log_keeps_trailing_stderr_without_subscribers() {
+        let debug_log = AcpDebugLog::default();
+        debug_log.record_line(AcpDebugMessageDirection::Stderr, "first line");
+        debug_log.record_line(AcpDebugMessageDirection::Stderr, "second line");
+
+        assert_eq!(
+            debug_log.trailing_stderr().as_deref(),
+            Some("first line\nsecond line")
+        );
+
+        let (backlog, _receiver) = debug_log.subscribe();
+        assert_eq!(backlog.len(), 2);
     }
 
     #[test]
