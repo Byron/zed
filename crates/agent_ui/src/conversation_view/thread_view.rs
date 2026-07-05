@@ -200,22 +200,6 @@ impl ThreadFeedbackState {
     }
 }
 
-struct GeneratingSpinner {
-    variant: SpinnerVariant,
-}
-
-impl GeneratingSpinner {
-    fn new(variant: SpinnerVariant) -> Self {
-        Self { variant }
-    }
-}
-
-impl Render for GeneratingSpinner {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        SpinnerLabel::with_variant(self.variant).size(LabelSize::Small)
-    }
-}
-
 #[derive(IntoElement)]
 struct GeneratingSpinnerElement {
     variant: SpinnerVariant,
@@ -228,15 +212,17 @@ impl GeneratingSpinnerElement {
 }
 
 impl RenderOnce for GeneratingSpinnerElement {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let id = match self.variant {
             SpinnerVariant::Dots => "generating-spinner-view",
             SpinnerVariant::Sand => "confirmation-spinner-view",
             _ => "spinner-view",
         };
-        window.with_id(id, |window| {
-            window.use_state(cx, |_, _| GeneratingSpinner::new(self.variant))
-        })
+        div().id(id).child(
+            Icon::new(IconName::Circle)
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+        )
     }
 }
 
