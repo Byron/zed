@@ -154,6 +154,7 @@ impl AcpDebugMessage {
 #[derive(Default)]
 struct AcpDebugLogState {
     messages: VecDeque<AcpDebugMessage>,
+    trailing_stderr: VecDeque<Arc<str>>,
     subscribers: Vec<async_channel::Sender<AcpDebugMessage>>,
     // Startup fallback must not depend on eviction from the diagnostic backlog.
     initialization: Option<InitializationExchange>,
@@ -204,11 +205,36 @@ impl AcpDebugLog {
     }
 
     pub(super) fn record_line(&self, direction: AcpDebugMessageDirection, line: &str) {
+        if direction != AcpDebugMessageDirection::Stderr
+            && !self.should_record_json_rpc_messages(direction)
+        {
+            return;
+        }
+
         let messages = AcpDebugMessage::parse_line(direction, line);
         if messages.is_empty() {
             return;
         }
         self.record_messages(messages);
+    }
+
+    fn should_record_json_rpc_messages(&self, direction: AcpDebugMessageDirection) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Client writes can race the agent's final stderr; only incoming traffic makes it stale.
+        if direction == AcpDebugMessageDirection::Incoming {
+            state.trailing_stderr.clear();
+        }
+        state.subscribers.retain(|sender| !sender.is_closed());
+        // Protocol fallback needs the initialize exchange even when nobody is watching the log.
+        !state.subscribers.is_empty()
+            || state.initialization.as_ref().map_or(
+                direction == AcpDebugMessageDirection::Outgoing,
+                |initialization| initialization.response.is_none(),
+            )
     }
 
     fn record_messages(&self, messages: Vec<ParsedDebugMessage>) {
@@ -246,6 +272,19 @@ impl AcpDebugLog {
                 }
                 _ => {}
             }
+            match &message.message {
+                AcpDebugMessageContent::Stderr { line } => {
+                    if state.trailing_stderr.len() == MAX_DEBUG_BACKLOG_MESSAGES {
+                        state.trailing_stderr.pop_front();
+                    }
+                    state.trailing_stderr.push_back(line.clone());
+                }
+                _ if message.direction == AcpDebugMessageDirection::Incoming => {
+                    state.trailing_stderr.clear();
+                }
+                _ => {}
+            }
+
             if state.messages.len() == MAX_DEBUG_BACKLOG_MESSAGES {
                 state.messages.pop_front();
             }
@@ -259,25 +298,17 @@ impl AcpDebugLog {
 
     pub(super) fn trailing_stderr(&self) -> Option<String> {
         let state = self.state.lock().ok()?;
-        let mut lines = state
-            .messages
+        let lines = state
+            .trailing_stderr
             .iter()
-            .rev()
-            // Client writes can race the agent's final stderr; only later
-            // traffic from the agent makes those diagnostics stale.
-            .filter(|message| message.direction != AcpDebugMessageDirection::Outgoing)
-            .take_while(|message| matches!(&message.message, AcpDebugMessageContent::Stderr { .. }))
-            .filter_map(|message| match &message.message {
-                AcpDebugMessageContent::Stderr { line } if !line.is_empty() => Some(line.as_ref()),
-                _ => None,
-            })
+            .filter(|line| !line.is_empty())
+            .map(|line| line.as_ref())
             .collect::<Vec<_>>();
 
         if lines.is_empty() {
             return None;
         }
 
-        lines.reverse();
         Some(lines.join("\n"))
     }
 }
@@ -295,6 +326,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":"initialize","method":null,"result":{"protocolVersion":1}}"#,
         ] {
             let log = AcpDebugLog::default();
+            let (_backlog, _receiver) = log.subscribe();
             log.record_line(
                 AcpDebugMessageDirection::Outgoing,
                 r#"{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":2}}"#,
@@ -333,6 +365,7 @@ mod tests {
             AcpDebugMessageDirection::Incoming,
             r#"{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":2}}"#,
         );
+        let (_backlog, _receiver) = log.subscribe();
         for _ in 0..MAX_DEBUG_BACKLOG_MESSAGES {
             log.record_line(
                 AcpDebugMessageDirection::Incoming,
@@ -427,43 +460,47 @@ mod tests {
 
     #[test]
     fn trailing_stderr_is_not_hidden_by_client_traffic() {
-        let debug_log = AcpDebugLog::default();
-        debug_log.record_line(AcpDebugMessageDirection::Stderr, "startup error");
-        debug_log.record_line(
-            AcpDebugMessageDirection::Outgoing,
-            r#"{"jsonrpc":"2.0","id":"startup","method":"initialize","params":{}}"#,
-        );
-        debug_log.record_line(AcpDebugMessageDirection::Stderr, "error detail");
-        debug_log.record_line(
-            AcpDebugMessageDirection::Outgoing,
-            r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"startup"}}"#,
-        );
-        assert_eq!(
-            debug_log.trailing_stderr().as_deref(),
-            Some("startup error\nerror detail")
-        );
+        for subscribed in [false, true] {
+            let debug_log = AcpDebugLog::default();
+            let _subscription = subscribed.then(|| debug_log.subscribe());
+            debug_log.record_line(AcpDebugMessageDirection::Stderr, "startup error");
+            debug_log.record_line(
+                AcpDebugMessageDirection::Outgoing,
+                r#"{"jsonrpc":"2.0","id":"startup","method":"initialize","params":{}}"#,
+            );
+            debug_log.record_line(AcpDebugMessageDirection::Stderr, "error detail");
+            debug_log.record_line(
+                AcpDebugMessageDirection::Outgoing,
+                r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"startup"}}"#,
+            );
+            assert_eq!(
+                debug_log.trailing_stderr().as_deref(),
+                Some("startup error\nerror detail")
+            );
 
-        debug_log.record_line(
-            AcpDebugMessageDirection::Incoming,
-            r#"{"jsonrpc":"2.0","id":"startup","result":{}}"#,
-        );
-        debug_log.record_line(
-            AcpDebugMessageDirection::Outgoing,
-            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"session"}}"#,
-        );
-        assert_eq!(debug_log.trailing_stderr(), None);
+            debug_log.record_line(
+                AcpDebugMessageDirection::Incoming,
+                r#"{"jsonrpc":"2.0","id":"startup","result":{}}"#,
+            );
+            debug_log.record_line(
+                AcpDebugMessageDirection::Outgoing,
+                r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"session"}}"#,
+            );
+            assert_eq!(debug_log.trailing_stderr(), None);
 
-        debug_log.record_line(AcpDebugMessageDirection::Stderr, "recent error");
-        debug_log.record_line(
-            AcpDebugMessageDirection::Outgoing,
-            r#"{"jsonrpc":"2.0","id":"next","method":"session/new","params":{}}"#,
-        );
-        assert_eq!(debug_log.trailing_stderr().as_deref(), Some("recent error"));
+            debug_log.record_line(AcpDebugMessageDirection::Stderr, "recent error");
+            debug_log.record_line(
+                AcpDebugMessageDirection::Outgoing,
+                r#"{"jsonrpc":"2.0","id":"next","method":"session/new","params":{}}"#,
+            );
+            assert_eq!(debug_log.trailing_stderr().as_deref(), Some("recent error"));
+        }
     }
 
     #[test]
     fn debug_log_records_each_json_rpc_batch_entry() {
         let debug_log = AcpDebugLog::default();
+        let (_backlog, _receiver) = debug_log.subscribe();
         debug_log.record_line(
             AcpDebugMessageDirection::Incoming,
             r#"{"jsonrpc":"2.0","method":"legacy/update"}"#,
@@ -531,5 +568,73 @@ mod tests {
             }) if id == &RequestId::Null
         ));
         assert!(messages.next().is_none());
+    }
+
+    #[test]
+    fn debug_log_skips_json_rpc_messages_without_subscribers() {
+        let debug_log = AcpDebugLog::default();
+        debug_log.record_line(
+            AcpDebugMessageDirection::Incoming,
+            r#"{"method":"initialized"}"#,
+        );
+
+        let (backlog, receiver) = debug_log.subscribe();
+        assert!(backlog.is_empty());
+
+        debug_log.record_line(
+            AcpDebugMessageDirection::Incoming,
+            r#"{"method":"initialized"}"#,
+        );
+
+        let message = receiver
+            .try_recv()
+            .expect("expected subscribed debug log to receive message");
+        assert_eq!(message.direction, AcpDebugMessageDirection::Incoming);
+        match message.message {
+            AcpDebugMessageContent::Notification { method, .. } => {
+                assert_eq!(method.as_ref(), "initialized");
+            }
+            _ => panic!("expected initialized notification"),
+        }
+    }
+
+    #[test]
+    fn initialization_is_recorded_without_subscribers_and_later_traffic_is_skipped() {
+        let debug_log = AcpDebugLog::default();
+        debug_log.record_line(
+            AcpDebugMessageDirection::Outgoing,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}"#,
+        );
+        debug_log.record_line(
+            AcpDebugMessageDirection::Incoming,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#,
+        );
+        assert_eq!(
+            debug_log.initialization_response(),
+            Some(Ok(Some(serde_json::json!({"protocolVersion": 1}))))
+        );
+        for direction in [
+            AcpDebugMessageDirection::Incoming,
+            AcpDebugMessageDirection::Outgoing,
+        ] {
+            assert!(!debug_log.should_record_json_rpc_messages(direction));
+            debug_log.record_line(direction, r#"{"jsonrpc":"2.0","method":"session/update"}"#);
+        }
+        assert_eq!(debug_log.subscribe().0.len(), 2);
+    }
+
+    #[test]
+    fn debug_log_keeps_trailing_stderr_without_subscribers() {
+        let debug_log = AcpDebugLog::default();
+        debug_log.record_line(AcpDebugMessageDirection::Stderr, "first line");
+        debug_log.record_line(AcpDebugMessageDirection::Stderr, "second line");
+
+        assert_eq!(
+            debug_log.trailing_stderr().as_deref(),
+            Some("first line\nsecond line")
+        );
+
+        let (backlog, _receiver) = debug_log.subscribe();
+        assert_eq!(backlog.len(), 2);
     }
 }
