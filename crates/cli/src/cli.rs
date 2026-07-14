@@ -48,7 +48,7 @@ pub enum OpenBehavior {
 pub enum CliBehaviorSetting {
     /// Open directories as a new workspace in the current Zed window's sidebar.
     ExistingWindow,
-    /// Open paths in a new window unless they are subpaths of an existing project.
+    /// Open paths in a new window unless they belong to an existing project.
     NewWindow,
 }
 
