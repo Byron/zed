@@ -640,7 +640,7 @@ pub async fn handle_cli_connection(
                             open_behavior = cli::OpenBehavior::ExistingWindow;
                         }
                         Some(settings::CliDefaultOpenBehavior::NewWindow) => {
-                            open_behavior = cli::OpenBehavior::PreferNewWindow;
+                            open_behavior = cli::OpenBehavior::Classic;
                         }
                         None => {}
                     }
@@ -812,6 +812,7 @@ pub(crate) fn open_options_for_behavior(
                 workspace::WorkspaceMatching::None
             }
             cli::OpenBehavior::PreferNewWindow => workspace::WorkspaceMatching::MatchSubpaths,
+            cli::OpenBehavior::Classic => workspace::WorkspaceMatching::MatchProject,
             cli::OpenBehavior::Add => workspace::WorkspaceMatching::MatchSubdirectory,
             _ => workspace::WorkspaceMatching::MatchExact,
         },
@@ -827,7 +828,7 @@ pub(crate) fn open_options_for_behavior(
 fn open_behavior_for_default_setting(cx: &App) -> cli::OpenBehavior {
     match workspace::WorkspaceSettings::get_global(cx).cli_default_open_behavior {
         settings::CliDefaultOpenBehavior::ExistingWindow => cli::OpenBehavior::ExistingWindow,
-        settings::CliDefaultOpenBehavior::NewWindow => cli::OpenBehavior::PreferNewWindow,
+        settings::CliDefaultOpenBehavior::NewWindow => cli::OpenBehavior::Classic,
     }
 }
 
@@ -1422,6 +1423,35 @@ mod tests {
         assert_eq!(
             options.workspace_matching,
             workspace::WorkspaceMatching::None
+        );
+        assert!(!options.add_dirs_to_sidebar);
+        assert!(options.requesting_window.is_none());
+    }
+
+    #[gpui::test]
+    fn test_open_options_for_behavior_new_window_setting(cx: &mut TestAppContext) {
+        use gpui::UpdateGlobal as _;
+
+        let _app_state = init_test(cx);
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.cli_default_open_behavior =
+                        Some(settings::CliDefaultOpenBehavior::NewWindow);
+                });
+            });
+        });
+
+        let options = cx.update(|cx| {
+            open_options_for_behavior(
+                cli::OpenBehavior::Default,
+                &SerializedWorkspaceLocation::Local,
+                cx,
+            )
+        });
+        assert_eq!(
+            options.workspace_matching,
+            workspace::WorkspaceMatching::MatchProject
         );
         assert!(!options.add_dirs_to_sidebar);
         assert!(options.requesting_window.is_none());
@@ -2785,7 +2815,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_e2e_new_window_setting_opens_project_root_in_new_window(cx: &mut TestAppContext) {
+    async fn test_e2e_new_window_setting_reuses_project_root(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
 
         app_state
@@ -2832,7 +2862,7 @@ mod tests {
             !prompt_shown,
             "no prompt should be shown when setting already configured"
         );
-        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(cx.windows().len(), 1);
     }
 
     #[gpui::test]
