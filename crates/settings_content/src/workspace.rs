@@ -453,7 +453,7 @@ pub enum CliDefaultOpenBehavior {
     #[default]
     #[strum(serialize = "Add to Existing Window")]
     ExistingWindow,
-    /// Open paths in a new window unless they are subpaths of an existing project.
+    /// Open paths in a new window unless they belong to an existing project.
     #[strum(serialize = "Open a New Window")]
     NewWindow,
 }
