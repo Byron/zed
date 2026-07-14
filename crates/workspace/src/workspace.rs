@@ -11612,6 +11612,9 @@ pub fn find_existing_workspace(
                             WorkspaceMatching::MatchSubpaths => {
                                 project.visibility_for_subpaths(&paths, cx)
                             }
+                            WorkspaceMatching::MatchProject => {
+                                project.visibility_for_paths(abs_paths, false, cx)
+                            }
                             WorkspaceMatching::MatchSubdirectory => {
                                 project.visibility_for_paths(&paths, false, cx)
                             }
@@ -11684,6 +11687,8 @@ pub enum WorkspaceMatching {
     /// Match files and directories inside existing worktrees, excluding the
     /// worktree roots themselves.
     MatchSubpaths,
+    /// Match worktree roots and all paths inside them.
+    MatchProject,
     /// Match paths against existing worktrees including subdirectories, and
     /// fall back to a workspace on the requested host if none match, preferring
     /// the focused window and its active workspace.
@@ -11726,7 +11731,9 @@ impl OpenOptions {
     fn should_reuse_existing_window(&self) -> bool {
         !matches!(
             self.workspace_matching,
-            WorkspaceMatching::None | WorkspaceMatching::MatchSubpaths
+            WorkspaceMatching::None
+                | WorkspaceMatching::MatchSubpaths
+                | WorkspaceMatching::MatchProject
         ) && self.open_mode != OpenMode::NewWindow
     }
 }

@@ -76,7 +76,7 @@ To use separate windows, open the Settings Editor and search for `CLI Default Op
 Both settings accept the same values:
 
 - `existing_window` (default): Open folders in the current window's threads sidebar. Files outside any open project can also open in an existing window.
-- `new_window`: Prefer a new window. For external or CLI file opens, a non-ignored file inside an already-open project opens in that project's window while an unrelated file opens in a new window.
+- `new_window`: Prefer a new window. CLI paths belonging to an already-open project, including its root folder, reuse that project's window. External file opens also reuse a matching project for non-ignored files. Unrelated paths open in a new window.
 
 It's worth noting that explicit flags provided to the CLI will override the CLI setting. In particular, `-n` forces a new window even when a path matches an open project. See [CLI Reference](./reference/cli.md) for the available flags.
 
