@@ -111,6 +111,8 @@ actions!(
         Fetch,
         /// Fetches changes from a specific remote.
         FetchFrom,
+        /// Reloads Git repositories and their derived state.
+        Reload,
         /// Creates a new commit with staged changes.
         Commit,
         /// Runs the next commit with `git commit --no-verify`.
