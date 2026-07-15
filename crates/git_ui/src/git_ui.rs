@@ -115,6 +115,34 @@ pub fn init(cx: &mut App) {
         repository_selector::register(workspace);
         git_picker::register(workspace);
 
+        if workspace.project().read(cx).is_local() {
+            workspace.register_action(|workspace, _: &git::Reload, window, cx| {
+                let git_store = workspace.project().read(cx).git_store().clone();
+                let reload =
+                    git_store.update(cx, |git_store, cx| git_store.reload_repositories(cx));
+                let workspace = cx.weak_entity();
+                let workspace_for_task = workspace.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        let repository_count = reload.await?;
+                        workspace_for_task.update(cx, |workspace, cx| {
+                            let message = match repository_count {
+                                0 => "No Git repositories found".to_string(),
+                                1 => "Reloaded 1 Git repository".to_string(),
+                                count => format!("Reloaded {count} Git repositories"),
+                            };
+                            workspace.show_toast(
+                                Toast::new(NotificationId::unique::<git::Reload>(), message)
+                                    .autohide(),
+                                cx,
+                            );
+                        })?;
+                        anyhow::Ok(())
+                    })
+                    .detach_and_notify_err(workspace, window, cx);
+            });
+        }
+
         workspace.register_action(
             |workspace, action: &zed_actions::CreateWorktree, window, cx| {
                 git_ui_core::worktree_service::handle_create_worktree(
@@ -1355,7 +1383,7 @@ impl ModalView for GitCloneModal {}
 #[cfg(test)]
 mod view_commit_tests {
     use super::*;
-    use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+    use gpui::{Action as _, TestAppContext, VisualTestContext, WindowHandle};
     use language::language_settings::AllLanguageSettings;
     use project::project_settings::ProjectSettings;
     use project::{FakeFs, Project, WorktreeSettings};
@@ -1378,6 +1406,7 @@ mod view_commit_tests {
             ProjectSettings::register(cx);
             WorktreeSettings::register(cx);
             WorkspaceSettings::register(cx);
+            crate::init(cx);
         });
     }
 
@@ -1451,5 +1480,46 @@ mod view_commit_tests {
 
         assert!(!initial_modal_state);
         assert!(final_modal_state);
+    }
+
+    #[gpui::test]
+    async fn test_reload_git_action_refreshes_status_without_fs_events(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = setup_git_repo(cx).await;
+        fs.set_status_for_repo(Path::new("/root/project/.git"), &[]);
+
+        let (project, workspace) = create_test_workspace(fs.clone(), cx).await;
+        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("project should have an active repository")
+        });
+        assert!(
+            repository
+                .read_with(cx, |repository, _| repository.cached_status().next())
+                .is_none()
+        );
+
+        fs.pause_events();
+        fs.set_status_for_repo(
+            Path::new("/root/project/.git"),
+            &[("src/main.rs", git::status::StatusCode::Modified.index())],
+        );
+        fs.clear_buffered_events();
+
+        workspace
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(git::Reload.boxed_clone(), cx);
+            })
+            .expect("workspace should still exist");
+        cx.run_until_parked();
+
+        repository.read_with(cx, |repository, _| {
+            assert!(repository.cached_status().any(|entry| {
+                entry.repo_path == git::repository::repo_path("src/main.rs")
+                    && entry.status == git::status::StatusCode::Modified.index()
+            }));
+        });
     }
 }

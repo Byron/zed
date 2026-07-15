@@ -11048,6 +11048,67 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_reload_populates_empty_panel_with_staged_changes(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "tracked\n",
+            }),
+        )
+        .await;
+        fs.set_status_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", StatusCode::Modified.index())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace should exist");
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .expect("project should have a worktree")
+                .read(cx)
+                .as_local()
+                .expect("worktree should be local")
+                .scan_complete()
+        })
+        .await;
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        await_git_panel_entries(&panel, &mut cx).await;
+        assert!(panel.read_with(&cx, |panel, _| !panel.entries.is_empty()));
+        panel.update(&mut cx, |panel, _| panel.entries.clear());
+
+        workspace.update_in(&mut cx, |_, window, cx| {
+            window.dispatch_action(git::Reload.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+        await_git_panel_entries(&panel, &mut cx).await;
+
+        panel.read_with(&cx, |panel, _| {
+            let entry = panel
+                .entries
+                .iter()
+                .find_map(GitListEntry::status_entry)
+                .expect("staged entry should populate the Git panel");
+            assert_eq!(entry.repo_path, repo_path("tracked"));
+            assert_eq!(entry.staging, StageStatus::Staged);
+        });
+    }
+
+    #[gpui::test]
     async fn test_view_file_tracked(cx: &mut TestAppContext) {
         init_test(cx);
 

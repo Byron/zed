@@ -1111,6 +1111,63 @@ impl GitStore {
         matches!(self.state, GitStoreState::Local { .. })
     }
 
+    pub fn reload_repositories(&mut self, cx: &mut Context<Self>) -> Task<Result<usize>> {
+        let (project_environment, fs, updates_tx) = match &self.state {
+            GitStoreState::Local {
+                project_environment,
+                fs,
+                downstream,
+                ..
+            } => (
+                project_environment.downgrade(),
+                fs.clone(),
+                downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+            ),
+            GitStoreState::Remote { .. } => {
+                return Task::ready(Err(anyhow!(
+                    "reloading remote Git repositories is not supported"
+                )));
+            }
+        };
+
+        let repositories = self
+            .repositories
+            .iter()
+            .map(|(repository_id, repository)| (*repository_id, repository.clone()))
+            .collect::<Vec<_>>();
+        let repository_count = repositories.len();
+        let mut reloads = Vec::with_capacity(repository_count);
+        for (repository_id, repository) in repositories {
+            let is_trusted = self.repository_is_trusted(repository_id, cx);
+            let project_environment = project_environment.clone();
+            let fs = fs.clone();
+            let updates_tx = updates_tx.clone();
+            let barrier = repository.update(cx, |repository, cx| {
+                if repository.job_sender.is_closed() {
+                    repository.respawn_local_worker(project_environment, fs, is_trusted, cx);
+                }
+                repository.schedule_scan(updates_tx, cx);
+                repository.reload_buffer_diff_bases(cx);
+                repository.barrier()
+            });
+            reloads.push((repository, barrier));
+        }
+
+        cx.spawn(async move |_, cx| {
+            for (repository, barrier) in reloads {
+                barrier
+                    .await
+                    .context("Git repository worker stopped while reloading")?;
+                repository.update(cx, |_, cx| {
+                    cx.emit(RepositoryEvent::StatusesChanged);
+                });
+            }
+            Ok(repository_count)
+        })
+    }
+
     fn set_active_repo_id(&mut self, repo_id: RepositoryId, cx: &mut Context<Self>) {
         if self.active_repo_id != Some(repo_id) {
             self.active_repo_id = Some(repo_id);
@@ -11774,6 +11831,156 @@ mod tests {
             hunk.diff_base_byte_range,
             old_text.find("строка два").unwrap()..old_text.len()
         );
+    }
+
+    #[gpui::test]
+    async fn test_reload_repositories_refreshes_status_without_fs_events(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content\n",
+            }),
+        )
+        .await;
+        fs.set_status_for_repo(Path::new("/project/.git"), &[]);
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (git_store, repository) = project.read_with(cx, |project, cx| {
+            (
+                project.git_store().clone(),
+                project
+                    .active_repository(cx)
+                    .expect("project should have an active repository"),
+            )
+        });
+        assert!(
+            repository
+                .read_with(cx, |repository, _| repository.cached_status().next())
+                .is_none()
+        );
+
+        fs.pause_events();
+        fs.set_status_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", StatusCode::Modified.index())],
+        );
+        fs.clear_buffered_events();
+        repository.update(cx, |repository, _| repository.job_sender.close_channel());
+        cx.run_until_parked();
+
+        let repository_count = git_store
+            .update(cx, |git_store, cx| git_store.reload_repositories(cx))
+            .await
+            .expect("Git repositories should reload");
+        cx.run_until_parked();
+
+        assert_eq!(repository_count, 1);
+        repository.read_with(cx, |repository, _| {
+            assert!(repository.cached_status().any(|entry| {
+                entry.repo_path == repo_path("file.txt")
+                    && entry.status == StatusCode::Modified.index()
+            }));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reload_repositories_counts_all_repositories_and_handles_none(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                "first": {
+                    ".git": {},
+                    "first.txt": "first\n",
+                },
+                "second": {
+                    ".git": {},
+                    "second.txt": "second\n",
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+        let repositories = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .iter()
+                .map(|(repository_id, repository)| (*repository_id, repository.clone()))
+                .collect::<Vec<_>>()
+        });
+        let mut original_backends = HashMap::default();
+        for (repository_id, repository) in repositories {
+            let state = repository
+                .read_with(cx, |repository, _| repository.repository_state.clone())
+                .await;
+            let Ok(RepositoryState::Local(LocalRepositoryState { backend, .. })) = state else {
+                panic!("repository should have a local backend");
+            };
+            original_backends.insert(repository_id, backend);
+        }
+
+        for _ in 0..2 {
+            let repository_count = git_store
+                .update(cx, |git_store, cx| git_store.reload_repositories(cx))
+                .await
+                .expect("all Git repositories should reload");
+            assert_eq!(repository_count, 2);
+        }
+        let repositories = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .iter()
+                .map(|(repository_id, repository)| (*repository_id, repository.clone()))
+                .collect::<Vec<_>>()
+        });
+        for (repository_id, repository) in repositories {
+            let state = repository
+                .read_with(cx, |repository, _| repository.repository_state.clone())
+                .await;
+            let Ok(RepositoryState::Local(LocalRepositoryState { backend, .. })) = state else {
+                panic!("repository should have a local backend");
+            };
+            let Some(original_backend) = original_backends.get(&repository_id) else {
+                panic!("repository should still exist");
+            };
+            assert!(Arc::ptr_eq(original_backend, &backend));
+        }
+
+        let empty_fs = FakeFs::new(cx.executor());
+        empty_fs
+            .insert_tree(
+                Path::new("/empty"),
+                json!({
+                    "file.txt": "content\n",
+                }),
+            )
+            .await;
+        let empty_project = Project::test(empty_fs, [Path::new("/empty")], cx).await;
+        empty_project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let empty_git_store = empty_project.read_with(cx, |project, _| project.git_store().clone());
+
+        let repository_count = empty_git_store
+            .update(cx, |git_store, cx| git_store.reload_repositories(cx))
+            .await
+            .expect("an empty project should reload successfully");
+        assert_eq!(repository_count, 0);
     }
 
     #[gpui::test]
