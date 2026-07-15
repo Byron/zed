@@ -75,7 +75,10 @@ pub fn get_host_from_git_remote_url(remote_url: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::get_host_from_git_remote_url;
+    use std::sync::Arc;
+
+    use super::{Github, get_host_from_git_remote_url};
+    use git::GitHostingProviderRegistry;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -99,5 +102,15 @@ mod tests {
             let host = get_host_from_git_remote_url(remote_url).ok();
             assert_eq!(host, expected_host);
         }
+    }
+
+    #[test]
+    fn registering_the_same_provider_twice_is_idempotent() {
+        let registry = GitHostingProviderRegistry::new();
+
+        registry.register_hosting_provider(Arc::new(Github::public_instance()));
+        registry.register_hosting_provider(Arc::new(Github::public_instance()));
+
+        assert_eq!(registry.list_hosting_providers().len(), 1);
     }
 }

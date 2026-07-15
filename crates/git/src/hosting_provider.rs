@@ -227,7 +227,15 @@ impl GitHostingProviderRegistry {
         &self,
         provider: Arc<dyn GitHostingProvider + Send + Sync + 'static>,
     ) {
-        self.state.write().default_providers.push(provider);
+        let base_url = provider.base_url();
+        let mut state = self.state.write();
+        if !state
+            .default_providers
+            .iter()
+            .any(|existing| existing.base_url() == base_url)
+        {
+            state.default_providers.push(provider);
+        }
     }
 }
 
