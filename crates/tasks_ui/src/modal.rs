@@ -631,6 +631,10 @@ impl PickerDelegate for TasksModalDelegate {
         }
     }
 
+    fn has_prominent_separators(&self) -> bool {
+        true
+    }
+
     fn render_footer(
         &self,
         window: &mut Window,

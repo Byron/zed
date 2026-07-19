@@ -180,6 +180,9 @@ pub trait PickerDelegate: Sized + 'static {
     ) {
         self.set_selected_index(ix, window, cx);
     }
+    fn has_prominent_separators(&self) -> bool {
+        false
+    }
     fn set_selected_index(
         &mut self,
         ix: usize,
@@ -1487,9 +1490,15 @@ impl<D: PickerDelegate> Picker<D> {
             .when(
                 self.delegate.separators_after_indices().contains(&ix),
                 |picker| {
+                    let is_prominent = self.delegate.has_prominent_separators();
                     picker
-                        .border_color(cx.theme().colors().border_variant)
-                        .border_b_1()
+                        .border_color(if is_prominent {
+                            cx.theme().colors().border
+                        } else {
+                            cx.theme().colors().border_variant
+                        })
+                        .when(is_prominent, |picker| picker.border_b_2())
+                        .when(!is_prominent, |picker| picker.border_b_1())
                         .py(px(-1.0))
                 },
             )
