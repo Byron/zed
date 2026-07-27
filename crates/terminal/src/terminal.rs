@@ -40,6 +40,7 @@ use std::{
     borrow::Cow,
     cmp::{self, min},
     fmt::{self, Display, Formatter},
+    future::Future,
     ops::{BitOr, BitOrAssign, Deref, Range as StdRange},
     path::{Path, PathBuf},
     process::ExitStatus,
@@ -76,6 +77,33 @@ use crate::alacritty::{
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
+
+/// How long the shell and its foreground job get to exit gracefully after a
+/// closed terminal sends SIGHUP/SIGTERM, before being SIGKILLed. Must stay
+/// comfortably below [`gpui::SHUTDOWN_TIMEOUT`] so the escalation also
+/// completes when the whole app is quitting.
+const PROCESS_KILL_GRACE_PERIOD: Duration = Duration::from_millis(100);
+
+/// Sends SIGTERM to the terminal's shell and foreground process groups, and
+/// returns a future that SIGKILLs whatever survives [`PROCESS_KILL_GRACE_PERIOD`].
+/// Closing the PTY only delivers SIGHUP, and a foreground job that ignores
+/// SIGHUP/SIGTERM would otherwise be orphaned (#47412).
+///
+/// When the PTY has not exited, this must be called before `pty_tx.shutdown()`:
+/// reading the foreground process group requires `tcgetpgrp` on the PTY fd.
+fn terminate_processes_with_grace_period(
+    info: Arc<PtyProcessInfo>,
+    executor: BackgroundExecutor,
+    pty_has_exited: bool,
+) -> impl Future<Output = ()> {
+    let process_ids = info.capture_process_ids(!pty_has_exited);
+    process_ids.terminate();
+    async move {
+        executor.timer(PROCESS_KILL_GRACE_PERIOD).await;
+        process_ids.kill();
+        info.kill_child_process();
+    }
+}
 
 /// Process-wide flag set by headless hosts (e.g. the eval CLI) that have no
 /// controlling TTY. In such sandboxes PTY allocation and acquiring a
@@ -1059,6 +1087,7 @@ impl TerminalBuilder {
                 window_id,
             },
             child_exited: None,
+            pty_has_exited: false,
             keyboard_input_sent: false,
             init_command_startup_marker: None,
             init_command_startup_tx: None,
@@ -1353,6 +1382,7 @@ impl TerminalBuilder {
                     window_id,
                 },
                 child_exited: None,
+                pty_has_exited: false,
                 keyboard_input_sent: false,
                 init_command_startup_marker: None,
                 init_command_startup_tx: None,
@@ -1411,6 +1441,33 @@ impl TerminalBuilder {
     }
 
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
+        // `Terminal::drop` escalates to SIGKILL on a detached background task,
+        // which never gets to run when the whole app quits: the process exits
+        // as soon as the `on_app_quit` futures resolve. Perform the same
+        // escalation in a quit observer, whose future keeps the app alive for
+        // the grace period, so that processes ignoring SIGHUP/SIGTERM don't
+        // outlive Zed (#47412). The subscription can't be stored on `Terminal`
+        // (`Subscription` is not `Send`, and `TerminalBuilder` is built on a
+        // background thread), so its lifetime is tied to the entity's release
+        // instead.
+        let app_quit_subscription = cx.on_app_quit(|terminal, cx| {
+            let kill_processes = match &terminal.terminal_type {
+                TerminalType::Pty { info, .. } => Some(terminate_processes_with_grace_period(
+                    info.clone(),
+                    cx.background_executor().clone(),
+                    terminal.pty_has_exited,
+                )),
+                TerminalType::DisplayOnly => None,
+            };
+            async move {
+                if let Some(kill_processes) = kill_processes {
+                    kill_processes.await;
+                }
+            }
+        });
+        cx.on_release(move |_, _| drop(app_quit_subscription))
+            .detach();
+
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
             while let Some(event) = self.events_rx.next().await {
@@ -1552,6 +1609,7 @@ pub struct Terminal {
     template: CopyTemplate,
     activation_script: Vec<String>,
     child_exited: Option<ExitStatus>,
+    pty_has_exited: bool,
     keyboard_input_sent: bool,
     init_command_startup_marker: Option<String>,
     init_command_startup_tx: Option<Sender<()>>,
@@ -1685,7 +1743,10 @@ impl Terminal {
             TerminalBackendEvent::Bell => {
                 cx.emit(Event::Bell);
             }
-            TerminalBackendEvent::Exit => self.register_task_finished(None, cx),
+            TerminalBackendEvent::Exit => {
+                self.pty_has_exited = true;
+                self.register_task_finished(None, cx);
+            }
             TerminalBackendEvent::MouseCursorDirty => {
                 //NOOP, Handled in render
             }
@@ -1712,6 +1773,7 @@ impl Terminal {
                 self.write_to_pty(format(color).into_bytes());
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
+                self.pty_has_exited = true;
                 self.register_task_finished(Some(exit_status), cx);
             }
         }
@@ -3183,18 +3245,13 @@ impl Terminal {
         else {
             return;
         };
-        let info = info.clone();
-
+        let kill_processes = terminate_processes_with_grace_period(
+            info.clone(),
+            self.background_executor.clone(),
+            self.pty_has_exited,
+        );
         pty_tx.shutdown();
-        info.terminate_child_process();
-
-        let timer = self.background_executor.timer(Duration::from_millis(100));
-        self.background_executor
-            .spawn(async move {
-                timer.await;
-                info.kill_child_process();
-            })
-            .detach();
+        self.background_executor.spawn(kill_processes).detach();
     }
 
     pub fn pid(&self) -> Option<sysinfo::Pid> {
@@ -3823,7 +3880,7 @@ mod tests {
         cx: &mut TestAppContext,
         command: &str,
         args: &[&str],
-    ) -> Entity<Terminal> {
+    ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let (program, args) =
             ShellBuilder::new(&Shell::System, false).build(Some(command.to_owned()), &args);
@@ -3834,7 +3891,7 @@ mod tests {
         cx: &mut TestAppContext,
         program: String,
         args: Vec<String>,
-    ) -> Entity<Terminal> {
+    ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
         let mode = TerminalMode::task(SpawnInTerminal {
             command: Some(program.clone()),
             args: args.clone(),
@@ -3865,7 +3922,15 @@ mod tests {
             })
             .await
             .unwrap();
-        cx.new(|cx| builder.subscribe(cx))
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+        let completion_rx = terminal.read_with(cx, |terminal, _| {
+            terminal
+                .task()
+                .expect("test terminal should have task state")
+                .completion_rx
+                .clone()
+        });
+        (terminal, completion_rx)
     }
 
     /// Builds a non-PTY (`no_pty`) task terminal, exercising the path used by
@@ -4310,7 +4375,7 @@ mod tests {
     async fn test_basic_terminal(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let terminal = build_test_terminal(cx, "echo", &["hello"]).await;
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
         let exit_status =
             terminal.read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx));
         assert_eq!(exit_status.await, Some(ExitStatus::default()));
@@ -4333,7 +4398,7 @@ mod tests {
     async fn test_foreground_process_command_tracks_path_command(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let terminal =
+        let (terminal, _completion_rx) =
             build_test_terminal_with_arguments(cx, "sleep".to_string(), vec!["1".to_string()])
                 .await;
 
@@ -4351,7 +4416,7 @@ mod tests {
     async fn test_task_terminal_starts_in_vi_mode(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let terminal = build_test_terminal(cx, "echo", &["hello"]).await;
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
 
         terminal.update(cx, |terminal, _| {
             assert!(terminal.vi_mode_enabled());
@@ -6063,7 +6128,7 @@ mod tests {
 
         // Run a command that prints output then sleeps for a long time
         // The echo ensures we have output to capture before killing
-        let terminal =
+        let (terminal, _completion_rx) =
             build_test_terminal(cx, "echo", &["test_output_before_kill; sleep 60"]).await;
 
         assert_content_eventually(&terminal, "test_output_before_kill", cx).await;
@@ -6091,13 +6156,153 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn parse_pid_marker(content: &str, prefix: &str, suffix: &str) -> i32 {
+        content
+            .split(prefix)
+            .nth(1)
+            .and_then(|rest| rest.split(suffix).next())
+            .and_then(|pid| pid.trim().parse().ok())
+            .unwrap_or_else(|| {
+                panic!("failed to parse pid between {prefix:?} and {suffix:?} from: {content}")
+            })
+    }
+
+    /// Regression test for <https://github.com/zed-industries/zed/issues/47412>:
+    /// closing a terminal must not orphan processes that ignore SIGHUP and
+    /// SIGTERM. The shell ignores both signals and the `sleep`s inherit the
+    /// ignored dispositions, so only the SIGKILL escalation can terminate them.
+    ///
+    /// Two process groups are covered: the background `sleep` is spawned before
+    /// `set -m` and stays in the shell's own group, while job control places
+    /// the foreground job (an inner shell that `exec`s `sleep`) in a separate
+    /// group that killing the shell's group never reaches — it is only found
+    /// via the foreground-group capture (`tcgetpgrp`).
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_dropping_terminal_kills_processes_ignoring_sighup_and_sigterm(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "trap '' HUP TERM; sleep 300 & echo bg_marker_${!}_bgend; set -m; \
+                 /bin/sh -c 'echo fg_marker_$$_fgend; exec sleep 300'"
+                    .to_string(),
+            ],
+        )
+        .await;
+
+        assert_content_eventually(&terminal, "_fgend", cx).await;
+        let content = terminal.update(cx, |term, _| term.get_content());
+        let background_sleep_pid = parse_pid_marker(&content, "bg_marker_", "_bgend");
+        let foreground_sleep_pid = parse_pid_marker(&content, "fg_marker_", "_fgend");
+
+        let shell_pid = terminal.update(cx, |terminal, _| match &terminal.terminal_type {
+            TerminalType::Pty { info, .. } => info.pid_getter().fallback_pid().as_u32() as i32,
+            TerminalType::DisplayOnly => panic!("expected a PTY-backed terminal"),
+        });
+
+        for pid in [background_sleep_pid, foreground_sleep_pid] {
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "process {pid} should be running before the terminal is dropped"
+            );
+        }
+
+        // The foreground-group escalation is only exercised if `set -m`
+        // actually placed the foreground job in its own process group; assert
+        // the arrangement so this test fails loudly instead of silently
+        // degrading into a shell-group-only test.
+        let shell_pgid = unsafe { libc::getpgid(shell_pid) };
+        let foreground_pgid = unsafe { libc::getpgid(foreground_sleep_pid) };
+        assert!(shell_pgid > 0 && foreground_pgid > 0);
+        assert_ne!(
+            foreground_pgid, shell_pgid,
+            "job control should place the foreground sleep in its own process group"
+        );
+        assert_eq!(
+            unsafe { libc::getpgid(background_sleep_pid) },
+            shell_pgid,
+            "the background sleep should stay in the shell's process group"
+        );
+
+        drop(terminal);
+        // Flush effects so the released terminal entity is actually dropped.
+        cx.update(|_| {});
+
+        for _ in 0..300 {
+            let background_dead = unsafe { libc::kill(background_sleep_pid, 0) } != 0;
+            let foreground_dead = unsafe { libc::kill(foreground_sleep_pid, 0) } != 0;
+            if background_dead && foreground_dead {
+                return;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        panic!(
+            "processes survived dropping the terminal: background sleep {background_sleep_pid} \
+             alive: {}, foreground sleep {foreground_sleep_pid} alive: {}",
+            unsafe { libc::kill(background_sleep_pid, 0) } == 0,
+            unsafe { libc::kill(foreground_sleep_pid, 0) } == 0,
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_dropping_completed_terminal_does_not_kill_replacement(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let (completed_terminal, completion_rx) = build_test_terminal(cx, "true", &[]).await;
+        let exit_status = completion_rx
+            .recv()
+            .await
+            .expect("completed task should report its exit status");
+        assert!(exit_status.is_some_and(|status| status.success()));
+
+        cx.background_executor
+            .timer(Duration::from_millis(50))
+            .await;
+
+        let (replacement_terminal, replacement_completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "echo replacement_started; sleep 300".to_string(),
+            ],
+        )
+        .await;
+        assert_content_eventually(&replacement_terminal, "replacement_started", cx).await;
+
+        drop(completed_terminal);
+        cx.update(|_| {});
+        cx.background_executor
+            .timer(PROCESS_KILL_GRACE_PERIOD * 2)
+            .await;
+
+        let replacement_status = replacement_completion_rx.try_recv();
+        assert!(
+            matches!(replacement_status, Err(async_channel::TryRecvError::Empty)),
+            "replacement task unexpectedly exited: {replacement_status:?}"
+        );
+
+        replacement_terminal.update(cx, |terminal, _| terminal.kill_active_task());
+    }
+
     /// Test that kill_active_task on a task that's not running is a no-op
     #[gpui::test]
     async fn test_kill_active_task_on_completed_task_is_noop(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
         // Run a command that exits immediately
-        let terminal = build_test_terminal(cx, "echo", &["done"]).await;
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["done"]).await;
 
         // Wait for the command to complete naturally
         let exit_status =
