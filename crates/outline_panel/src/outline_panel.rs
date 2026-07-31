@@ -142,6 +142,7 @@ pub struct OutlinePanel {
     buffers: HashMap<BufferId, BufferOutlines>,
     cached_entries: Vec<CachedEntry>,
     filter_editor: Entity<Editor>,
+    show_public_symbols_only: bool,
     mode: ItemsDisplayMode,
     max_width_item_index: Option<usize>,
     preserve_selection_on_buffer_fold_toggles: HashSet<BufferId>,
@@ -1260,6 +1261,7 @@ impl OutlinePanel {
                 rendered_entries_len: 0,
                 focus_handle,
                 filter_editor,
+                show_public_symbols_only: false,
                 fs_entries: Vec::new(),
                 fs_children_count: HashMap::default(),
                 collapsed_entries: HashSet::default(),
@@ -3827,6 +3829,19 @@ impl OutlinePanel {
         }
     }
 
+    fn supports_public_symbol_filter(&self, cx: &App) -> bool {
+        self.active_editor().is_some_and(|editor| {
+            editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .as_singleton()
+                .and_then(BufferSnapshot::language)
+                .is_some_and(|language| language.name() == "Rust")
+        })
+    }
+
     fn invalidate_outlines(&mut self, ids: &[BufferId]) {
         if let Some(PanelEntry::Outline(outline)) = self.selected_entry()
             && ids.contains(&outline.buffer_id())
@@ -3997,16 +4012,26 @@ impl OutlinePanel {
                                     )
                                 })
                         {
-                            let awaiting_outlines = match &new_selected_entry {
-                                PanelEntry::Outline(outline) => outline_panel
-                                    .buffers
-                                    .get(&outline.buffer_id())
-                                    .is_some_and(BufferOutlines::should_fetch_outlines),
-                                _ => false,
-                            };
-                            outline_panel.select_entry(new_selected_entry, false, window, cx);
-                            if awaiting_outlines {
-                                outline_panel.selected_entry.invalidate();
+                            if outline_panel.show_public_symbols_only
+                                && outline_panel.supports_public_symbol_filter(cx)
+                                && !outline_panel
+                                    .cached_entries
+                                    .iter()
+                                    .any(|entry| entry.entry == new_selected_entry)
+                            {
+                                outline_panel.selected_entry = SelectedEntry::None;
+                            } else {
+                                let awaiting_outlines = match &new_selected_entry {
+                                    PanelEntry::Outline(outline) => outline_panel
+                                        .buffers
+                                        .get(&outline.buffer_id())
+                                        .is_some_and(BufferOutlines::should_fetch_outlines),
+                                    _ => false,
+                                };
+                                outline_panel.select_entry(new_selected_entry, false, window, cx);
+                                if awaiting_outlines {
+                                    outline_panel.selected_entry.invalidate();
+                                }
                             }
                         }
 
@@ -4810,7 +4835,15 @@ impl OutlinePanel {
         let expanded_excerpts = excerpts.iter().filter(|excerpt| excerpt.expanded).count();
         if expanded_excerpts > 0 {
             let children = self.outline_children_cache.entry(buffer_id).or_default();
-            let outlines = buffer.iter_outlines().collect::<Vec<_>>();
+            let mut outlines = buffer.iter_outlines().collect::<Vec<_>>();
+            if is_singleton
+                && self.show_public_symbols_only
+                && snapshot
+                    .and_then(BufferSnapshot::language)
+                    .is_some_and(|language| language.name() == "Rust")
+            {
+                outlines = public_outlines_with_ancestors(&outlines);
+            }
             if let Some(snapshot) = snapshot
                 && expanded_excerpts > 1
                 && !outlines.is_empty()
@@ -5343,6 +5376,7 @@ impl OutlinePanel {
         } else {
             (IconName::FileCode, "Hide Symbols")
         };
+        let supports_public_symbol_filter = self.supports_public_symbol_filter(cx);
 
         h_flex()
             .p_2()
@@ -5387,6 +5421,20 @@ impl OutlinePanel {
                                 ))
                                 .on_click(cx.listener(|outline_panel, _, window, cx| {
                                     outline_panel.toggle_symbols(&ToggleSymbols, window, cx);
+                                })),
+                        )
+                    })
+                    .when(supports_public_symbol_filter, |this| {
+                        this.child(
+                            IconButton::new("public_symbols_filter", IconName::Filter)
+                                .shape(IconButtonShape::Square)
+                                .toggle_state(self.show_public_symbols_only)
+                                .tooltip(Tooltip::text("Show Public Symbols Only"))
+                                .on_click(cx.listener(|outline_panel, _, window, cx| {
+                                    outline_panel.show_public_symbols_only =
+                                        !outline_panel.show_public_symbols_only;
+                                    outline_panel.selected_entry.invalidate();
+                                    outline_panel.update_cached_entries(None, window, cx);
                                 })),
                         )
                     })
@@ -5880,6 +5928,28 @@ fn reserve_chevron_slot(indicator: FolderIndicator, icon: AnyElement) -> AnyElem
     } else {
         icon
     }
+}
+
+fn public_outlines_with_ancestors<'a>(outlines: &[&'a Outline]) -> Vec<&'a Outline> {
+    let mut ancestors = Vec::new();
+    let mut retain = vec![false; outlines.len()];
+
+    for (index, outline) in outlines.iter().enumerate() {
+        ancestors.truncate(outline.depth);
+        if outline.text.starts_with("pub ") {
+            retain[index] = true;
+            for &ancestor in &ancestors {
+                retain[ancestor] = true;
+            }
+        }
+        ancestors.push(index);
+    }
+
+    outlines
+        .iter()
+        .zip(retain)
+        .filter_map(|(&outline, retain)| retain.then_some(outline))
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -10659,6 +10729,123 @@ outline: struct OutlineEntryExcerpt
                     .map(|path| (worktree_id, Arc::<RelPath>::from(rel_path(path))))
                     .collect::<HashSet<_>>(),
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_filter_rust_outline_to_public_symbols(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/test",
+            json!({
+                "src": {
+                    "lib.rs": indoc!("
+                        mod private_module {
+                            pub fn public_nested() {}
+                            fn private_nested() {}
+                        }
+
+                        pub(crate) mod crate_module {
+                            pub struct PublicNested {
+                                pub field: usize,
+                                pub(crate) restricted_field: usize,
+                                private_field: usize,
+                            }
+                        }
+
+                        pub struct Public {
+                            pub field: usize,
+                            pub(crate) restricted_field: usize,
+                            private_field: usize,
+                        }
+
+                        impl Public {
+                            pub fn public_method(&self) {}
+                            pub(crate) fn restricted_method(&self) {}
+                            fn private_method(&self) {}
+                        }
+
+                        pub(crate) fn restricted_function() {}
+                        fn private_function() {}
+                    "),
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
+        project.read_with(cx, |project, _| project.languages().add(rust_lang()));
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.set_active(true, window, cx)
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from("/test/src/lib.rs"),
+                    OpenOptions {
+                        visible: Some(OpenVisible::All),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(500));
+        cx.run_until_parked();
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.update_non_fs_items(window, cx);
+            outline_panel.show_public_symbols_only = true;
+            outline_panel.update_cached_entries(None, window, cx);
+        });
+        cx.run_until_parked();
+
+        outline_panel.update(cx, |outline_panel, cx| {
+            assert_eq!(
+                display_entries(
+                    &project,
+                    &snapshot(outline_panel, cx),
+                    &outline_panel.cached_entries,
+                    None,
+                    cx,
+                ),
+                indoc!(
+                    "
+                    outline: mod private_module
+                      outline: pub fn public_nested
+                    outline: pub(crate) mod crate_module
+                      outline: pub struct PublicNested
+                        outline: pub field
+                    outline: pub struct Public
+                      outline: pub field
+                    outline: impl Public
+                      outline: pub fn public_method"
+                )
+            );
+        });
+
+        outline_panel.update_in(cx, |outline_panel, window, cx| {
+            outline_panel.show_public_symbols_only = false;
+            outline_panel.update_cached_entries(None, window, cx);
+        });
+        cx.run_until_parked();
+        outline_panel.update(cx, |outline_panel, _| {
+            assert!(outline_panel.cached_entries.iter().any(|entry| {
+                matches!(
+                    &entry.entry,
+                    PanelEntry::Outline(OutlineEntry::Outline(outline))
+                        if outline.text == "fn private_function"
+                )
+            }));
         });
     }
 
