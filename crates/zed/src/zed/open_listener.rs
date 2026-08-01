@@ -667,6 +667,12 @@ pub async fn handle_cli_connection(
                 )
                 .await;
 
+                // The target window may only be ordered front while opening. Activating again
+                // afterward ensures macOS moves Zed in front of the invoking terminal.
+                if !wait {
+                    cx.update(|cx| cx.activate(true));
+                }
+
                 let status = if open_workspace_result.is_err() { 1 } else { 0 };
                 responses.send(CliResponse::Exit { status }).log_err();
             }
