@@ -165,6 +165,7 @@ pub struct ProjectPanel {
     last_reported_update: Instant,
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
+    zoomed: bool,
     state: State,
 }
 
@@ -897,6 +898,7 @@ impl ProjectPanel {
                     project.read(cx).is_via_collab(),
                     &cx,
                 ),
+                zoomed: false,
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -7212,6 +7214,7 @@ impl Render for ProjectPanel {
                     },
                 ))
                 .key_context(self.dispatch_context(window, cx))
+                .on_action(cx.listener(Self::toggle_zoom))
                 .on_action(cx.listener(Self::scroll_up))
                 .on_action(cx.listener(Self::scroll_down))
                 .on_action(cx.listener(Self::scroll_cursor_center))
@@ -7706,6 +7709,7 @@ impl Render for ProjectPanel {
             v_flex()
                 .id("empty-project_panel-wrapper")
                 .size_full()
+                .on_action(cx.listener(Self::toggle_zoom))
                 .child(
                     ProjectEmptyState::new(
                         "Project Panel",
@@ -7867,6 +7871,15 @@ impl Panel for ProjectPanel {
         1
     }
 
+    fn is_zoomed(&self, _window: &Window, _cx: &App) -> bool {
+        self.zoomed
+    }
+
+    fn set_zoomed(&mut self, zoomed: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zoomed = zoomed;
+        cx.notify();
+    }
+
     fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
         Some(workspace::HideStatusItem::new(|settings| {
             settings.project_panel.get_or_insert_default().button = Some(false);
@@ -7875,6 +7888,22 @@ impl Panel for ProjectPanel {
 }
 
 impl ProjectPanel {
+    fn toggle_zoom(
+        &mut self,
+        _: &workspace::ToggleZoom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.zoomed {
+            cx.emit(PanelEvent::ZoomOut);
+        } else {
+            if !self.focus_handle(cx).contains_focused(window, cx) {
+                self.focus_handle(cx).focus(window, cx);
+            }
+            cx.emit(PanelEvent::ZoomIn);
+        }
+    }
+
     pub fn select_path_for_test(&mut self, project_path: ProjectPath, cx: &App) {
         let Some(worktree) = self
             .project
