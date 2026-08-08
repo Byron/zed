@@ -564,7 +564,7 @@ impl MergeConflictIndicator {
         let conflicts_changed = matches!(
             event,
             GitStoreEvent::ConflictsUpdated
-                | GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged, _)
+                | GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged)
         );
 
         let agent_settings = AgentSettings::get_global(cx);
