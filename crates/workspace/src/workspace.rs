@@ -2026,18 +2026,21 @@ impl Workspace {
             cx.subscribe_in(
                 &project.read(cx).git_store().clone(),
                 window,
-                |this, _, event, window, cx| match event {
-                    GitStoreEvent::ActiveRepositoryChanged(_)
-                    | GitStoreEvent::RepositoryUpdated(
-                        _,
-                        RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged,
-                        true,
-                    ) => {
-                        if this.window_title_needs_branch(cx) {
-                            this.update_window_title(window, cx);
-                        }
+                |this, git_store, event, window, cx| {
+                    let should_update = match event {
+                        GitStoreEvent::ActiveRepositoryChanged(_) => true,
+                        GitStoreEvent::RepositoryUpdated(
+                            repository_id,
+                            RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged,
+                        ) => git_store
+                            .read(cx)
+                            .active_repository()
+                            .is_some_and(|repository| repository.read(cx).id == *repository_id),
+                        _ => false,
+                    };
+                    if should_update && this.window_title_needs_branch(cx) {
+                        this.update_window_title(window, cx);
                     }
-                    _ => {}
                 },
             ),
             cx.observe_window_bounds(window, move |this, window, cx| {

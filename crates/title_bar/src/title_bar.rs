@@ -483,15 +483,22 @@ impl TitleBar {
         );
 
         subscriptions.push(cx.observe(&active_call, |this, _, cx| this.active_call_changed(cx)));
-        subscriptions.push(
-            cx.subscribe(&git_store, move |_, _, event, cx| match event {
-                GitStoreEvent::ActiveRepositoryChanged(_)
-                | GitStoreEvent::RepositoryUpdated(_, _, true) => {
+        subscriptions.push(cx.subscribe(&git_store, move |_, git_store, event, cx| {
+            match event {
+                GitStoreEvent::ActiveRepositoryChanged(_) => {
+                    cx.notify();
+                }
+                GitStoreEvent::RepositoryUpdated(repository_id, _)
+                    if git_store
+                        .read(cx)
+                        .active_repository()
+                        .is_some_and(|repository| repository.read(cx).id == *repository_id) =>
+                {
                     cx.notify();
                 }
                 _ => {}
-            }),
-        );
+            }
+        }));
         subscriptions.push(cx.observe(&user_store, |_a, _, cx| cx.notify()));
         if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
             subscriptions.push(cx.subscribe(
