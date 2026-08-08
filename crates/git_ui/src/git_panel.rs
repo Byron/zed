@@ -1459,11 +1459,16 @@ impl GitPanel {
                 window,
                 move |this, _git_store, event, window, cx| match event {
                     GitStoreEvent::RepositoryUpdated(
-                        _,
+                        repository_id,
                         RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
-                        true,
-                    )
-                    | GitStoreEvent::RepositoryAdded
+                    ) if this
+                        .active_repository
+                        .as_ref()
+                        .is_some_and(|repository| repository.read(cx).id == *repository_id) =>
+                    {
+                        this.schedule_update(window, cx);
+                    }
+                    GitStoreEvent::RepositoryAdded
                     | GitStoreEvent::RepositoryRemoved(_)
                     | GitStoreEvent::ActiveRepositoryChanged(_) => {
                         this.schedule_update(window, cx);
@@ -1479,7 +1484,7 @@ impl GitPanel {
                             })
                             .ok();
                     }
-                    GitStoreEvent::RepositoryUpdated(_, _, _) => {}
+                    GitStoreEvent::RepositoryUpdated(_, _) => {}
                     GitStoreEvent::JobsUpdated
                     | GitStoreEvent::ConflictsUpdated
                     | GitStoreEvent::DiffBaseChanged(_) => {}
@@ -1997,24 +2002,6 @@ impl GitPanel {
         })
     }
 
-    fn repository_for_project_path(
-        &self,
-        project_path: &ProjectPath,
-        cx: &App,
-    ) -> Option<Entity<Repository>> {
-        self.project
-            .read(cx)
-            .repositories(cx)
-            .values()
-            .find(|repository| {
-                repository
-                    .read(cx)
-                    .project_path_to_repo_path(project_path, cx)
-                    .is_some()
-            })
-            .cloned()
-    }
-
     fn follow_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.has_user_focus(window, cx) {
             return;
@@ -2030,7 +2017,11 @@ impl GitPanel {
             return;
         };
 
-        let Some(active_repository) = self.repository_for_project_path(&project_path, cx) else {
+        let git_store = self.project.read(cx).git_store().clone();
+        git_store.update(cx, |git_store, cx| {
+            git_store.set_active_repo_for_path(&project_path, cx);
+        });
+        let Some(active_repository) = self.project.read(cx).active_repository(cx) else {
             self.clear_selection(cx);
             return;
         };
@@ -2038,10 +2029,7 @@ impl GitPanel {
         if self.active_repository.as_ref().map(Entity::entity_id)
             != Some(active_repository.entity_id())
         {
-            self.active_repository = Some(active_repository.clone());
-            active_repository.update(cx, |repository, cx| {
-                repository.set_as_active_repository(cx);
-            });
+            self.active_repository = Some(active_repository);
             self.reopen_commit_buffer(window, cx);
             self.update_visible_entries(window, cx);
         }
@@ -5804,11 +5792,6 @@ impl GitPanel {
                 let access = active_repo.update(cx, |active_repo, cx| active_repo.access(cx));
 
                 cx.spawn_in(window, async move |git_panel, cx| {
-                    // When the user does not own the `.git` folder, the
-                    // `GitStore.spawn_local_git_worker` will fail to create the
-                    // receiver for Git jobs, so this access check will be
-                    // cancelled.
-                    //
                     let access = match access.await {
                         Ok(access) => access,
                         Err(Canceled) => GitAccess::Error("Git access check was cancelled".into()),

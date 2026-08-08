@@ -2292,8 +2292,7 @@ impl AcpThread {
                 event,
                 GitStoreEvent::RepositoryUpdated(
                     _,
-                    RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
-                    _
+                    RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged
                 )
             ) {
                 this.update_last_checkpoint_if_changed_task =

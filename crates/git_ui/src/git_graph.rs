@@ -1461,7 +1461,7 @@ impl GitGraph {
         let log_order = LogOrder::default();
 
         cx.subscribe(&git_store, |this, _, event, cx| match event {
-            GitStoreEvent::RepositoryUpdated(updated_repo_id, repo_event, _) => {
+            GitStoreEvent::RepositoryUpdated(updated_repo_id, repo_event) => {
                 if this.repo_id == *updated_repo_id {
                     if let Some(repository) = this.get_repository(cx) {
                         this.on_repository_event(repository, repo_event, cx);
@@ -5525,7 +5525,7 @@ mod tests {
         project.update(cx, |project, cx| {
             let observed_repository_events = observed_repository_events.clone();
             cx.subscribe(project.git_store(), move |_, _, event, _| {
-                if let GitStoreEvent::RepositoryUpdated(_, repository_event, true) = event {
+                if let GitStoreEvent::RepositoryUpdated(_, repository_event) = event {
                     observed_repository_events
                         .lock()
                         .expect("repository event mutex should be available")

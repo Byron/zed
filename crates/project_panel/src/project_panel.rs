@@ -695,7 +695,7 @@ impl ProjectPanel {
                 &git_store,
                 window,
                 |this, _, event, window, cx| match event {
-                    GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged, _)
+                    GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged)
                     | GitStoreEvent::RepositoryAdded
                     | GitStoreEvent::DiffBaseChanged(_)
                     | GitStoreEvent::RepositoryRemoved(_) => {

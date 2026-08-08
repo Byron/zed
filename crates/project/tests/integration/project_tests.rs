@@ -17476,7 +17476,6 @@ async fn test_repository_pending_ops_staging(
             if let GitStoreEvent::RepositoryUpdated(
                 _,
                 RepositoryEvent::PendingOpsChanged { pending_ops },
-                _,
             ) = e
             {
                 let merged = merge_pending_ops_snapshots(
@@ -17646,7 +17645,6 @@ async fn test_repository_pending_ops_long_running_staging(
             if let GitStoreEvent::RepositoryUpdated(
                 _,
                 RepositoryEvent::PendingOpsChanged { pending_ops },
-                _,
             ) = e
             {
                 let merged = merge_pending_ops_snapshots(
@@ -17765,7 +17763,6 @@ async fn test_repository_pending_ops_stage_all(
             if let GitStoreEvent::RepositoryUpdated(
                 _,
                 RepositoryEvent::PendingOpsChanged { pending_ops },
-                _,
             ) = e
             {
                 let merged = merge_pending_ops_snapshots(
@@ -18262,22 +18259,8 @@ async fn test_linked_worktree_real_git_status_updates_after_external_change(
         );
     });
 
-    let worktree_id = tree.read_with(cx, |tree, _| tree.id());
-    let buffer = project
-        .update(cx, |project, cx| {
-            project.open_buffer((worktree_id, rel_path("src/changed.txt")), cx)
-        })
-        .await
-        .unwrap();
-    cx.executor().run_until_parked();
-
     std::fs::write(linked_worktree.join("src/changed.txt"), "changed\n").unwrap();
-    project
-        .update(cx, |project, cx| {
-            project.reload_buffers([buffer.clone()].into_iter().collect(), false, cx)
-        })
-        .await
-        .unwrap();
+    tree.flush_fs_events(cx).await;
     repository
         .update(cx, |repository, _cx| repository.barrier())
         .await
@@ -18290,6 +18273,30 @@ async fn test_linked_worktree_real_git_status_updates_after_external_change(
                 .status_for_path(&repo_path("src/changed.txt"))
                 .map(|entry| entry.status),
             Some(StatusCode::Modified.worktree())
+        );
+    });
+
+    project
+        .update(cx, |project, cx| {
+            project
+                .git_store()
+                .update(cx, |store, cx| store.reload_repositories(cx))
+        })
+        .await
+        .unwrap();
+    std::fs::write(linked_worktree.join("src/changed.txt"), "original\n").unwrap();
+    tree.flush_fs_events(cx).await;
+    repository
+        .update(cx, |repository, _cx| repository.barrier())
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    repository.read_with(cx, |repository, _cx| {
+        assert_eq!(repository.work_directory_abs_path.as_ref(), linked_worktree);
+        assert_eq!(
+            repository.status_for_path(&repo_path("src/changed.txt")),
+            None
         );
     });
 }
@@ -18873,7 +18880,7 @@ async fn test_ignored_dirs_events(cx: &mut gpui::TestAppContext) {
     project.update(cx, |project, cx| {
         let repo_events = repository_updates.clone();
         cx.subscribe(project.git_store(), move |_, _, e, _| {
-            if let GitStoreEvent::RepositoryUpdated(_, e, _) = e {
+            if let GitStoreEvent::RepositoryUpdated(_, e) = e {
                 repo_events.lock().push(e.clone());
             }
         })
@@ -19035,7 +19042,7 @@ async fn test_odd_events_for_ignored_dirs(
     project.update(cx, |project, cx| {
         let repository_updates = repository_updates.clone();
         cx.subscribe(project.git_store(), move |_, _, e, _| {
-            if let GitStoreEvent::RepositoryUpdated(_, e, _) = e {
+            if let GitStoreEvent::RepositoryUpdated(_, e) = e {
                 repository_updates.lock().push(e.clone());
             }
         })
