@@ -85,7 +85,6 @@ impl DiffBufferList {
                     RepositoryEvent::StatusesChanged
                     | RepositoryEvent::HeadChanged
                     | RepositoryEvent::BranchListChanged,
-                    _,
                 ) => this
                     .repo
                     .as_ref()

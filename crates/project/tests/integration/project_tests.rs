@@ -18209,7 +18209,6 @@ async fn test_repository_pending_ops_staging(
             if let GitStoreEvent::RepositoryUpdated(
                 _,
                 RepositoryEvent::PendingOpsChanged { pending_ops },
-                _,
             ) = e
             {
                 let merged = merge_pending_ops_snapshots(
@@ -18379,7 +18378,6 @@ async fn test_repository_pending_ops_long_running_staging(
             if let GitStoreEvent::RepositoryUpdated(
                 _,
                 RepositoryEvent::PendingOpsChanged { pending_ops },
-                _,
             ) = e
             {
                 let merged = merge_pending_ops_snapshots(
@@ -18498,7 +18496,6 @@ async fn test_repository_pending_ops_stage_all(
             if let GitStoreEvent::RepositoryUpdated(
                 _,
                 RepositoryEvent::PendingOpsChanged { pending_ops },
-                _,
             ) = e
             {
                 let merged = merge_pending_ops_snapshots(
@@ -19035,6 +19032,35 @@ async fn test_linked_worktree_real_git_status_updates_after_external_change(
         vec![RepositoryEvent::StatusesChanged],
         "a worktree edit should only update statuses"
     );
+
+    project
+        .update(cx, |project, cx| {
+            project
+                .git_store()
+                .update(cx, |store, cx| store.reload_repositories(cx))
+        })
+        .await
+        .expect("reload linked-worktree repositories");
+    std::fs::write(linked_worktree.join("src/changed.txt"), "original\n")
+        .expect("restore external worktree file after reloading repositories");
+    cx.condition(&repository, |repository, _| {
+        repository
+            .status_for_path(&repo_path("src/changed.txt"))
+            .is_none()
+    })
+    .await;
+    repository.read_with(cx, |repository, _| {
+        assert_eq!(repository.work_directory_abs_path.as_ref(), linked_worktree);
+    });
+    std::fs::write(linked_worktree.join("src/changed.txt"), "changed\n")
+        .expect("modify external worktree file after monitor recovery");
+    cx.condition(&repository, |repository, _| {
+        repository
+            .status_for_path(&repo_path("src/changed.txt"))
+            .map(|entry| entry.status)
+            == Some(StatusCode::Modified.worktree())
+    })
+    .await;
 
     std::fs::write(linked_worktree.join("src/transient.txt"), "temporary\n")
         .expect("create transient worktree file");
@@ -19764,7 +19790,7 @@ async fn test_ignored_dirs_events(cx: &mut gpui::TestAppContext) {
     project.update(cx, |project, cx| {
         let repo_events = repository_updates.clone();
         cx.subscribe(project.git_store(), move |_, _, e, _| {
-            if let GitStoreEvent::RepositoryUpdated(_, e, _) = e {
+            if let GitStoreEvent::RepositoryUpdated(_, e) = e {
                 repo_events.lock().push(e.clone());
             }
         })
@@ -19926,7 +19952,7 @@ async fn test_odd_events_for_ignored_dirs(
     project.update(cx, |project, cx| {
         let repository_updates = repository_updates.clone();
         cx.subscribe(project.git_store(), move |_, _, e, _| {
-            if let GitStoreEvent::RepositoryUpdated(_, e, _) = e {
+            if let GitStoreEvent::RepositoryUpdated(_, e) = e {
                 repository_updates.lock().push(e.clone());
             }
         })
