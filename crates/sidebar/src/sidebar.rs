@@ -1054,7 +1054,6 @@ impl Sidebar {
                         _,
                         project::git_store::RepositoryEvent::GitWorktreeListChanged
                             | project::git_store::RepositoryEvent::HeadChanged,
-                        _,
                     )
                 ) {
                     this.schedule_update_entries(false, cx);
