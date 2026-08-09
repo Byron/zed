@@ -2141,11 +2141,10 @@ impl Workspace {
                     {
                         // Reopening an existing workspace - restore its saved bounds
                         (Some(bounds.0), Some(display))
-                    } else if let Some((display, bounds)) =
-                        persistence::read_default_window_bounds(&kvp)
+                    } else if let Some((_, bounds)) = persistence::read_default_window_bounds(&kvp)
                     {
                         // New or empty workspace - use the last known window bounds
-                        (Some(bounds), Some(display))
+                        (Some(bounds), None)
                     } else {
                         // New window - let GPUI's default_bounds() handle cascading
                         (None, None)
