@@ -371,14 +371,20 @@ impl BufferDiffSnapshot {
         let unstaged_counterpart = self.secondary_diff.as_deref();
         let range = range.to_offset(buffer);
         let mark_split_remainders_as_overlapping = range.start > 0 || range.end < buffer.len();
+        let split_range = range.clone();
         let filter = move |summary: &DiffHunkSummary| {
             let summary_range = summary.buffer_range.to_offset(buffer);
             let before_start = summary_range.end < range.start;
             let after_end = summary_range.start > range.end;
             !before_start && !after_end
         };
+        let split_filter = move |hunk: &DiffHunk| {
+            let hunk_range = hunk.buffer_range.to_offset(buffer);
+            hunk_range.end >= split_range.start && hunk_range.start <= split_range.end
+        };
         self.hunks_intersecting_range_impl(
             filter,
+            split_filter,
             buffer,
             unstaged_counterpart,
             mark_split_remainders_as_overlapping,
@@ -454,12 +460,23 @@ impl BufferDiffSnapshot {
         main_buffer: &'a text::BufferSnapshot,
     ) -> impl 'a + Iterator<Item = DiffHunk> {
         let unstaged_counterpart = self.secondary_diff.as_deref();
+        let split_range = range.clone();
         let filter = move |summary: &DiffHunkSummary| {
             let before_start = summary.diff_base_byte_range.end < range.start;
             let after_end = summary.diff_base_byte_range.start > range.end;
             !before_start && !after_end
         };
-        self.hunks_intersecting_range_impl(filter, main_buffer, unstaged_counterpart, false)
+        let split_filter = move |hunk: &DiffHunk| {
+            hunk.diff_base_byte_range.end >= split_range.start
+                && hunk.diff_base_byte_range.start <= split_range.end
+        };
+        self.hunks_intersecting_range_impl(
+            filter,
+            split_filter,
+            main_buffer,
+            unstaged_counterpart,
+            false,
+        )
     }
 
     pub fn hunks_intersecting_base_text_range_rev<'a>(
@@ -1050,6 +1067,7 @@ impl BufferDiffSnapshot {
     fn hunks_intersecting_range_impl<'a>(
         &'a self,
         filter: impl 'a + Fn(&DiffHunkSummary) -> bool,
+        split_filter: impl 'a + Fn(&DiffHunk) -> bool,
         buffer: &'a text::BufferSnapshot,
         secondary: Option<&'a Self>,
         mark_split_remainders_as_overlapping: bool,
@@ -1089,8 +1107,10 @@ impl BufferDiffSnapshot {
         let mut split_hunks = Vec::new();
         iter::from_fn(move || {
             loop {
-                if let Some(hunk) = split_hunks.pop() {
-                    return Some(hunk);
+                while let Some(hunk) = split_hunks.pop() {
+                    if split_filter(&hunk) {
+                        return Some(hunk);
+                    }
                 }
 
                 let (start_point, (start_anchor, start_base, hunk)) = summaries.next()?;
@@ -2807,6 +2827,15 @@ mod tests {
             )
             .collect::<Vec<_>>();
         assert_hunks(hunks.iter().cloned(), &buffer, &head_text, &expected_hunks);
+        assert_hunks(
+            uncommitted_diff.hunks_intersecting_range(
+                buffer.anchor_before(Point::new(5, 1))..buffer.anchor_after(Point::new(5, 1)),
+                &buffer,
+            ),
+            &buffer,
+            &head_text,
+            &expected_hunks[2..3],
+        );
         assert_eq!(
             hunks
                 .iter()
