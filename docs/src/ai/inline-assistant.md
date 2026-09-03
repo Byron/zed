@@ -11,6 +11,8 @@ Use {#kb assistant::InlineAssist} to open the Inline Assistant in editors, chann
 
 The Inline Assistant sends your current selection (or line) to a language model and replaces it with the response.
 
+Before starting an inline generation, press {#kb inline_assistant::SendToThread} to send the prompt and selected code to the current Agent Panel thread instead. If no thread is open, Zed creates one using the selected agent. The Agent Panel opens after the prompt is sent.
+
 ## Getting Started
 
 If you're using the Inline Assistant for the first time, you need to have at least one [LLM provider](./llm-providers.md) configured.
