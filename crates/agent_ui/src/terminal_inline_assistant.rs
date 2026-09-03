@@ -149,6 +149,7 @@ impl TerminalInlineAssistant {
             PromptEditorEvent::StopRequested => {
                 self.stop_assist(assist_id, cx);
             }
+            PromptEditorEvent::SendToThreadRequested => {}
             PromptEditorEvent::ConfirmRequested { execute } => {
                 self.finish_assist(assist_id, false, *execute, window, cx);
             }
