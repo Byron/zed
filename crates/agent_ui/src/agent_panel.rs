@@ -6886,7 +6886,7 @@ mod tests {
         active_session_id, active_thread_id, open_thread_with_connection,
         open_thread_with_custom_connection, register_test_sidebar, send_message,
     };
-    use acp_thread::{AgentConnection, StubAgentConnection, ThreadStatus};
+    use acp_thread::{AgentConnection, AgentThreadEntry, StubAgentConnection, ThreadStatus};
     use action_log::ActionLog;
     use anyhow::{Result, anyhow};
     use feature_flags::FeatureFlagAppExt;
@@ -13993,5 +13993,94 @@ mod tests {
                 "selected_agent should be restored to the original after an agent override"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_send_resolved_content_preserves_composer(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("response".into()),
+        )]);
+        open_thread_with_connection(&panel, connection, &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        let message_editor =
+            thread_view.read_with(&cx, |thread, _cx| thread.message_editor.clone());
+        message_editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("existing draft", window, cx);
+        });
+
+        thread_view.update_in(&mut cx, |thread, window, cx| {
+            thread.send_resolved_content(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "inline prompt",
+                ))],
+                Vec::new(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            message_editor.read_with(&cx, |editor, cx| editor.text(cx)),
+            "existing draft"
+        );
+        thread_view.read_with(&cx, |thread, cx| {
+            let sent = thread
+                .thread
+                .read(cx)
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::UserMessage(message) => Some(message.content.to_markdown(cx)),
+                    _ => None,
+                });
+            assert_eq!(sent, Some("inline prompt"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_send_resolved_content_queues_while_generating(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+        send_message(&panel, &mut cx);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        let message_editor =
+            thread_view.read_with(&cx, |thread, _cx| thread.message_editor.clone());
+        message_editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("existing draft", window, cx);
+        });
+        thread_view.update_in(&mut cx, |thread, window, cx| {
+            thread.send_resolved_content(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "queued inline prompt",
+                ))],
+                Vec::new(),
+                window,
+                cx,
+            );
+        });
+
+        thread_view.read_with(&cx, |thread, cx| {
+            assert_eq!(thread.message_editor.read(cx).text(cx), "existing draft");
+            let queued = thread
+                .message_queue
+                .first()
+                .expect("message should be queued");
+            assert!(matches!(
+                queued.content.as_slice(),
+                [acp::ContentBlock::Text(text)] if text.text == "queued inline prompt"
+            ));
+        });
+
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("response".into()),
+        )]);
+        connection.end_turn(active_session_id(&panel, &cx), acp::StopReason::EndTurn);
+        cx.run_until_parked();
     }
 }

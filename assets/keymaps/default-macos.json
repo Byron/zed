@@ -999,6 +999,13 @@
     },
   },
   {
+    "context": "BufferInlineAssistant && inline_assistant_idle > Editor && !showing_completions",
+    "use_key_equivalents": true,
+    "bindings": {
+      "shift-enter": "inline_assistant::SendToThread",
+    },
+  },
+  {
     "context": "Prompt",
     "use_key_equivalents": true,
     "bindings": {

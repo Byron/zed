@@ -946,6 +946,12 @@
     },
   },
   {
+    "context": "BufferInlineAssistant && inline_assistant_idle > Editor && !showing_completions",
+    "bindings": {
+      "shift-enter": "inline_assistant::SendToThread",
+    },
+  },
+  {
     "context": "Prompt",
     "bindings": {
       "left": "menu::SelectPrevious",

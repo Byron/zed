@@ -1,5 +1,7 @@
 use agent::ThreadStore;
+use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
+use anyhow::Result;
 use collections::{HashMap, VecDeque};
 use editor::actions::Paste;
 use editor::code_context_menus::CodeContextMenu;
@@ -11,8 +13,9 @@ use editor::{
 use fs::Fs;
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Subscription, TextStyle, TextStyleRefinement, WeakEntity, Window, actions,
+    KeyContext, Subscription, Task, TextStyle, TextStyleRefinement, WeakEntity, Window, actions,
 };
+use language::Buffer;
 use language_model::{LanguageModel, LanguageModelRegistry};
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownStyle};
 use parking_lot::Mutex;
@@ -40,12 +43,16 @@ use crate::completion_provider::{
 };
 use crate::mention_set::paste_images_as_context;
 use crate::mention_set::{MentionSet, crease_for_mention};
+use crate::message_editor::build_content_blocks_from_editor;
 use crate::terminal_codegen::TerminalCodegen;
 use crate::{
     CycleFavoriteModels, CycleNextInlineAssist, CyclePreviousInlineAssist, ModelUsageContext,
 };
 
-actions!(inline_assistant, [ThumbsUpResult, ThumbsDownResult]);
+actions!(
+    inline_assistant,
+    [ThumbsUpResult, ThumbsDownResult, SendToThread]
+);
 
 enum CompletionState {
     Pending,
@@ -149,7 +156,7 @@ impl<T: 'static> Render for PromptEditor<T> {
             .into_any_element();
 
         v_flex()
-            .key_context("InlineAssistant")
+            .key_context(self.key_context(cx))
             .capture_action(cx.listener(Self::paste))
             .block_mouse_except_scroll()
             .size_full()
@@ -165,6 +172,7 @@ impl<T: 'static> Render for PromptEditor<T> {
                 h_flex()
                     .on_action(cx.listener(Self::confirm))
                     .on_action(cx.listener(Self::secondary_confirm))
+                    .on_action(cx.listener(Self::send_to_thread))
                     .on_action(cx.listener(Self::cancel))
                     .on_action(cx.listener(Self::move_up))
                     .on_action(cx.listener(Self::move_down))
@@ -315,6 +323,18 @@ impl<T: 'static> PromptEditor<T> {
             PromptEditorMode::Buffer { codegen, .. } => codegen.read(cx).status(cx),
             PromptEditorMode::Terminal { codegen, .. } => &codegen.read(cx).status,
         }
+    }
+
+    fn key_context(&self, cx: &App) -> KeyContext {
+        let mut key_context = KeyContext::new_with_defaults();
+        key_context.add("InlineAssistant");
+        if matches!(self.mode, PromptEditorMode::Buffer { .. }) {
+            key_context.add("BufferInlineAssistant");
+        }
+        if matches!(self.codegen_status(cx), CodegenStatus::Idle) {
+            key_context.add("inline_assistant_idle");
+        }
+        key_context
     }
 
     fn subscribe_to_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -539,6 +559,15 @@ impl<T: 'static> PromptEditor<T> {
     ) {
         let execute = matches!(self.mode, PromptEditorMode::Terminal { .. });
         self.handle_confirm(execute, cx);
+    }
+
+    fn send_to_thread(&mut self, _: &SendToThread, _window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.mode, PromptEditorMode::Buffer { .. })
+            && matches!(self.codegen_status(cx), CodegenStatus::Idle)
+            && !self.prompt(cx).trim().is_empty()
+        {
+            cx.emit(PromptEditorEvent::SendToThreadRequested);
+        }
     }
 
     fn handle_confirm(&mut self, execute: bool, cx: &mut Context<Self>) {
@@ -1180,6 +1209,7 @@ pub enum PromptEditorMode {
 pub enum PromptEditorEvent {
     StartRequested,
     StopRequested,
+    SendToThreadRequested,
     ConfirmRequested { execute: bool },
     CancelRequested,
     Resized { height_in_lines: u8 },
@@ -1360,6 +1390,21 @@ impl PromptEditor<BufferCodegen> {
 
     pub fn mention_set(&self) -> &Entity<MentionSet> {
         &self.mention_set
+    }
+
+    pub fn content_blocks(
+        &self,
+        full_mention_content: bool,
+        supports_embedded_context: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>> {
+        build_content_blocks_from_editor(
+            self.editor.clone(),
+            self.mention_set.clone(),
+            full_mention_content,
+            supports_embedded_context,
+            cx,
+        )
     }
 
     pub fn editor_margins(&self) -> &Arc<Mutex<EditorMargins>> {
@@ -1637,8 +1682,9 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use language::Buffer;
     use project::Project;
+    use prompt_store::PromptBuilder;
     use settings::SettingsStore;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::Path;
     use std::rc::Rc;
     use terminal::TerminalBuilder;
@@ -1710,6 +1756,113 @@ mod tests {
         })
     }
 
+    fn build_buffer_prompt_editor(
+        prompt: &str,
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<PromptEditor<BufferCodegen>> {
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let fs = FakeFs::new(cx.executor());
+        let session_id = Uuid::new_v4();
+        let prompt_builder = Arc::new(PromptBuilder::new(None).expect("prompt builder"));
+        let prompt = prompt.to_string();
+        let (codegen, prompt_buffer) = cx.update(|_window, cx| {
+            let source_buffer = cx.new(|cx| Buffer::local("selected", cx));
+            let source_buffer = cx.new(|cx| MultiBuffer::singleton(source_buffer, cx));
+            let source_snapshot = source_buffer.read(cx).snapshot(cx);
+            let range = source_snapshot.anchor_before(MultiBufferOffset(0))
+                ..source_snapshot.anchor_after(source_snapshot.len());
+            let codegen = cx.new(|cx| {
+                BufferCodegen::new(source_buffer, range, None, session_id, prompt_builder, cx)
+            });
+            let prompt_buffer =
+                cx.new(|cx| MultiBuffer::singleton(cx.new(|cx| Buffer::local(prompt, cx)), cx));
+            (codegen, prompt_buffer)
+        });
+        let project = workspace.update(cx, |workspace, _cx| workspace.project().downgrade());
+
+        cx.update(|window, cx| {
+            cx.new(|cx| {
+                PromptEditor::new_buffer(
+                    InlineAssistId::default(),
+                    Arc::new(Mutex::new(EditorMargins::default())),
+                    VecDeque::new(),
+                    prompt_buffer,
+                    codegen,
+                    session_id,
+                    fs,
+                    thread_store,
+                    project,
+                    workspace.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+        })
+    }
+
+    #[gpui::test]
+    async fn test_send_to_thread_requires_nonblank_buffer_prompt(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", serde_json::json!({"file": ""}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let prompt_editor = build_buffer_prompt_editor("explain this", &workspace, cx);
+        let send_count = Rc::new(Cell::new(0));
+        cx.update(|_window, cx| {
+            let send_count = send_count.clone();
+            cx.subscribe(&prompt_editor, move |_, event: &PromptEditorEvent, _cx| {
+                if matches!(event, PromptEditorEvent::SendToThreadRequested) {
+                    send_count.set(send_count.get() + 1);
+                }
+            })
+            .detach();
+        });
+
+        prompt_editor.update_in(cx, |prompt_editor, window, cx| {
+            prompt_editor.send_to_thread(&SendToThread, window, cx);
+        });
+        assert_eq!(send_count.get(), 1);
+
+        prompt_editor.update_in(cx, |prompt_editor, window, cx| {
+            prompt_editor.editor.update(cx, |editor, cx| {
+                editor.set_text("   ", window, cx);
+            });
+            prompt_editor.send_to_thread(&SendToThread, window, cx);
+        });
+        assert_eq!(send_count.get(), 1, "blank prompts must not be sent");
+
+        let terminal_prompt_editor = build_terminal_prompt_editor(&workspace, cx);
+        cx.update(|_window, cx| {
+            let send_count = send_count.clone();
+            cx.subscribe(
+                &terminal_prompt_editor,
+                move |_, event: &PromptEditorEvent, _cx| {
+                    if matches!(event, PromptEditorEvent::SendToThreadRequested) {
+                        send_count.set(send_count.get() + 1);
+                    }
+                },
+            )
+            .detach();
+        });
+        terminal_prompt_editor.update_in(cx, |prompt_editor, window, cx| {
+            prompt_editor.editor.update(cx, |editor, cx| {
+                editor.set_text("explain this", window, cx);
+            });
+            prompt_editor.send_to_thread(&SendToThread, window, cx);
+        });
+        assert_eq!(
+            send_count.get(),
+            1,
+            "terminal Inline Assist must keep its existing behavior"
+        );
+    }
+
     #[gpui::test]
     async fn test_secondary_confirm_emits_execute_true_in_terminal_mode(cx: &mut TestAppContext) {
         init_test(cx);
@@ -1741,6 +1894,9 @@ mod tests {
                     }
                     PromptEditorEvent::StartRequested => PromptEditorEvent::StartRequested,
                     PromptEditorEvent::StopRequested => PromptEditorEvent::StopRequested,
+                    PromptEditorEvent::SendToThreadRequested => {
+                        PromptEditorEvent::SendToThreadRequested
+                    }
                     PromptEditorEvent::CancelRequested => PromptEditorEvent::CancelRequested,
                     PromptEditorEvent::Resized { height_in_lines } => PromptEditorEvent::Resized {
                         height_in_lines: *height_in_lines,
@@ -1801,6 +1957,9 @@ mod tests {
                     }
                     PromptEditorEvent::StartRequested => PromptEditorEvent::StartRequested,
                     PromptEditorEvent::StopRequested => PromptEditorEvent::StopRequested,
+                    PromptEditorEvent::SendToThreadRequested => {
+                        PromptEditorEvent::SendToThreadRequested
+                    }
                     PromptEditorEvent::CancelRequested => PromptEditorEvent::CancelRequested,
                     PromptEditorEvent::Resized { height_in_lines } => PromptEditorEvent::Resized {
                         height_in_lines: *height_in_lines,

@@ -1191,14 +1191,21 @@ impl ThreadView {
         message_editor: &Entity<MessageEditor>,
         cx: &mut App,
     ) -> Task<Result<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>> {
-        let expand = self.as_native_thread(cx).is_some_and(|thread| {
+        let (expand, _) = self.message_content_options(cx);
+        message_editor.update(cx, |message_editor, cx| message_editor.contents(expand, cx))
+    }
+
+    pub(crate) fn message_content_options(&self, cx: &App) -> (bool, bool) {
+        let expand_mentions = self.as_native_thread(cx).is_some_and(|thread| {
             let thread = thread.read(cx);
             AgentSettings::get_global(cx)
                 .profiles
                 .get(thread.profile())
                 .is_some_and(|profile| profile.tools.is_empty())
         });
-        message_editor.update(cx, |message_editor, cx| message_editor.contents(expand, cx))
+        let supports_embedded_context =
+            self.session_capabilities.read().supports_embedded_context();
+        (expand_mentions, supports_embedded_context)
     }
 
     pub fn current_model_id(&self, cx: &App) -> Option<String> {
@@ -1536,6 +1543,43 @@ impl ThreadView {
 
         cx.emit(AcpThreadViewEvent::Interacted);
         self.send_impl(message_editor, window, cx)
+    }
+
+    pub(crate) fn send_resolved_content(
+        &mut self,
+        content: Vec<acp::ContentBlock>,
+        tracked_buffers: Vec<Entity<Buffer>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if content.is_empty() {
+            return;
+        }
+
+        cx.emit(AcpThreadViewEvent::Interacted);
+        if self.is_loading_contents || self.thread.read(cx).status() != ThreadStatus::Idle {
+            self.add_to_queue(content, tracked_buffers, window, cx);
+            return;
+        }
+
+        self.thread_error.take();
+        self.thread_feedback.clear();
+        self.message_queue.resume();
+
+        if self.should_be_following {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.follow(CollaboratorId::Agent, window, cx);
+                })
+                .ok();
+        }
+
+        self.send_content(
+            Task::ready(Ok(Some((content, tracked_buffers)))),
+            false,
+            window,
+            cx,
+        );
     }
 
     /// Sends a bare `/command` turn and queues everything the user typed after

@@ -878,32 +878,15 @@ impl MessageEditor {
         full_mention_content: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>> {
-        let contents = self
-            .mention_set
-            .update(cx, |store, cx| store.contents(full_mention_content, cx));
-        let editor = self.editor.clone();
         let supports_embedded_context =
             self.session_capabilities.read().supports_embedded_context();
-
-        cx.spawn(async move |_, cx| {
-            let mut contents = contents.await?;
-            Ok(editor.update(cx, |editor, cx| {
-                let crease_snapshot = editor.display_map.read(cx).crease_snapshot();
-                let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
-                let text = editor.text(cx);
-                build_chunks_from_creases(
-                    &text,
-                    &crease_snapshot,
-                    &buffer_snapshot,
-                    supports_embedded_context,
-                    |crease_id| {
-                        contents
-                            .remove(crease_id)
-                            .map(|(uri, mention)| (uri, Some(mention)))
-                    },
-                )
-            }))
-        })
+        build_content_blocks_from_editor(
+            self.editor.clone(),
+            self.mention_set.clone(),
+            full_mention_content,
+            supports_embedded_context,
+            cx,
+        )
     }
 
     /// Snapshots the editor's current draft into a list of `ContentBlock`s
@@ -2068,6 +2051,36 @@ impl Addon for MessageEditorAddon {
     }
 }
 
+pub(crate) fn build_content_blocks_from_editor(
+    editor: Entity<Editor>,
+    mention_set: Entity<MentionSet>,
+    full_mention_content: bool,
+    supports_embedded_context: bool,
+    cx: &mut App,
+) -> Task<Result<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>> {
+    let contents = mention_set.update(cx, |store, cx| store.contents(full_mention_content, cx));
+
+    cx.spawn(async move |cx| {
+        let mut contents = contents.await?;
+        Ok(editor.update(cx, |editor, cx| {
+            let crease_snapshot = editor.display_map.read(cx).crease_snapshot();
+            let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+            let text = editor.text(cx);
+            build_chunks_from_creases(
+                &text,
+                &crease_snapshot,
+                &buffer_snapshot,
+                supports_embedded_context,
+                |crease_id| {
+                    contents
+                        .remove(crease_id)
+                        .map(|(uri, mention)| (uri, Some(mention)))
+                },
+            )
+        }))
+    })
+}
+
 /// Walks the editor's creases in order, interleaving plain-text chunks from
 /// `text` with mention blocks produced from `resolve`.
 fn build_chunks_from_creases(
@@ -2135,7 +2148,7 @@ fn image_preview_task_for_mention(
     )
 }
 
-fn mention_to_content_block(
+pub(crate) fn mention_to_content_block(
     uri: &MentionUri,
     mention: Option<&Mention>,
     supports_embedded_context: bool,

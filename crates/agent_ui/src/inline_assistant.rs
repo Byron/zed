@@ -6,15 +6,19 @@ use std::ops::Range;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::agent_panel::CreateThreadOptions;
 use crate::context::load_context;
-use crate::mention_set::MentionSet;
+use crate::mention_set::{Mention, MentionSet};
+use crate::message_editor::mention_to_content_block;
 use crate::{
-    AgentPanel,
+    AgentInitialContent, AgentPanel, AgentThreadSource,
     buffer_codegen::{BufferCodegen, CodegenAlternative, CodegenEvent},
     inline_prompt_editor::{CodegenStatus, InlineAssistId, PromptEditor, PromptEditorEvent},
     terminal_inline_assistant::TerminalInlineAssistant,
 };
+use acp_thread::MentionUri;
 use agent::ThreadStore;
+use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet, VecDeque, hash_map};
@@ -42,11 +46,12 @@ use language::{Buffer, Point, Selection, TransactionId};
 use language_model::{ConfigurationError, ConfiguredModel, LanguageModelRegistry};
 use multi_buffer::MultiBufferRow;
 use parking_lot::Mutex;
-use project::{DisableAiSettings, Project};
+use project::{DisableAiSettings, Project, ProjectItem};
 use prompt_store::PromptBuilder;
 use settings::{Settings, SettingsStore};
 
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
+use text::OffsetRangeExt;
 use ui::prelude::*;
 use util::{RangeExt, ResultExt, maybe};
 use workspace::{Toast, Workspace, dock::Panel, notifications::NotificationId};
@@ -719,6 +724,9 @@ impl InlineAssistant {
             PromptEditorEvent::StopRequested => {
                 self.stop_assist(assist_id, cx);
             }
+            PromptEditorEvent::SendToThreadRequested => {
+                self.send_to_thread(prompt_editor, window, cx);
+            }
             PromptEditorEvent::ConfirmRequested { execute: _ } => {
                 self.finish_assist(assist_id, false, window, cx);
             }
@@ -729,6 +737,249 @@ impl InlineAssistant {
                 // This only matters for the terminal inline assistant
             }
         }
+    }
+
+    fn send_to_thread(
+        &mut self,
+        prompt_editor: Entity<PromptEditor<BufferCodegen>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let assist_id = prompt_editor.read(cx).id();
+        let Some(assist) = self.assists.get(&assist_id) else {
+            return;
+        };
+        let assist_group_id = assist.group_id;
+        let Some(workspace) = assist.workspace.upgrade() else {
+            return;
+        };
+        let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            self.fail_send_to_thread(
+                assist_group_id,
+                &workspace,
+                "Agent Panel is unavailable".to_string(),
+                cx,
+            );
+            return;
+        };
+
+        let active_thread = if let Some(conversation_view) =
+            agent_panel.read(cx).active_conversation_view().cloned()
+        {
+            let Some(thread_view) = conversation_view.read(cx).root_thread_view() else {
+                let message = if conversation_view.read(cx).is_loading() {
+                    "Agent thread is still loading"
+                } else {
+                    "Agent thread is unavailable"
+                };
+                self.fail_send_to_thread(assist_group_id, &workspace, message.to_string(), cx);
+                return;
+            };
+            Some(thread_view)
+        } else {
+            None
+        };
+
+        let assist_ids = {
+            let Some(assist_group) = self.assist_groups.get(&assist_group_id) else {
+                return;
+            };
+            if assist_group.sending_to_thread {
+                return;
+            }
+            if assist_group.linked {
+                assist_group.assist_ids.clone()
+            } else {
+                vec![assist_id]
+            }
+        };
+
+        let (full_mention_content, supports_embedded_context) = active_thread
+            .as_ref()
+            .map(|thread| thread.read(cx).message_content_options(cx))
+            .unwrap_or((false, true));
+        let (selection_blocks, selection_buffers) = match self.selection_content_blocks(
+            &assist_ids,
+            &workspace,
+            supports_embedded_context,
+            cx,
+        ) {
+            Ok(selection_content) => selection_content,
+            Err(error) => {
+                self.fail_send_to_thread(assist_group_id, &workspace, error.to_string(), cx);
+                return;
+            }
+        };
+
+        let Some(assist_group) = self.assist_groups.get_mut(&assist_group_id) else {
+            return;
+        };
+        assist_group.sending_to_thread = true;
+        let content_task = prompt_editor.update(cx, |prompt_editor, cx| {
+            prompt_editor.content_blocks(full_mention_content, supports_embedded_context, cx)
+        });
+
+        window
+            .spawn(cx, async move |cx| {
+                match content_task.await {
+                    Ok((mut content, mut tracked_buffers)) => {
+                        content.extend(selection_blocks);
+                        tracked_buffers.extend(selection_buffers);
+
+                        cx.update(|window, cx| {
+                            let should_send =
+                                InlineAssistant::update_global(cx, |inline_assistant, _cx| {
+                                    inline_assistant
+                                        .assist_groups
+                                        .get(&assist_group_id)
+                                        .is_some_and(|group| group.sending_to_thread)
+                                });
+                            if !should_send {
+                                return;
+                            }
+
+                            if let Some(active_thread) = active_thread {
+                                active_thread.update(cx, |thread, cx| {
+                                    thread.send_resolved_content(
+                                        content,
+                                        tracked_buffers,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            } else {
+                                agent_panel.update(cx, |panel, cx| {
+                                    let thread_id = panel.create_thread_with_options(
+                                        CreateThreadOptions {
+                                            initial_content: Some(
+                                                AgentInitialContent::ContentBlock {
+                                                    blocks: content,
+                                                    auto_submit: true,
+                                                },
+                                            ),
+                                            ..Default::default()
+                                        },
+                                        AgentThreadSource::AgentPanel,
+                                        window,
+                                        cx,
+                                    );
+                                    panel.activate_retained_thread(thread_id, true, window, cx);
+                                });
+                            }
+
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.reveal_panel::<AgentPanel>(window, cx);
+                                workspace.focus_panel::<AgentPanel>(window, cx);
+                            });
+                            InlineAssistant::update_global(cx, |inline_assistant, cx| {
+                                inline_assistant.remove_assist_group(assist_group_id, window, cx);
+                            });
+                        })?;
+                    }
+                    Err(error) => {
+                        cx.update(|_window, cx| {
+                            InlineAssistant::update_global(cx, |inline_assistant, cx| {
+                                inline_assistant.fail_send_to_thread(
+                                    assist_group_id,
+                                    &workspace,
+                                    error.to_string(),
+                                    cx,
+                                );
+                            });
+                        })?;
+                    }
+                }
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+    }
+
+    fn selection_content_blocks(
+        &self,
+        assist_ids: &[InlineAssistId],
+        workspace: &Entity<Workspace>,
+        supports_embedded_context: bool,
+        cx: &mut App,
+    ) -> Result<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)> {
+        let project = workspace.read(cx).project().clone();
+        let ranges = assist_ids
+            .iter()
+            .filter_map(|assist_id| {
+                self.assists
+                    .get(assist_id)
+                    .map(|assist| (assist.editor.clone(), assist.range.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut blocks = Vec::with_capacity(ranges.len());
+        let mut tracked_buffers = Vec::with_capacity(ranges.len());
+
+        for (editor, range) in ranges {
+            let editor = editor.upgrade().context("Editor is no longer available")?;
+            let (buffer, range) = editor
+                .update(cx, |editor, cx| {
+                    let multi_buffer = editor.buffer().read(cx);
+                    let (start_buffer, start) =
+                        multi_buffer.text_anchor_for_position(range.start, cx)?;
+                    let (end_buffer, end) = multi_buffer.text_anchor_for_position(range.end, cx)?;
+                    (start_buffer == end_buffer).then_some((start_buffer, start..end))
+                })
+                .context("Selected code is no longer available")?;
+
+            let (content, line_range, abs_path) = {
+                let buffer = buffer.read(cx);
+                let snapshot = buffer.snapshot();
+                let content = snapshot.text_for_range(range.clone()).collect::<String>();
+                let point_range = range.to_point(&snapshot);
+                let line_range = point_range.start.row..=point_range.end.row;
+                let abs_path = buffer
+                    .project_path(cx)
+                    .and_then(|path| project.read(cx).absolute_path(&path, cx));
+                (content, line_range, abs_path)
+            };
+            let uri = MentionUri::Selection {
+                abs_path,
+                line_range,
+                column: None,
+            };
+            let mention = Mention::Text {
+                content,
+                tracked_buffers: vec![buffer],
+            };
+            blocks.push(mention_to_content_block(
+                &uri,
+                Some(&mention),
+                supports_embedded_context,
+                &mut tracked_buffers,
+            ));
+        }
+
+        if blocks.is_empty() {
+            anyhow::bail!("Selected code is no longer available");
+        }
+        Ok((blocks, tracked_buffers))
+    }
+
+    fn fail_send_to_thread(
+        &mut self,
+        assist_group_id: InlineAssistGroupId,
+        workspace: &Entity<Workspace>,
+        message: String,
+        cx: &mut App,
+    ) {
+        if let Some(group) = self.assist_groups.get_mut(&assist_group_id) {
+            group.sending_to_thread = false;
+        }
+        workspace.update(cx, |workspace, cx| {
+            struct SendToThreadError;
+
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::composite::<SendToThreadError>(assist_group_id.0),
+                    message,
+                ),
+                cx,
+            );
+        });
     }
 
     fn handle_editor_newline(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut App) {
@@ -951,29 +1202,7 @@ impl InlineAssistant {
 
         self.dismiss_assist(assist_id, window, cx);
 
-        if let Some(assist) = self.assists.remove(&assist_id) {
-            if let hash_map::Entry::Occupied(mut entry) = self.assist_groups.entry(assist.group_id)
-            {
-                entry.get_mut().assist_ids.retain(|id| *id != assist_id);
-                if entry.get().assist_ids.is_empty() {
-                    entry.remove();
-                }
-            }
-
-            if let hash_map::Entry::Occupied(mut entry) =
-                self.assists_by_editor.entry(assist.editor.clone())
-            {
-                entry.get_mut().assist_ids.retain(|id| *id != assist_id);
-                if entry.get().assist_ids.is_empty() {
-                    entry.remove();
-                    if let Some(editor) = assist.editor.upgrade() {
-                        self.update_editor_highlights(&editor, cx);
-                    }
-                } else {
-                    entry.get_mut().highlight_updates.send(()).ok();
-                }
-            }
-
+        if let Some(assist) = self.remove_assist_state(assist_id, cx) {
             let active_alternative = assist.codegen.read(cx).active_alternative().clone();
             if let Some(model) = LanguageModelRegistry::read_global(cx).inline_assistant_model() {
                 let language_name = assist.editor.upgrade().and_then(|editor| {
@@ -1036,6 +1265,52 @@ impl InlineAssistant {
                 self.confirmed_assists.insert(assist_id, active_alternative);
             }
         }
+    }
+
+    fn remove_assist_group(
+        &mut self,
+        assist_group_id: InlineAssistGroupId,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let assist_ids = self
+            .assist_groups
+            .get(&assist_group_id)
+            .map(|group| group.assist_ids.clone())
+            .unwrap_or_default();
+        for assist_id in assist_ids {
+            self.dismiss_assist(assist_id, window, cx);
+            self.remove_assist_state(assist_id, cx);
+        }
+    }
+
+    fn remove_assist_state(
+        &mut self,
+        assist_id: InlineAssistId,
+        cx: &mut App,
+    ) -> Option<InlineAssist> {
+        let assist = self.assists.remove(&assist_id)?;
+        if let hash_map::Entry::Occupied(mut entry) = self.assist_groups.entry(assist.group_id) {
+            entry.get_mut().assist_ids.retain(|id| *id != assist_id);
+            if entry.get().assist_ids.is_empty() {
+                entry.remove();
+            }
+        }
+
+        if let hash_map::Entry::Occupied(mut entry) =
+            self.assists_by_editor.entry(assist.editor.clone())
+        {
+            entry.get_mut().assist_ids.retain(|id| *id != assist_id);
+            if entry.get().assist_ids.is_empty() {
+                entry.remove();
+                if let Some(editor) = assist.editor.upgrade() {
+                    self.update_editor_highlights(&editor, cx);
+                }
+            } else {
+                entry.get_mut().highlight_updates.send(()).ok();
+            }
+        }
+        Some(assist)
     }
 
     fn dismiss_assist(
@@ -1598,6 +1873,7 @@ struct InlineAssistGroup {
     assist_ids: Vec<InlineAssistId>,
     linked: bool,
     active_assist_id: Option<InlineAssistId>,
+    sending_to_thread: bool,
 }
 
 impl InlineAssistGroup {
@@ -1606,6 +1882,7 @@ impl InlineAssistGroup {
             assist_ids: Vec::new(),
             linked: true,
             active_assist_id: None,
+            sending_to_thread: false,
         }
     }
 }
