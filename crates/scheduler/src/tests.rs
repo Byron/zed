@@ -35,6 +35,25 @@ fn test_background_executor_spawn() {
 }
 
 #[test]
+fn test_task_waker_matches_its_clone() {
+    // The test scheduler wraps wakers, so exercise async-task's own waker directly.
+    let (runnable, task) = async_task::Builder::new()
+        .metadata(RunnableMeta::new_with_callers_location())
+        .spawn(
+            |_| {
+                future::poll_fn(|context| {
+                    assert!(context.waker().will_wake(&context.waker().clone()));
+                    Poll::Ready(())
+                })
+            },
+            |_| {},
+        );
+
+    runnable.run();
+    block_on(task);
+}
+
+#[test]
 fn test_dedicated_executor_spawn() {
     TestScheduler::once(async |scheduler| {
         let dedicated = DedicatedExecutor::new(&scheduler.background());
