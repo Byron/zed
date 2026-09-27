@@ -4,13 +4,24 @@ use cpal::{
     DeviceDescription, DeviceId, default_host,
     traits::{DeviceTrait, HostTrait},
 };
-use gpui::{App, AsyncApp, BorrowAppContext, Global};
+use gpui::{App, AsyncApp, BorrowAppContext, Global, Task};
 
 pub(super) use cpal::Sample;
 
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Source, mixer::Mixer, source::Buffered};
+use rodio::{
+    Decoder, DeviceSinkBuilder, MixerDeviceSink, Source,
+    mixer::Mixer,
+    source::{Buffered, Done},
+};
 use settings::Settings;
-use std::io::Cursor;
+use std::{
+    io::Cursor,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use util::ResultExt;
 
 mod echo_canceller;
@@ -47,6 +58,8 @@ pub fn ensure_devices_initialized(cx: &mut App) {
 #[derive(Default)]
 pub struct Audio {
     output: Option<(MixerDeviceSink, Mixer)>,
+    active_sounds: Arc<AtomicUsize>,
+    output_cleanup: Option<Task<()>>,
     pub echo_canceller: EchoCanceller,
     source_cache: HashMap<Sound, Buffered<Decoder<Cursor<Vec<u8>>>>>,
 }
@@ -80,16 +93,46 @@ impl Audio {
             let output_mixer = this
                 .ensure_output_exists(output_audio_device)
                 .context("Could not get output mixer")
-                .log_err()?;
+                .log_err()?
+                .clone();
 
-            output_mixer.add(source);
+            this.play_source(source, &output_mixer, cx);
             Some(())
         });
     }
 
+    fn play_source(
+        &mut self,
+        source: impl Source + Send + 'static,
+        output_mixer: &Mixer,
+        cx: &mut App,
+    ) {
+        let active_sounds = self.active_sounds.clone();
+        active_sounds.fetch_add(1, Ordering::Relaxed);
+        // Finite spans can end without polling `Done` for its final `None`.
+        let source = source.constant_params(CHANNEL_COUNT, SAMPLE_RATE);
+        output_mixer.add(Done::new(source, active_sounds.clone()));
+
+        self.output_cleanup = Some(cx.spawn(async move |cx| {
+            loop {
+                let idle = active_sounds.load(Ordering::Relaxed) == 0;
+                // The device may still have buffered samples after its sources are exhausted.
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                if idle && active_sounds.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+            }
+            cx.update(Self::end_call);
+        }));
+    }
+
     pub fn end_call(cx: &mut App) {
         cx.update_default_global(|this: &mut Self, _cx| {
+            this.output_cleanup.take();
             this.output.take();
+            this.active_sounds = Arc::default();
         });
     }
 
@@ -241,3 +284,116 @@ fn get_available_audio_devices() -> Vec<AudioDeviceInfo> {
 pub struct AvailableAudioDevices(pub Vec<AudioDeviceInfo>);
 
 impl Global for AvailableAudioDevices {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use std::time::{Duration, Instant};
+
+    fn play_test_sound(output_mixer: &Mixer, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.update_default_global(|audio: &mut Audio, cx| {
+                audio.play_source(
+                    rodio::static_buffer::StaticSamplesBuffer::new(
+                        rodio::nz!(1),
+                        rodio::nz!(1000),
+                        &[0.25; 1000],
+                    ),
+                    output_mixer,
+                    cx,
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_cleanup_waits_for_overlapping_sounds(cx: &mut TestAppContext) {
+        let (output_mixer, mut output) = rodio::mixer::mixer(rodio::nz!(1), rodio::nz!(1000));
+        play_test_sound(&output_mixer, cx);
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.read_global::<Audio, _>(|audio, _| assert!(audio.output_cleanup.is_some()));
+
+        assert_eq!(output.by_ref().take(500).count(), 500);
+        play_test_sound(&output_mixer, cx);
+        assert_eq!(output.by_ref().take(600).count(), 600);
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.read_global::<Audio, _>(|audio, _| {
+            assert_eq!(audio.active_sounds.load(Ordering::Relaxed), 1);
+            assert!(audio.output_cleanup.is_some());
+        });
+
+        output.count();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.read_global::<Audio, _>(|audio, _| assert!(audio.output_cleanup.is_none()));
+    }
+
+    #[gpui::test]
+    fn test_ending_call_does_not_stop_new_sound(cx: &mut TestAppContext) {
+        let (old_mixer, old_output) = rodio::mixer::mixer(rodio::nz!(1), rodio::nz!(1000));
+        play_test_sound(&old_mixer, cx);
+        cx.run_until_parked();
+        cx.update(Audio::end_call);
+
+        let (new_mixer, new_output) = rodio::mixer::mixer(rodio::nz!(1), rodio::nz!(1000));
+        play_test_sound(&new_mixer, cx);
+        old_output.count();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.read_global::<Audio, _>(|audio, _| {
+            assert_eq!(audio.active_sounds.load(Ordering::Relaxed), 1);
+            assert!(audio.output_cleanup.is_some());
+        });
+
+        new_output.count();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.read_global::<Audio, _>(|audio, _| assert!(audio.output_cleanup.is_none()));
+    }
+
+    #[gpui::test]
+    fn test_cleanup_after_buffered_notification(cx: &mut TestAppContext) {
+        let (output_mixer, output) = rodio::mixer::mixer(CHANNEL_COUNT, SAMPLE_RATE);
+        cx.update(|cx| {
+            let source = Decoder::new(Cursor::new(
+                include_bytes!("../../../assets/sounds/agent_done.wav").to_vec(),
+            ))
+            .expect("valid notification sound")
+            .buffered();
+            cx.update_default_global(|audio: &mut Audio, cx| {
+                audio.play_source(source, &output_mixer, cx);
+            });
+        });
+        output.count();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.read_global::<Audio, _>(|audio, _| assert!(audio.output_cleanup.is_none()));
+    }
+
+    #[gpui::test]
+    #[ignore = "requires an audio output device"]
+    fn test_notification_releases_output(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            let source = Decoder::new(Cursor::new(
+                include_bytes!("../../../assets/sounds/mute.wav").to_vec(),
+            ))
+            .expect("valid notification sound")
+            .buffered();
+            cx.default_global::<Audio>()
+                .source_cache
+                .insert(Sound::Mute, source);
+            Audio::play_sound(Sound::Mute, cx);
+            assert!(cx.global::<Audio>().output.is_some());
+        });
+
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(3) {
+            // The device consumes audio outside GPUI's deterministic scheduler.
+            std::thread::sleep(Duration::from_millis(10));
+            cx.background_executor
+                .advance_clock(Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+
+        cx.read_global::<Audio, _>(|audio, _| assert!(audio.output.is_none()));
+    }
+}

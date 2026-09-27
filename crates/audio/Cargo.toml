@@ -31,3 +31,6 @@ util.workspace = true
 
 [target.'cfg(not(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd")))'.dependencies]
 libwebrtc = { workspace = true, optional = true }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
