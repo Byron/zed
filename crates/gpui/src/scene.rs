@@ -154,11 +154,11 @@ impl Scene {
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
     }
 
@@ -945,5 +945,130 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AtlasTextureKind, TileId};
+
+    #[test]
+    fn test_sprite_batches_group_by_texture_and_preserve_order() {
+        use AtlasTextureKind::{Monochrome, Polychrome, Subpixel};
+
+        let mut scene = Scene::default();
+        for (order, texture_index, tile_id) in [
+            (1, 1, 1),
+            (0, 1, 2),
+            (0, 0, 2),
+            (0, 1, 0),
+            (0, 0, 0),
+            (1, 0, 0),
+            (1, 1, 0),
+        ] {
+            let tile = |kind| AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: texture_index,
+                    kind,
+                },
+                tile_id: TileId(tile_id),
+                padding: 0,
+                bounds: Bounds::default(),
+            };
+            scene.monochrome_sprites.push(MonochromeSprite {
+                order,
+                pad: 0,
+                bounds: Bounds::default(),
+                content_mask: ContentMask::default(),
+                color: Hsla::default(),
+                tile: tile(Monochrome),
+                transformation: TransformationMatrix::default(),
+            });
+            scene.subpixel_sprites.push(SubpixelSprite {
+                order,
+                pad: 0,
+                bounds: Bounds::default(),
+                content_mask: ContentMask::default(),
+                color: Hsla::default(),
+                tile: tile(Subpixel),
+                transformation: TransformationMatrix::default(),
+            });
+            scene.polychrome_sprites.push(PolychromeSprite {
+                order,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 1.,
+                bounds: Bounds::default(),
+                content_mask: ContentMask::default(),
+                corner_radii: Corners::default(),
+                tile: tile(Polychrome),
+            });
+        }
+        scene.finish();
+
+        let expected = [
+            (0, 0, 2),
+            (0, 0, 0),
+            (0, 1, 2),
+            (0, 1, 0),
+            (1, 0, 0),
+            (1, 1, 1),
+            (1, 1, 0),
+        ];
+        for sprites in [
+            scene
+                .monochrome_sprites
+                .iter()
+                .map(|sprite| (sprite.order, sprite.tile))
+                .collect::<Vec<_>>(),
+            scene
+                .subpixel_sprites
+                .iter()
+                .map(|sprite| (sprite.order, sprite.tile))
+                .collect(),
+            scene
+                .polychrome_sprites
+                .iter()
+                .map(|sprite| (sprite.order, sprite.tile))
+                .collect(),
+        ] {
+            assert_eq!(
+                sprites
+                    .iter()
+                    .map(|(order, tile)| (*order, tile.texture_id.index, tile.tile_id.0))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        let batches = scene
+            .batches()
+            .map(|batch| match batch {
+                PrimitiveBatch::MonochromeSprites { texture_id, range }
+                | PrimitiveBatch::SubpixelSprites { texture_id, range }
+                | PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                    (texture_id.kind, texture_id.index, range)
+                }
+                other => panic!("unexpected batch: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches,
+            [
+                (Monochrome, 0, 0..2),
+                (Monochrome, 1, 2..4),
+                (Subpixel, 0, 0..2),
+                (Subpixel, 1, 2..4),
+                (Polychrome, 0, 0..2),
+                (Polychrome, 1, 2..4),
+                (Monochrome, 0, 4..5),
+                (Monochrome, 1, 5..7),
+                (Subpixel, 0, 4..5),
+                (Subpixel, 1, 5..7),
+                (Polychrome, 0, 4..5),
+                (Polychrome, 1, 5..7),
+            ]
+        );
     }
 }

@@ -33922,6 +33922,7 @@ fn test_crease_insertion_and_rendering(cx: &mut TestAppContext) {
     });
 
     let render_args = Arc::new(Mutex::new(None));
+    let trailer_args = Arc::new(Mutex::new(None));
     let snapshot = editor
         .update(cx, |editor, window, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -33948,13 +33949,31 @@ fn test_crease_insertion_and_rendering(cx: &mut TestAppContext) {
                         div()
                     }
                 },
-                |_row, _folded, _window, _cx| div(),
+                {
+                    let trailer_args = trailer_args.clone();
+                    move |row, folded, _window, _cx| {
+                        *trailer_args.lock() = Some((row, folded));
+                        div()
+                    }
+                },
             );
 
-            editor.insert_creases(Some(crease), cx);
+            let simple_crease = Crease::simple(
+                snapshot.anchor_before(Point::new(3, 0))..snapshot.anchor_after(Point::new(3, 7)),
+                FoldPlaceholder::test(),
+            );
+            editor.insert_creases([crease, simple_crease], cx);
             let snapshot = editor.snapshot(window, cx);
             let _div =
                 snapshot.render_crease_toggle(MultiBufferRow(1), false, cx.entity(), window, cx);
+            assert!(
+                snapshot
+                    .render_crease_trailer(MultiBufferRow(1), window, cx)
+                    .is_some()
+            );
+            for row in [MultiBufferRow(0), MultiBufferRow(3)] {
+                assert!(snapshot.render_crease_trailer(row, window, cx).is_none());
+            }
             snapshot
         })
         .unwrap();
@@ -33963,24 +33982,43 @@ fn test_crease_insertion_and_rendering(cx: &mut TestAppContext) {
     assert_eq!(render_args.row, MultiBufferRow(1));
     assert!(!render_args.folded);
     assert!(!snapshot.is_line_folded(MultiBufferRow(1)));
+    assert_eq!(trailer_args.lock().take(), Some((MultiBufferRow(1), false)));
 
     cx.update_window(*editor, |_, window, cx| {
         (render_args.callback)(true, window, cx)
     })
     .unwrap();
     let snapshot = editor
-        .update(cx, |editor, window, cx| editor.snapshot(window, cx))
+        .update(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            assert!(
+                snapshot
+                    .render_crease_trailer(MultiBufferRow(1), window, cx)
+                    .is_some()
+            );
+            snapshot
+        })
         .unwrap();
     assert!(snapshot.is_line_folded(MultiBufferRow(1)));
+    assert_eq!(trailer_args.lock().take(), Some((MultiBufferRow(1), true)));
 
     cx.update_window(*editor, |_, window, cx| {
         (render_args.callback)(false, window, cx)
     })
     .unwrap();
     let snapshot = editor
-        .update(cx, |editor, window, cx| editor.snapshot(window, cx))
+        .update(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            assert!(
+                snapshot
+                    .render_crease_trailer(MultiBufferRow(1), window, cx)
+                    .is_some()
+            );
+            snapshot
+        })
         .unwrap();
     assert!(!snapshot.is_line_folded(MultiBufferRow(1)));
+    assert_eq!(trailer_args.lock().take(), Some((MultiBufferRow(1), false)));
 }
 
 #[gpui::test]

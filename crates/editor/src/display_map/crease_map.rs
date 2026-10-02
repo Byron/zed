@@ -53,6 +53,10 @@ impl CreaseSnapshot {
         row: MultiBufferRow,
         snapshot: &'a MultiBufferSnapshot,
     ) -> Option<&'a Crease<Anchor>> {
+        if self.creases.is_empty() {
+            return None;
+        }
+
         let start = snapshot.anchor_before(Point::new(row.0, 0));
         let mut cursor = self.creases.cursor::<ItemSummary>(snapshot);
         cursor.seek(&start, Bias::Left);
@@ -418,6 +422,12 @@ mod test {
         let buffer = MultiBuffer::build_simple(text, cx);
         let snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
         let mut crease_map = CreaseMap::new(&buffer.read(cx).read(cx));
+        assert!(
+            crease_map
+                .snapshot()
+                .query_row(MultiBufferRow(1), &snapshot)
+                .is_none()
+        );
 
         // Insert creases
         let creases = [

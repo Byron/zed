@@ -5718,16 +5718,24 @@ name = "editor_benchmarks"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
+ "benchmarks",
+ "buffer_diff",
+ "criterion",
  "editor",
  "gpui",
  "gpui_platform",
+ "grammars",
  "language",
  "multi_buffer",
  "project",
+ "rand 0.9.4",
  "release_channel",
  "semver",
  "settings",
  "theme",
+ "theme_settings",
+ "tree-sitter-rust",
  "workspace",
 ]
 

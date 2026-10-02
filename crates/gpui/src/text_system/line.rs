@@ -799,6 +799,13 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    if decoration_runs
+        .iter()
+        .all(|run| run.background_color.is_none())
+    {
+        return Ok(());
+    }
+
     let line_bounds = line_paint_bounds(
         origin,
         layout,
@@ -1110,6 +1117,94 @@ mod tests {
                 Bounds::new(origin, size(Pixels::ZERO, line_height)),
             );
         }
+    }
+
+    #[gpui::test]
+    fn test_paint_line_background(cx: &mut TestAppContext) {
+        test_underline_handler_at_scales(cx, |window, cx| {
+            let origin = point(px(4.), px(8.));
+            let line_height = px(20.);
+            let mut line = underline_test_line("abcd", &[], false, window);
+            let decoration = DecorationRun {
+                len: 1,
+                color: black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            for background_color in [
+                None,
+                Some(hsla(0., 1., 0.5, 1.)),
+                Some(Hsla::transparent_black()),
+            ] {
+                line.decoration_runs = SmallVec::from_vec(vec![
+                    decoration.clone(),
+                    DecorationRun {
+                        len: 3,
+                        background_color,
+                        ..decoration.clone()
+                    },
+                ]);
+                for wrapped in [false, true] {
+                    let boundary = [WrapBoundary {
+                        run_ix: 0,
+                        glyph_ix: 2,
+                    }];
+                    window.next_frame.scene.clear();
+                    paint_line_background(
+                        origin,
+                        &line.layout,
+                        line_height,
+                        TextAlign::Left,
+                        None,
+                        &line.decoration_runs,
+                        if wrapped { &boundary } else { &[] },
+                        window,
+                        cx,
+                    )
+                    .expect("paint text background");
+
+                    let scene = &window.next_frame.scene;
+                    assert_eq!(
+                        scene.len(),
+                        scene.quads.len() + 2 * usize::from(background_color.is_some())
+                    );
+                    if let Some(color) = background_color {
+                        let actual_quads = scene.quads.clone();
+                        let expected_bounds = if wrapped {
+                            vec![
+                                Bounds::new(point(px(12.), px(8.)), size(px(8.), line_height)),
+                                Bounds::new(point(px(4.), px(28.)), size(px(16.), line_height)),
+                            ]
+                        } else {
+                            vec![Bounds::new(
+                                point(px(12.), px(8.)),
+                                size(px(24.), line_height),
+                            )]
+                        };
+                        window.next_frame.scene.clear();
+                        for bounds in expected_bounds {
+                            window.paint_quad(fill(bounds, color));
+                        }
+                        let expected_quads = &window.next_frame.scene.quads;
+                        assert_eq!(actual_quads.len(), expected_quads.len());
+                        for (actual, expected) in actual_quads.iter().zip(expected_quads) {
+                            assert_eq!(actual.bounds, expected.bounds);
+                            assert_eq!(actual.content_mask, expected.content_mask);
+                            assert_eq!(actual.background.as_solid(), Some(color.opacity(0.5)));
+                        }
+                    } else {
+                        assert!(scene.quads.is_empty());
+                    }
+                }
+            }
+
+            line.decoration_runs.clear();
+            window.next_frame.scene.clear();
+            line.paint_background(origin, line_height, TextAlign::Left, None, window, cx)
+                .expect("paint undecorated text");
+            assert_eq!(window.next_frame.scene.len(), 0);
+        });
     }
 
     #[gpui::test]
