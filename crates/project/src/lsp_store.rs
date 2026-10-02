@@ -65,6 +65,7 @@ use futures::{
     AsyncWriteExt, Future, FutureExt, StreamExt,
     channel::oneshot,
     future::{Shared, join_all},
+    io::BufWriter,
     select, select_biased,
     stream::FuturesUnordered,
 };
@@ -2800,7 +2801,7 @@ impl LocalLspStore {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let stdin = child.stdin.as_mut().context("failed to acquire stdin")?;
+        let mut stdin = BufWriter::new(child.stdin.as_mut().context("failed to acquire stdin")?);
         let text = buffer
             .handle
             .read_with(cx, |buffer, _| buffer.as_rope().clone());

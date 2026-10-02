@@ -6,7 +6,7 @@ use editor::{
     actions::{SortLinesCaseInsensitive, SortLinesCaseSensitive},
     display_map::ToDisplayPoint,
 };
-use futures::AsyncWriteExt as _;
+use futures::{AsyncWriteExt as _, io::BufWriter};
 use gpui::{
     Action, App, AppContext as _, Context, Global, Keystroke, Task, TaskExt, WeakEntity, Window,
     actions,
@@ -2569,11 +2569,12 @@ impl ShellExec {
                 return;
             };
 
-            if let Some(mut stdin) = running.stdin.take()
+            if let Some(stdin) = running.stdin.take()
                 && let Some(snapshot) = input_snapshot
             {
                 let range = range.clone();
                 cx.background_spawn(async move {
+                    let mut stdin = BufWriter::new(stdin);
                     for chunk in snapshot.text_for_range(range) {
                         if stdin.write_all(chunk.as_bytes()).await.log_err().is_none() {
                             return;

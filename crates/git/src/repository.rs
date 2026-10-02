@@ -6257,6 +6257,59 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_blame_contents(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repository_directory = tempfile::tempdir().expect("create repository directory");
+        git_init_repo(repository_directory.path());
+        git_command(
+            repository_directory.path(),
+            ["config", "core.autocrlf", "false"],
+        );
+        let repository = RealGitRepository::new(
+            &repository_directory.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("open repository");
+
+        for line_ending in [LineEnding::Unix, LineEnding::Windows] {
+            for line_count in [1, 4096] {
+                for trailing_newline in [false, true] {
+                    let mut contents =
+                        format!("committed λ {line_ending:?} {line_count} {trailing_newline}\n")
+                            .repeat(line_count);
+                    if !trailing_newline {
+                        contents.pop();
+                    }
+                    fs::write(
+                        repository_directory.path().join("file"),
+                        contents.replace('\n', line_ending.as_str()),
+                    )
+                    .expect("write committed contents");
+                    git_command(repository_directory.path(), ["add", "file"]);
+                    git_command(repository_directory.path(), ["commit", "-m", "Contents"]);
+                    let committed_sha: Oid =
+                        git_command_output(repository_directory.path(), ["rev-parse", "HEAD"])
+                            .parse()
+                            .expect("parse commit ID");
+
+                    let blame = repository
+                        .blame(repo_path("file"), Rope::from(contents), line_ending)
+                        .await
+                        .expect("blame buffer contents");
+                    assert_eq!(blame.entries.len(), 1);
+                    let entry = blame.entries.first().expect("committed blame entry");
+                    assert_eq!(entry.sha, committed_sha);
+                    assert_eq!(entry.range, 0..line_count as u32);
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn test_blame_at_revision(cx: &mut TestAppContext) {
         disable_git_global_config();
         cx.executor().allow_parking();
