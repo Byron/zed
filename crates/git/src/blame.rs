@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet};
 use futures::{AsyncWriteExt, TryFutureExt, try_join};
 use serde::{Deserialize, Serialize};
-use smol::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use smol::io::{AsyncBufReadExt, AsyncReadExt, BufReader, BufWriter};
 use std::ops::Range;
 use text::{LineEnding, Rope};
 use time::OffsetDateTime;
@@ -125,7 +125,8 @@ async fn run_git_blame(
 
     let write_stdin = async move {
         if let BlameSource::Contents(contents, line_ending) = source {
-            let mut stdin = stdin.context("failed to get pipe to stdin of git blame command")?;
+            let mut stdin =
+                BufWriter::new(stdin.context("failed to get pipe to stdin of git blame command")?);
             for chunk in text::chunks_with_line_ending(contents, line_ending) {
                 stdin.write_all(chunk.as_bytes()).await?;
             }
