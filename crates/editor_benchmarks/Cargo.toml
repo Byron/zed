@@ -18,5 +18,25 @@ settings.workspace = true
 theme.workspace = true
 workspace.workspace = true
 
+[dev-dependencies]
+assets.workspace = true
+benchmarks = { path = "../benchmarks" }
+buffer_diff.workspace = true
+criterion.workspace = true
+gpui = { workspace = true, features = ["bench-support"] }
+gpui_platform = { workspace = true, features = ["bench-support", "font-kit"] }
+grammars.workspace = true
+rand.workspace = true
+theme_settings.workspace = true
+tree-sitter-rust.workspace = true
+
+[[bench]]
+name = "scrolling"
+harness = false
+
+[package.metadata.cargo-shear]
+# Referenced by the expansion of #[gpui::bench].
+ignored = ["criterion"]
+
 [lints]
 workspace = true
