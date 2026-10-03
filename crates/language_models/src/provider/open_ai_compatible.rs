@@ -97,6 +97,8 @@ impl OpenAiCompatibleLanguageModelProvider {
             },
             supports_streaming_tools: true,
             supports_thinking: default_thinking_reasoning_effort(model).is_some(),
+            supports_disabling_thinking: supports_none_reasoning_effort(model)
+                || default_thinking_reasoning_effort(model).is_none(),
             supported_effort_levels: supported_thinking_effort_levels(model).into(),
             supports_split_token_display: true,
             max_output_tokens: model.max_output_tokens,
@@ -363,9 +365,15 @@ fn supported_thinking_effort_levels(model: &AvailableModel) -> Vec<LanguageModel
     let Some(default_effort) = default_thinking_reasoning_effort(model) else {
         return Vec::new();
     };
+    let known_model = open_ai::Model::from_id(&model.name).ok();
 
     open_ai::ReasoningEffort::OPENAI_COMPATIBLE_SELECTABLE
         .into_iter()
+        .filter(|effort| {
+            known_model
+                .as_ref()
+                .is_none_or(|model| model.supported_reasoning_efforts().contains(effort))
+        })
         .map(|effort| LanguageModelEffortLevel {
             name: effort.label().into(),
             value: effort.value().into(),
@@ -397,6 +405,13 @@ fn chat_completion_max_tokens_parameter(
 
 fn supports_none_reasoning_effort(model: &AvailableModel) -> bool {
     model.reasoning_effort.is_some()
+        && open_ai::Model::from_id(&model.name)
+            .map(|model| {
+                model
+                    .supported_reasoning_efforts()
+                    .contains(&open_ai::ReasoningEffort::None)
+            })
+            .unwrap_or(true)
 }
 
 fn chat_completion_reasoning_effort(
@@ -674,6 +689,47 @@ mod tests {
             open_ai::ReasoningEffort::None
         ))));
         assert!(!supports_none_reasoning_effort(&available_model(None)));
+        for name in ["gpt-5.6-sol", "gpt-6-sol", "gpt-6-luna"] {
+            let mut model = available_model(Some(open_ai::ReasoningEffort::Medium));
+            model.name = name.to_owned();
+            assert!(supports_none_reasoning_effort(&model));
+        }
+    }
+
+    #[test]
+    fn reasoning_only_models_do_not_send_none_for_compaction() -> Result<()> {
+        for name in ["gpt-6.1-sol", "gpt-6-astra"] {
+            let mut model = available_model(Some(open_ai::ReasoningEffort::Medium));
+            model.name = name.to_owned();
+            let request = LanguageModelRequest {
+                thinking_allowed: false,
+                thinking_effort: Some("high".to_owned()),
+                ..Default::default()
+            };
+
+            assert!(!supports_none_reasoning_effort(&model));
+            assert_eq!(chat_completion_reasoning_effort(&request, &model), None);
+            let response = into_open_ai_response(
+                request,
+                &model.name,
+                model.capabilities.parallel_tool_calls,
+                model.capabilities.prompt_cache_key,
+                model.max_output_tokens,
+                default_thinking_reasoning_effort(&model),
+                supports_none_reasoning_effort(&model),
+                &LanguageModelProviderId::new("Azure"),
+            )?;
+            let serialized = serde_json::to_value(response)?;
+            assert!(serialized.get("reasoning").is_none());
+            assert_eq!(
+                supported_thinking_effort_levels(&model)
+                    .iter()
+                    .map(|effort| effort.value.as_ref())
+                    .collect::<Vec<_>>(),
+                ["low", "medium", "high", "xhigh", "max"]
+            );
+        }
+        Ok(())
     }
 
     #[test]
