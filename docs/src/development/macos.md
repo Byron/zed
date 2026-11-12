@@ -61,6 +61,28 @@ And to run the tests:
 cargo test --workspace
 ```
 
+## Keeping macOS permissions across local builds
+
+Use the same signing certificate for each local build so macOS can recognize the
+application across rebuilds. The local bundle recipe uses the existing
+`Rustty Local Signing` certificate in your login keychain:
+
+```sh
+just zed-bundle-macos
+```
+
+It builds a `release-fast-small` bundle. Pass `-d` for a debug bundle or `-i` to
+install it. To select another persistent certificate, set `MACOS_SIGNING_KEY`:
+
+```sh
+MACOS_SIGNING_KEY="Your Local Signing Certificate" just zed-bundle-macos
+```
+
+Keep the certificate and its private key; recreating it changes the identity.
+After switching from ad hoc signing, macOS may ask you to grant permissions again.
+Local signing does not provide Developer ID notarization or enable universal links.
+The bundle script verifies the signature before installing or creating a DMG.
+
 ## Visual Regression Tests
 
 Zed includes visual regression tests that capture screenshots of real Zed windows and compare them against baseline images. These tests require macOS with Screen Recording permission.

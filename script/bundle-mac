@@ -265,8 +265,10 @@ function sign_app_binaries() {
         # then comment out this line.
         cat crates/zed/resources/zed.entitlements | sed '/com.apple.developer.associated-domains/,+1d' > "${app_path}/Contents/Resources/zed.entitlements"
 
-        codesign --force --deep --entitlements "${app_path}/Contents/Resources/zed.entitlements" --sign ${MACOS_SIGNING_KEY:- -} "${app_path}" -v
+        codesign --force --deep --entitlements "${app_path}/Contents/Resources/zed.entitlements" --sign "${MACOS_SIGNING_KEY:--}" "${app_path}" -v
     fi
+
+    codesign --verify --deep --strict "${app_path}"
 
     bundle_name=$(basename "$app_path")
 
