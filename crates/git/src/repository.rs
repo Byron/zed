@@ -819,7 +819,10 @@ pub fn delete_branch_flag(is_remote_tracking_ref: bool, force: bool) -> &'static
 }
 
 pub trait GitRepository: Send + Sync {
-    fn monitor(&self) -> Result<Option<gix::notify::RepositoryMonitor>> {
+    fn monitor(
+        &self,
+        _additional_paths: &[gix::notify::InvalidationPath],
+    ) -> Result<Option<gix::notify::RepositoryMonitor>> {
         Ok(None)
     }
 
@@ -1421,10 +1424,14 @@ pub async fn get_git_committer(cx: &AsyncApp) -> GitCommitter {
 }
 
 impl GitRepository for RealGitRepository {
-    fn monitor(&self) -> Result<Option<gix::notify::RepositoryMonitor>> {
+    fn monitor(
+        &self,
+        additional_paths: &[gix::notify::InvalidationPath],
+    ) -> Result<Option<gix::notify::RepositoryMonitor>> {
         let repository = Self::open_gix_repository(&self.git_dir)?.to_thread_local();
         let monitor = repository.monitor(gix::notify::Options::default())?;
         let mut options = monitor.options().clone();
+        options.additional_paths.extend_from_slice(additional_paths);
         let mut dependencies = monitor.layout().dependencies.clone();
         let permissions = repository.open_options().permissions;
         let snapshot = repository.config_snapshot();

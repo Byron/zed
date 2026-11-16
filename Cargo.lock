@@ -6627,6 +6627,8 @@ dependencies = [
  "fs",
  "futures 0.3.34",
  "git",
+ "gix",
+ "gix-notify",
  "gpui",
  "ignore",
  "is_executable",
@@ -7639,7 +7641,9 @@ name = "gix-notify"
 version = "0.1.0"
 source = "git+https://github.com/GitoxideLabs/gitoxide?rev=ab7c5dc0596943b42fe9294813a8cdc0383c403a#ab7c5dc0596943b42fe9294813a8cdc0383c403a"
 dependencies = [
+ "async-channel 2.5.0",
  "dispatch2",
+ "event-listener 5.4.2",
  "fsevent-sys",
  "gix-error",
  "gix-parallel",

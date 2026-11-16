@@ -4784,6 +4784,201 @@ async fn test_repo_exclude_naming_a_worktree_ancestor(
 }
 
 #[gpui::test]
+async fn test_refresh_git_ignores_without_fs_events(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": { "info": { "exclude": "project/ignored/\n" } },
+            "project": {
+                "ignored": { "child.txt": "child" },
+                "tracked.txt": "tracked",
+            }
+        }),
+    )
+    .await;
+    let tree = Worktree::local(
+        Path::new(path!("/root/project")),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(tree.entry_for_path(rel_path("ignored")).unwrap().is_ignored);
+        assert!(tree.entry_for_path(rel_path("ignored/child.txt")).is_none());
+    });
+
+    fs.pause_events();
+    let exclude_path = Path::new(path!("/root/.git/info/exclude"));
+    fs.write(exclude_path, b"tracked.txt\n").await.unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().refresh_git_ignores())
+        .recv()
+        .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path("tracked.txt"))
+                .unwrap()
+                .is_ignored
+        );
+        assert!(
+            !tree
+                .entry_for_path(rel_path("ignored/child.txt"))
+                .unwrap()
+                .is_ignored
+        );
+    });
+
+    fs.remove_file(exclude_path, RemoveOptions::default())
+        .await
+        .unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().refresh_git_ignores())
+        .recv()
+        .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            !tree
+                .entry_for_path(rel_path("tracked.txt"))
+                .unwrap()
+                .is_ignored
+        );
+    });
+
+    let ancestor_ignore_path = Path::new(path!("/root/.gitignore"));
+    fs.write(ancestor_ignore_path, b"tracked.txt\n")
+        .await
+        .unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().refresh_git_ignores())
+        .recv()
+        .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path("tracked.txt"))
+                .unwrap()
+                .is_ignored
+        );
+    });
+    fs.remove_file(ancestor_ignore_path, RemoveOptions::default())
+        .await
+        .unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().refresh_git_ignores())
+        .recv()
+        .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            !tree
+                .entry_for_path(rel_path("tracked.txt"))
+                .unwrap()
+                .is_ignored
+        );
+    });
+
+    fs.write(exclude_path, b"tracked.txt\n").await.unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().refresh_git_ignores())
+        .recv()
+        .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path("tracked.txt"))
+                .unwrap()
+                .is_ignored
+        );
+    });
+
+    fs.remove_file(exclude_path, RemoveOptions::default())
+        .await
+        .unwrap();
+    fs.create_dir(exclude_path).await.unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().refresh_git_ignores())
+        .recv()
+        .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            !tree
+                .entry_for_path(rel_path("tracked.txt"))
+                .unwrap()
+                .is_ignored
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_queued_git_ignore_refreshes_preserve_latest_rules(cx: &mut TestAppContext) {
+    use futures::FutureExt as _;
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": { "info": { "exclude": "generated/\n" } },
+            "generated": { "child.txt": "child" },
+            "tracked.txt": "tracked",
+        }),
+    )
+    .await;
+    let tree = Worktree::local(
+        Path::new(path!("/root")),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+
+    fs.pause_events();
+    let (entered_tx, entered_rx) = async_channel::bounded(1);
+    let (release_tx, release_rx) = async_channel::bounded(1);
+    fs.before_read_dir(
+        path!("/root/generated"),
+        async move {
+            entered_tx.send(()).await.unwrap();
+            release_rx.recv().await.unwrap();
+        }
+        .boxed(),
+    );
+    let exclude_path = Path::new(path!("/root/.git/info/exclude"));
+    fs.write(exclude_path, b"").await.unwrap();
+    let mut first_refresh =
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().refresh_git_ignores());
+    entered_rx.recv().await.unwrap();
+
+    fs.write(exclude_path, b"generated/\n").await.unwrap();
+    fs.write(Path::new(path!("/root/.gitignore")), b"tracked.txt\n")
+        .await
+        .unwrap();
+    let mut second_refresh =
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().refresh_git_ignores());
+    cx.run_until_parked();
+    {
+        let second_wait = second_refresh.recv();
+        futures::pin_mut!(second_wait);
+        assert!(futures::poll!(second_wait.as_mut()).is_pending());
+    }
+
+    release_tx.send(()).await.unwrap();
+    first_refresh.recv().await;
+    second_refresh.recv().await;
+    tree.read_with(cx, |tree, _| {
+        for path in ["generated", "generated/child.txt", "tracked.txt"] {
+            assert!(tree.entry_for_path(rel_path(path)).unwrap().is_ignored);
+        }
+    });
+}
+
+#[gpui::test]
 async fn test_repo_exclude(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -6134,13 +6329,18 @@ async fn test_dot_git_event_explained_by_filtered_sibling_does_not_emit_git_repo
 }
 
 #[gpui::test]
-async fn test_ref_updates_in_dot_git_subdirectories_are_detected(cx: &mut TestAppContext) {
-    // On Linux and FreeBSD the native file watcher is non-recursive: watching `.git`
-    // does not deliver events for files nested below it, like the loose refs that git
-    // updates on commit, fetch, and branch operations. The worktree must watch the
-    // `refs` tree explicitly, including directories created after the initial scan.
+async fn test_git_metadata_filetree_updates_in_subdirectories_are_detected(
+    cx: &mut TestAppContext,
+) {
     init_test(cx);
     cx.executor().allow_parking();
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(SplicingVec::from(vec![]));
+            });
+        });
+    });
 
     let dir = TempTree::new(json!({
         ".git": {},
@@ -6165,54 +6365,152 @@ async fn test_ref_updates_in_dot_git_subdirectories_are_detected(cx: &mut TestAp
     .unwrap();
     cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
         .await;
+    tree.read_with(cx, |tree, _| {
+        tree.as_local()
+            .unwrap()
+            .add_path_prefix_to_scan(rel_path(".git/refs").into())
+    })
+    .recv()
+    .await;
     tree.flush_fs_events(cx).await;
 
-    let mut events = cx.events(&tree);
+    let ref_path = rel_path(".git/refs/heads/main");
+    let previous_mtime = tree.read_with(cx, |tree, _| tree.entry_for_path(ref_path).unwrap().mtime);
     std::fs::write(
         dir.path().join(".git/refs/heads/main"),
         "1111111111111111111111111111111111111111\n",
     )
     .unwrap();
-    expect_git_repo_update(&mut events, cx, "updating a loose ref").await;
+    wait_for_worktree_condition(&tree, cx, |tree| {
+        tree.entry_for_path(ref_path)
+            .is_some_and(|entry| entry.mtime != previous_mtime)
+    })
+    .await;
 
     std::fs::create_dir_all(dir.path().join(".git/refs/remotes/origin")).unwrap();
-    expect_git_repo_update(&mut events, cx, "creating a directory under refs").await;
+    wait_for_worktree_condition(&tree, cx, |tree| {
+        tree.entry_for_path(rel_path(".git/refs/remotes/origin"))
+            .is_some_and(|entry| entry.kind == EntryKind::Dir)
+    })
+    .await;
     tree.flush_fs_events(cx).await;
-    drain_git_repo_updates(&mut events);
 
     std::fs::write(
         dir.path().join(".git/refs/remotes/origin/main"),
         "2222222222222222222222222222222222222222\n",
     )
     .unwrap();
-    expect_git_repo_update(
-        &mut events,
-        cx,
-        "updating a ref in a directory created after the initial scan",
-    )
+    wait_for_worktree_condition(&tree, cx, |tree| {
+        tree.entry_for_path(rel_path(".git/refs/remotes/origin/main"))
+            .is_some()
+    })
+    .await;
+
+    std::fs::create_dir_all(dir.path().join("nested/.git")).unwrap();
+    wait_for_worktree_condition(&tree, cx, |tree| {
+        tree.as_local()
+            .unwrap()
+            .repositories()
+            .contains(&Arc::from(dir.path().join("nested")))
+    })
     .await;
 }
 
-async fn expect_git_repo_update(
-    events: &mut futures::channel::mpsc::UnboundedReceiver<Event>,
-    cx: &mut TestAppContext,
-    description: &str,
-) {
-    let mut elapsed = std::time::Duration::ZERO;
-    let timeout = std::time::Duration::from_secs(10);
-    let poll_interval = std::time::Duration::from_millis(50);
-    loop {
-        match events.try_recv() {
-            Ok(Event::UpdatedGitRepositories(_)) => return,
-            Ok(_) => continue,
-            Err(_) => {}
+#[gpui::test]
+async fn test_fake_git_metadata_changes_in_subdirectories_are_detected(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {
+                "refs": {"heads": {"topic": {"main": "before"}}},
+                "reftable": {"tables.list": "before"},
+            },
+            "project": {"a.txt": "content"},
+        }),
+    )
+    .await;
+
+    let tree = Worktree::local(
+        Path::new("/root/project"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+    tree.flush_fs_events(cx).await;
+
+    for defer_watch in [false, true] {
+        if defer_watch {
+            tree.update(cx, |tree, cx| {
+                tree.as_local_mut().unwrap().set_defer_watch(true, cx);
+            });
+            tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+                .await;
+            tree.flush_fs_events(cx).await;
         }
+
+        for metadata_path in [
+            "/root/.git/refs/heads/topic/main",
+            "/root/.git/reftable/tables.list",
+        ] {
+            let mut events = cx.events(&tree);
+            fs.write(Path::new(metadata_path), b"after").await.unwrap();
+            tree.flush_fs_events(cx).await;
+            assert!(
+                drain_git_repo_updates(&mut events),
+                "missing update for {metadata_path} (defer_watch={defer_watch})"
+            );
+        }
+
+        fs.create_dir(Path::new("/root/.git/refs/remotes/origin/topic"))
+            .await
+            .unwrap();
+        tree.flush_fs_events(cx).await;
+
+        let mut events = cx.events(&tree);
+        fs.write(
+            Path::new("/root/.git/refs/remotes/origin/topic/main"),
+            b"after",
+        )
+        .await
+        .unwrap();
+        tree.flush_fs_events(cx).await;
         assert!(
-            elapsed < timeout,
-            "timed out waiting for UpdatedGitRepositories after {description}"
+            drain_git_repo_updates(&mut events),
+            "missing update in new ref subtree (defer_watch={defer_watch})"
         );
-        cx.background_executor.timer(poll_interval).await;
-        elapsed += poll_interval;
+    }
+}
+
+async fn wait_for_worktree_condition(
+    tree: &Entity<Worktree>,
+    cx: &mut TestAppContext,
+    mut predicate: impl FnMut(&Worktree) -> bool,
+) {
+    use futures::{FutureExt as _, StreamExt as _};
+
+    let mut events = cx.events(tree);
+    let timeout = cx
+        .background_executor
+        .timer(std::time::Duration::from_secs(10))
+        .fuse();
+    futures::pin_mut!(timeout);
+    loop {
+        if tree.read_with(cx, |tree, _| predicate(tree)) {
+            return;
+        }
+        futures::select! {
+            _ = events.next().fuse() => {},
+            _ = timeout => panic!("timed out waiting for worktree update"),
+        }
     }
 }
 

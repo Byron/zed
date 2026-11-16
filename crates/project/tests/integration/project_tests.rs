@@ -19080,6 +19080,48 @@ async fn test_linked_worktree_real_git_status_updates_after_external_change(
         "collected status updates must not show a file removed during the batch"
     );
 
+    std::fs::write(
+        linked_worktree.join("src/ignored.txt"),
+        "ignored candidate\n",
+    )
+    .expect("create a file affected by the shared exclude file");
+    tree.condition::<worktree::Event>(cx, |tree, _| {
+        tree.entry_for_path(rel_path("src/ignored.txt"))
+            .is_some_and(|entry| !entry.is_ignored)
+    })
+    .await;
+    let exclude = main_worktree.join(".git/info/exclude");
+    for (contents, ignored, untracked_ignored) in [
+        (Some("src/ignored.txt\n"), true, false),
+        (Some("src/untracked.txt\n"), false, true),
+        (None, false, false),
+    ] {
+        if let Some(contents) = contents {
+            std::fs::write(&exclude, contents).expect("update shared excludes externally");
+        } else {
+            std::fs::remove_file(&exclude).expect("remove shared excludes externally");
+        }
+        tree.condition::<worktree::Event>(cx, |tree, _| {
+            tree.entry_for_path(rel_path("src/ignored.txt"))
+                .is_some_and(|entry| entry.is_ignored == ignored)
+                && tree
+                    .entry_for_path(rel_path("src/untracked.txt"))
+                    .is_some_and(|entry| entry.is_ignored == untracked_ignored)
+        })
+        .await;
+        cx.condition(&repository, |repository, _| {
+            repository
+                .status_for_path(&repo_path("src/ignored.txt"))
+                .map(|entry| entry.status)
+                == (!ignored).then_some(FileStatus::Untracked)
+                && repository
+                    .status_for_path(&repo_path("src/untracked.txt"))
+                    .map(|entry| entry.status)
+                    == (!untracked_ignored).then_some(FileStatus::Untracked)
+        })
+        .await;
+    }
+
     git_add("src/changed.txt", &linked_worktree);
     cx.condition(&repository, |repository, _| {
         repository
@@ -19089,20 +19131,23 @@ async fn test_linked_worktree_real_git_status_updates_after_external_change(
     })
     .await;
 
-    let output = smol::process::Command::from(git_cmd(&main_worktree))
-        .args(["branch", "external"])
-        .output()
-        .await
-        .expect("create an external branch in the common repository");
-    assert!(output.status.success(), "external branch creation failed");
-    cx.condition(&repository, |repository, _| {
-        repository
-            .snapshot()
-            .branch_list
-            .iter()
-            .any(|branch| branch.ref_name.as_ref() == "refs/heads/external")
-    })
-    .await;
+    for branch_name in ["external/nested/first", "external/nested/second"] {
+        let output = smol::process::Command::from(git_cmd(&main_worktree))
+            .args(["branch", branch_name])
+            .output()
+            .await
+            .expect("create an external branch in the common repository");
+        assert!(output.status.success(), "external branch creation failed");
+        let ref_name = format!("refs/heads/{branch_name}");
+        cx.condition(&repository, |repository, _| {
+            repository
+                .snapshot()
+                .branch_list
+                .iter()
+                .any(|branch| branch.ref_name.as_ref() == ref_name)
+        })
+        .await;
+    }
 
     let output = smol::process::Command::from(git_cmd(&main_worktree))
         .args([

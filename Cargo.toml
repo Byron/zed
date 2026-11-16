@@ -643,6 +643,7 @@ futures-lite = "2"
 gh-workflow = { git = "https://github.com/zed-industries/gh-workflow", rev = "37f3c0575d379c218a9c455ee67585184e40d43f" }
 gix = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "ab7c5dc0596943b42fe9294813a8cdc0383c403a", default-features = false, features = ["parallel", "sha1", "revision", "index", "blob-diff", "anyhow"] }
 gix-imara-diff = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "ab7c5dc0596943b42fe9294813a8cdc0383c403a" }
+gix-notify = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "ab7c5dc0596943b42fe9294813a8cdc0383c403a", features = ["async"] }
 globset = "0.4"
 handlebars = "4.3"
 hdrhistogram = { version = "7", default-features = false }

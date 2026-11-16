@@ -1108,6 +1108,375 @@ async fn watcher_delivered_event(
     }
 }
 
+async fn next_watcher_batch(
+    events: &mut (impl futures::Stream<Item = Vec<PathEvent>> + Unpin),
+    executor: &BackgroundExecutor,
+) -> Vec<PathEvent> {
+    let timeout = executor.timer(Duration::from_secs(5)).fuse();
+    futures::pin_mut!(timeout);
+    futures::select_biased! {
+        batch = events.next().fuse() => batch.expect("watcher stream ended"),
+        _ = timeout => panic!("timed out waiting for a watcher batch"),
+    }
+}
+
+#[gpui::test]
+async fn test_realfs_watch_without_repository_collects_nested_changes(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let fs = RealFs::new(None, executor.clone());
+    let directory = TempDir::new().expect("create temporary directory");
+    let parent = std::fs::canonicalize(directory.path()).expect("resolve temporary directory");
+    let root = util::paths::SanitizedPath::new(&parent)
+        .as_path()
+        .join("watched");
+    std::fs::create_dir(&root).expect("create watched directory");
+    let latency = Duration::from_millis(100);
+    let (mut events, watcher) = fs.watch(&root, latency).await;
+    assert!(
+        next_watcher_batch(&mut events, &executor)
+            .await
+            .iter()
+            .any(|event| event.kind == Some(PathEventKind::Rescan))
+    );
+
+    let transient = root.join("temporary.txt");
+    let persistent = root.join("new/nested/persistent.txt");
+    std::fs::write(&transient, b"temporary").expect("create transient file");
+    std::fs::remove_file(&transient).expect("remove transient file");
+    std::fs::create_dir_all(root.join("new/nested")).expect("create nested directories");
+    if !gix_notify::Watcher::supports_native_recursive_watches() {
+        watcher
+            .add(&root.join("new"))
+            .expect("watch loaded directory");
+        watcher
+            .add(&root.join("new/nested"))
+            .expect("watch loaded nested directory");
+    }
+    std::fs::write(&persistent, b"first").expect("create persistent nested file");
+
+    let batch = {
+        let next_batch = events.next().fuse();
+        let collection_delay = executor.timer(latency / 2).fuse();
+        let timeout = executor.timer(Duration::from_secs(5)).fuse();
+        futures::pin_mut!(next_batch, collection_delay, timeout);
+        futures::select_biased! {
+            _ = collection_delay => {},
+            batch = next_batch => panic!("watcher published the burst before collecting: {batch:?}"),
+        }
+        futures::select_biased! {
+            batch = next_batch => batch.expect("watcher stream ended"),
+            _ = timeout => panic!("timed out waiting for nested file creation"),
+        }
+    };
+    assert!(batch.iter().any(|event| {
+        persistent.starts_with(&event.path) || event.kind == Some(PathEventKind::Rescan)
+    }));
+    assert!(!fs.is_file(&transient).await);
+    assert_eq!(
+        fs.load(&persistent).await.expect("load nested file"),
+        "first"
+    );
+
+    std::fs::write(&persistent, b"second").expect("modify nested file");
+    assert!(
+        watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+            path == persistent
+        })
+        .await,
+        "new nested directories must remain watched"
+    );
+
+    std::fs::rename(&root, parent.join("moved")).expect("move watched root");
+    std::fs::create_dir_all(root.join("new/nested")).expect("recreate watched root");
+    std::fs::write(&persistent, b"replacement").expect("populate replacement root");
+    assert!(
+        watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+            persistent.starts_with(path)
+        })
+        .await,
+        "replacing the watched root must invalidate its baseline"
+    );
+    assert_eq!(
+        fs.load(&persistent).await.expect("load replacement file"),
+        "replacement"
+    );
+    drop(events);
+    drop(watcher);
+}
+
+#[gpui::test]
+async fn test_realfs_watch_individual_files_in_repository(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let fs = RealFs::new(None, executor.clone());
+    let directory = TempDir::new().expect("create temporary directory");
+    let root = std::fs::canonicalize(directory.path()).expect("resolve temporary directory");
+    let root = util::paths::SanitizedPath::new(&root)
+        .as_path()
+        .to_path_buf();
+    let initialized = smol::process::Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .current_dir(&root)
+        .output()
+        .await
+        .expect("initialize repository");
+    assert!(
+        initialized.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+
+    let file = root.join("missing/watched.txt");
+    let latency = Duration::from_millis(100);
+    let (mut events, watcher) = fs.watch_file(&file, latency).await;
+    let initial = next_watcher_batch(&mut events, &executor).await;
+    assert!(initial.iter().any(|event| event.path == file));
+
+    std::fs::write(root.join("sibling.txt"), b"unrelated").expect("create sibling file");
+    let quiet = executor.timer(Duration::from_secs(1)).fuse();
+    futures::pin_mut!(quiet);
+    loop {
+        futures::select_biased! {
+            batch = events.next().fuse() => {
+                // Native ancestor events can conservatively invalidate a missing dependency.
+                let batch = batch.expect("watcher stream ended");
+                assert!(batch.iter().all(|event| event.path == file));
+            }
+            _ = quiet => break,
+        }
+    }
+
+    std::fs::create_dir_all(root.join("missing")).expect("create watched file parent");
+    std::fs::write(&file, b"first").expect("create watched file");
+    assert!(
+        watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+            path == file
+        })
+        .await,
+        "missing file creation must be observed"
+    );
+    {
+        let quiet = executor.timer(Duration::from_millis(500)).fuse();
+        let timeout = executor.timer(Duration::from_secs(5)).fuse();
+        futures::pin_mut!(quiet, timeout);
+        loop {
+            futures::select_biased! {
+                batch = events.next().fuse() => {
+                    let batch = batch.expect("watcher stream ended");
+                    assert!(batch.iter().all(|event| event.path == file));
+                    quiet.set(executor.timer(Duration::from_millis(500)).fuse());
+                }
+                _ = quiet => break,
+                _ = timeout => panic!("file watcher did not settle after parent creation"),
+            }
+        }
+    }
+    std::fs::write(root.join("sibling.txt"), b"changed sibling").expect("modify sibling file");
+    let quiet = executor.timer(Duration::from_secs(1)).fuse();
+    futures::pin_mut!(quiet);
+    futures::select_biased! {
+        batch = events.next().fuse() => panic!("outside-parent sibling invalidated watched file: {batch:?}"),
+        _ = quiet => {},
+    }
+
+    fs.atomic_write(file.clone(), "replacement".into())
+        .await
+        .expect("atomically replace watched file");
+    assert!(
+        watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+            path == file
+        })
+        .await,
+        "atomic replacement must be observed"
+    );
+    std::fs::write(&file, b"after replacement").expect("modify replaced file");
+    assert!(
+        watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+            path == file
+        })
+        .await,
+        "watching must survive atomic replacement"
+    );
+
+    std::fs::remove_file(&file).expect("delete watched file");
+    let removed = next_watcher_batch(&mut events, &executor).await;
+    assert!(
+        removed
+            .iter()
+            .any(|event| event.path == file && event.kind == Some(PathEventKind::Removed)),
+        "file deletion must preserve its event kind: {removed:?}"
+    );
+    std::fs::write(&file, b"recreated").expect("recreate watched file");
+    let created = next_watcher_batch(&mut events, &executor).await;
+    assert!(
+        created
+            .iter()
+            .any(|event| event.path == file && event.kind == Some(PathEventKind::Created)),
+        "file recreation must preserve its event kind: {created:?}"
+    );
+
+    let additional = root.join("additional.txt");
+    watcher.add(&additional).expect("add another watched file");
+    assert!(
+        next_watcher_batch(&mut events, &executor)
+            .await
+            .iter()
+            .any(|event| event.path == additional)
+    );
+    std::fs::write(&additional, b"first").expect("create additional watched file");
+    assert!(
+        watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+            path == additional
+        })
+        .await
+    );
+    watcher
+        .remove(&additional)
+        .expect("remove additional file watch");
+    std::fs::write(&additional, b"unwatched").expect("modify unwatched file");
+    let quiet = executor.timer(Duration::from_secs(1)).fuse();
+    futures::pin_mut!(quiet);
+    loop {
+        futures::select_biased! {
+            batch = events.next().fuse() => {
+                let batch = batch.expect("watcher stream ended");
+                assert!(batch.iter().all(|event| event.path != additional));
+            }
+            _ = quiet => break,
+        }
+    }
+    drop(events);
+    drop(watcher);
+}
+
+#[gpui::test]
+#[cfg(unix)]
+async fn test_realfs_watch_symlink_file_retargeting(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let fs = RealFs::new(None, executor.clone());
+    let directory = TempDir::new().expect("create temporary directory");
+    let parent = std::fs::canonicalize(directory.path()).expect("resolve temporary directory");
+    let parent = util::paths::SanitizedPath::new(&parent)
+        .as_path()
+        .to_path_buf();
+    let repository = parent.join("repository");
+    std::fs::create_dir(&repository).expect("create repository directory");
+    let initialized = smol::process::Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .current_dir(&repository)
+        .output()
+        .await
+        .expect("initialize repository");
+    assert!(
+        initialized.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+
+    for (name, symlink_ancestor, initially_symlinked, initially_missing) in [
+        ("file", false, true, false),
+        ("directory", true, true, false),
+        ("plain-file", false, false, false),
+        ("missing-parent", true, false, true),
+    ] {
+        let target_a = parent.join(format!("{name}-target-a"));
+        let target_b = parent.join(format!("{name}-target-b"));
+        std::fs::create_dir(&target_a).expect("create original target directory");
+        std::fs::create_dir(&target_b).expect("create new target directory");
+        let file_a = target_a.join("watched.txt");
+        let file_b = target_b.join("watched.txt");
+        std::fs::write(&file_a, b"original").expect("create original target file");
+        std::fs::write(&file_b, b"new target").expect("create new target file");
+        let link = repository.join(format!("{name}-link"));
+        let (original_target, new_target, watched_path) = if symlink_ancestor {
+            (&target_a, &target_b, link.join("watched.txt"))
+        } else {
+            (&file_a, &file_b, link.clone())
+        };
+        if initially_symlinked {
+            std::os::unix::fs::symlink(original_target, &link).expect("create watched symlink");
+        } else if !initially_missing {
+            std::fs::write(&watched_path, b"original").expect("create watched file");
+        }
+        let (mut events, watcher) = fs
+            .watch_file(&watched_path, Duration::from_millis(100))
+            .await;
+        assert!(
+            next_watcher_batch(&mut events, &executor)
+                .await
+                .iter()
+                .any(|event| event.kind == Some(PathEventKind::Rescan))
+        );
+
+        if !initially_missing {
+            let original_file = if initially_symlinked {
+                &file_a
+            } else {
+                &watched_path
+            };
+            std::fs::write(original_file, b"changed original").expect("modify watched file");
+            assert!(
+                watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+                    path == watched_path
+                })
+                .await,
+                "{name} file changes must use the watched path"
+            );
+        }
+
+        if !initially_missing {
+            std::fs::remove_file(&link).expect("remove original watched entry");
+        }
+        std::os::unix::fs::symlink(new_target, &link).expect("retarget watched symlink");
+        assert!(
+            watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+                path == watched_path
+            })
+            .await,
+            "retargeting the {name} symlink must invalidate the watched path"
+        );
+        assert!(file_a.is_file(), "the old target must remain present");
+        assert_eq!(
+            fs.load(&watched_path).await.expect("load retargeted file"),
+            "new target"
+        );
+
+        {
+            let quiet = executor.timer(Duration::from_millis(500)).fuse();
+            let timeout = executor.timer(Duration::from_secs(5)).fuse();
+            futures::pin_mut!(quiet, timeout);
+            loop {
+                futures::select_biased! {
+                    batch = events.next().fuse() => {
+                        batch.expect("watcher stream ended");
+                        quiet.set(executor.timer(Duration::from_millis(500)).fuse());
+                    }
+                    _ = quiet => break,
+                    _ = timeout => panic!("{name} watcher did not settle after retargeting"),
+                }
+            }
+        }
+        std::fs::write(&file_b, b"changed new target").expect("modify new symlink target");
+        assert!(
+            watcher_delivered_event(&mut events, &executor, Duration::from_secs(5), &|path| {
+                path == watched_path
+            })
+            .await,
+            "edits after retargeting the {name} symlink must remain observed"
+        );
+        drop(events);
+        drop(watcher);
+    }
+}
+
 #[gpui::test]
 async fn test_realfs_watcher_diagnostics(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     cx.executor().allow_parking();

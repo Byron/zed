@@ -1,5 +1,6 @@
 pub mod fs_watcher;
 mod git_clone_progress;
+mod repository_watcher;
 
 use parking_lot::Mutex;
 use slotmap::{KeyData, SlotMap};
@@ -180,6 +181,18 @@ pub trait Fs: Send + Sync {
         Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
         Arc<dyn Watcher>,
     );
+
+    /// Preserve file invalidations even before the file exists, without treating a missing directory as a file.
+    async fn watch_file(
+        &self,
+        path: &Path,
+        latency: Duration,
+    ) -> (
+        Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
+        Arc<dyn Watcher>,
+    ) {
+        self.watch(path, latency).await
+    }
 
     fn open_repo(
         &self,
@@ -560,8 +573,6 @@ impl FileHandle for std::fs::File {
         Ok(PathBuf::from(os_str))
     }
 }
-
-pub struct RealWatcher {}
 
 impl RealFs {
     pub fn new(git_binary_path: Option<PathBuf>, executor: BackgroundExecutor) -> Arc<Self> {
@@ -1221,6 +1232,13 @@ impl Fs for RealFs {
             .this
             .upgrade()
             .expect("RealFs is only constructed inside an Arc");
+        if path.is_file()
+            && !self.requires_poll_watcher(path)
+            && let Some(watcher) =
+                repository_watcher::watch(this.clone(), path, self.executor.clone(), latency).await
+        {
+            return watcher;
+        }
         fs_watcher::watch(
             this,
             self.native_watcher.clone(),
@@ -1230,6 +1248,24 @@ impl Fs for RealFs {
             latency,
         )
         .await
+    }
+
+    async fn watch_file(
+        &self,
+        path: &Path,
+        latency: Duration,
+    ) -> (
+        Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
+        Arc<dyn Watcher>,
+    ) {
+        if !self.requires_poll_watcher(path)
+            && let Some(this) = self.this.upgrade()
+            && let Some(watcher) =
+                repository_watcher::watch(this, path, self.executor.clone(), latency).await
+        {
+            return watcher;
+        }
+        self.watch(path, latency).await
     }
 
     fn open_repo(
@@ -1430,17 +1466,6 @@ impl Fs for RealFs {
         rx.await.expect("Restore all never panics")?;
         self.trash.lock().remove(trash_id);
         Ok(restored_item_path)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-impl Watcher for RealWatcher {
-    fn add(&self, _: &Path) -> Result<()> {
-        Ok(())
-    }
-
-    fn remove(&self, _: &Path) -> Result<()> {
-        Ok(())
     }
 }
 

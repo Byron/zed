@@ -990,7 +990,7 @@ impl GitStore {
 
                     cx.spawn(async move |this, cx| {
                         let (mut watcher, _) =
-                            fs.watch(&path, GIT_CHANGE_COLLECTION_INTERVAL).await;
+                            fs.watch_file(&path, GIT_CHANGE_COLLECTION_INTERVAL).await;
                         while watcher.next().await.is_some() {
                             let Ok(()) = this.update(cx, |this, cx| {
                                 let GitStoreState::Local {
@@ -2556,7 +2556,11 @@ impl GitStore {
 
         match event {
             WorktreeStoreEvent::WorktreeUpdatedEntries(worktree_id, updated_entries) => {
-                if !fs.is_fake() {
+                if self
+                    .repositories
+                    .values()
+                    .all(|repo| repo.read(cx).monitoring)
+                {
                     return;
                 }
                 if let Some(worktree) = self
@@ -2573,7 +2577,9 @@ impl GitStore {
                         let paths_by_git_repo = paths_by_git_repo.await;
                         for (repo, paths) in paths_by_git_repo {
                             repo.update(cx, |repo, cx| {
-                                repo.paths_changed(paths, downstream.clone(), cx);
+                                if !repo.monitoring {
+                                    repo.paths_changed(paths, downstream.clone(), cx);
+                                }
                             });
                         }
                     })
@@ -6684,7 +6690,10 @@ impl Repository {
         is_trusted: bool,
         cx: &mut Context<Self>,
     ) {
-        self.monitoring = !fs.is_fake();
+        self.monitoring = !fs.is_fake()
+            && !fs.requires_poll_watcher(&self.snapshot.work_directory_abs_path)
+            && !fs.requires_poll_watcher(&self.snapshot.common_dir_abs_path)
+            && !fs.requires_poll_watcher(&self.snapshot.repository_dir_abs_path);
         self._monitor_task = None;
         let work_directory_abs_path = self.snapshot.work_directory_abs_path.clone();
         let dot_git_abs_path = self.snapshot.dot_git_abs_path.clone();
@@ -10539,8 +10548,20 @@ impl Repository {
             let Some(state) = state.await.log_err() else {
                 return;
             };
+            let monitor_dependencies = || {
+                paths::global_gitignore_path()
+                    .into_iter()
+                    .map(|path| gix::notify::InvalidationPath {
+                        path,
+                        changes: Changes {
+                            ignores: true,
+                            ..Changes::default()
+                        },
+                    })
+                    .collect::<Vec<_>>()
+            };
             let mut monitor = loop {
-                match state.backend.monitor() {
+                match state.backend.monitor(&monitor_dependencies()) {
                     Ok(Some(monitor)) => break monitor,
                     Ok(None) => return,
                     Err(error) => log::error!("starting repository monitor: {error:#}"),
@@ -10564,7 +10585,7 @@ impl Repository {
                         || outcome.changes.references
                         || outcome.changes.layout
                     {
-                        match state.backend.monitor() {
+                        match state.backend.monitor(&monitor_dependencies()) {
                             Ok(Some(replacement)) => {
                                 if replacement.options().additional_paths
                                     != monitor.options().additional_paths
@@ -10602,6 +10623,28 @@ impl Repository {
     }
 
     fn apply_monitor_changes(&mut self, mut changes: Changes, cx: &mut Context<Self>) {
+        if changes.ignores || changes.configuration || changes.layout {
+            let git_store = self.git_store.clone();
+            let repository_id = self.id;
+            cx.defer(move |cx| {
+                git_store
+                    .read_with(cx, |git_store, cx| {
+                        let Some(entries) = git_store.worktree_entries.get(&repository_id) else {
+                            return;
+                        };
+                        for worktree in git_store.worktree_store.read(cx).worktrees() {
+                            if let Some(local) = worktree.read(cx).as_local()
+                                && entries
+                                    .iter()
+                                    .any(|(worktree_id, _)| *worktree_id == local.id())
+                            {
+                                drop(local.refresh_git_ignores());
+                            }
+                        }
+                    })
+                    .log_err();
+            });
+        }
         let updates_tx = self
             .git_store()
             .and_then(|git_store| match &git_store.read(cx).state {

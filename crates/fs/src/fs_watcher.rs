@@ -1,26 +1,30 @@
 use collections::FxHashMap;
-use futures::{Stream, StreamExt as _};
+use futures::{Future, FutureExt as _, Stream};
 use gpui::{BackgroundExecutor, Task};
 use notify::{Event, EventKind};
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     ops::DerefMut,
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Poll, ready},
+    time::Duration,
 };
 use util::{ResultExt, paths::SanitizedPath};
 
 use crate::{Fs, PathEvent, PathEventKind, Watcher};
 
+const MAX_DISPATCH_BATCH_SIZE: usize = 256;
+
 mod diagnostics;
 pub use diagnostics::{
     WatchDiagnosticEvent, WatchRecording, WatchRoot, WatchSnapshot, WatcherSnapshot,
 };
-
-const MAX_DISPATCH_BATCH_SIZE: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum OsWatcherKind {
@@ -29,10 +33,9 @@ pub enum OsWatcherKind {
 }
 
 impl OsWatcherKind {
-    /// Poll watches and native macOS/Windows watches cover their whole subtree;
-    /// native Linux (inotify) watches cover one directory.
     fn is_recursive(self) -> bool {
-        self == Self::Poll || cfg!(any(target_os = "windows", target_os = "macos"))
+        // Emulating recursion would visit directories beyond the scanner's depth and ignore limits.
+        self == Self::Poll || gix_notify::asynchronous::Watcher::supports_native_recursive_watches()
     }
 }
 
@@ -47,12 +50,12 @@ pub(crate) async fn watch(
     Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
     Arc<dyn Watcher>,
 ) {
-    let (tx, rx) = async_channel::unbounded();
+    let (tx, rx) = async_channel::bounded(1);
     let pending_paths: Arc<Mutex<Vec<PathEvent>>> = Default::default();
 
     let watcher: Arc<dyn Watcher> = Arc::new(FsWatcher::new(
-        native_watcher,
-        poll_watcher,
+        native_watcher.clone(),
+        poll_watcher.clone(),
         fs.clone(),
         executor.clone(),
         tx,
@@ -63,8 +66,9 @@ pub(crate) async fn watch(
         log::warn!("Failed to watch {}:\n{e}", path.display());
     }
 
-    // Check if path is a symlink and follow the target parent
-    if let Some(mut target) = fs.read_link(path).await.ok() {
+    if (fs.is_fake() || fs.requires_poll_watcher(path))
+        && let Some(mut target) = fs.read_link(path).await.ok()
+    {
         log::trace!("watch symlink {path:?} -> {target:?}");
         // Check if symlink target is relative path, if so make it absolute
         if target.is_relative()
@@ -75,7 +79,7 @@ pub(crate) async fn watch(
                 target = SanitizedPath::new(&canonical).as_path().to_path_buf();
             }
         }
-        watcher.add(&target).ok();
+        watcher.add(&target).log_err();
         // Skipped for poll watchers: PollWatcher::watch() recursively scans
         // at registration, blocking on large virtual filesystem mounts
         if let Some(parent) = target.parent()
@@ -85,25 +89,52 @@ pub(crate) async fn watch(
         }
     }
 
+    native_watcher.synchronize_registrations().await.log_err();
+
     (
-        Box::pin(rx.filter_map({
-            let watcher = watcher.clone();
-            move |_| {
-                let _ = watcher.clone();
-                let pending_paths = pending_paths.clone();
-                let executor = executor.clone();
-                async move {
-                    if !latency.is_zero() {
-                        executor.timer(latency).await;
-                    }
-                    let paths = std::mem::take(&mut *pending_paths.lock());
-                    log::debug!("pending path events: {:?}", paths);
-                    (!paths.is_empty()).then_some(paths)
-                }
-            }
-        })),
+        event_stream(rx, pending_paths, watcher.clone(), executor, latency),
         watcher,
     )
+}
+
+pub(crate) fn event_stream(
+    receiver: async_channel::Receiver<()>,
+    pending_paths: Arc<Mutex<Vec<PathEvent>>>,
+    watcher: Arc<dyn Watcher>,
+    executor: BackgroundExecutor,
+    latency: Duration,
+) -> Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>> {
+    let mut receiver = Box::pin(receiver);
+    let mut delay: Option<Task<()>> = None;
+    let stream = futures::stream::poll_fn({
+        let watcher = watcher.clone();
+        move |cx| {
+            let _watcher = &watcher;
+            loop {
+                if let Some(timer) = &mut delay {
+                    ready!(Pin::new(timer).poll(cx));
+                    delay = None;
+                    let paths = std::mem::take(&mut *pending_paths.lock());
+                    if !paths.is_empty() {
+                        return Poll::Ready(Some(paths));
+                    }
+                }
+                let Some(()) = ready!(receiver.as_mut().poll_next(cx)) else {
+                    return Poll::Ready(None);
+                };
+                if latency.is_zero() {
+                    let paths = std::mem::take(&mut *pending_paths.lock());
+                    if !paths.is_empty() {
+                        return Poll::Ready(Some(paths));
+                    }
+                } else {
+                    // Keep the timer in the stream so cancelling `next()` cannot consume its wakeup.
+                    delay = Some(executor.timer(latency));
+                }
+            }
+        }
+    });
+    Box::pin(stream)
 }
 
 pub struct FsWatcher {
@@ -113,6 +144,7 @@ pub struct FsWatcher {
     executor: BackgroundExecutor,
     tx: async_channel::Sender<()>,
     pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
+    rescan_roots: Arc<Mutex<HashMap<WatchKey, PathBuf>>>,
     registrations: Arc<Mutex<HashMap<WatchKey, FsWatcherRegistration>>>,
     pending_registrations: Arc<Mutex<HashMap<Arc<std::path::Path>, Task<()>>>>,
 }
@@ -139,6 +171,7 @@ impl FsWatcher {
             executor,
             tx,
             pending_path_events,
+            rescan_roots: Default::default(),
             registrations: Default::default(),
             pending_registrations: Default::default(),
         }
@@ -147,16 +180,17 @@ impl FsWatcher {
     fn add_existing_path(&self, path: Arc<Path>) -> anyhow::Result<()> {
         let case_insensitive = !self.fs.is_path_case_sensitive(&path);
         let key = WatchKey::for_registration(SanitizedPath::new(&path), case_insensitive);
-        let existing = self.registrations.lock().get(&key).cloned();
-        if let Some(existing) = existing {
-            log::trace!("path to watch is already registered: {path:?}");
-            return existing.os_watcher.rewatch_if_stale(
-                &mut existing.os_watcher.state.lock(),
-                SanitizedPath::new(&path),
-                &key,
-            );
+        {
+            let mut roots = self.rescan_roots.lock();
+            roots.remove(&WatchKey::exact(SanitizedPath::new(&path)));
+            roots.remove(&WatchKey::folded(SanitizedPath::new(&path)));
+            roots.insert(key.clone(), path.to_path_buf());
         }
-        match register_existing_path(
+        let existing = self.registrations.lock().get(&key).cloned();
+        if existing.is_some() {
+            return Ok(());
+        }
+        let registration = match register_existing_path(
             &self.native_watcher,
             &self.poll_watcher,
             self.fs.as_ref(),
@@ -164,18 +198,15 @@ impl FsWatcher {
             case_insensitive,
             self.tx.clone(),
             self.pending_path_events.clone(),
-        )? {
-            Some(registration) => {
-                self.registrations.lock().insert(key, registration);
-            }
-            None => {
-                // Registration was skipped (e.g. the native watch-limit cooldown
-                // is active). Retry in the background rather than silently leaving
-                // the path unwatched forever.
-                log::warn!("watch registration for {path:?} was skipped; retrying in background");
+            self.rescan_roots.clone(),
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
                 self.add_pending_path(path);
+                return Err(error);
             }
-        }
+        };
+        self.registrations.lock().insert(key, registration);
         Ok(())
     }
 
@@ -193,6 +224,7 @@ impl FsWatcher {
             path.clone(),
             self.tx.clone(),
             self.pending_path_events.clone(),
+            self.rescan_roots.clone(),
             self.registrations.clone(),
             self.pending_registrations.clone(),
         ));
@@ -203,6 +235,7 @@ impl FsWatcher {
 impl Drop for FsWatcher {
     fn drop(&mut self) {
         self.pending_registrations.lock().clear();
+        self.rescan_roots.lock().clear();
 
         let mut registrations = HashMap::new();
         {
@@ -239,6 +272,11 @@ impl Watcher for FsWatcher {
         }
 
         if !self.fs.path_exists(&path) {
+            let key = WatchKey::for_registration(
+                SanitizedPath::new(&path),
+                !self.fs.is_path_case_sensitive(&path),
+            );
+            self.rescan_roots.lock().insert(key, path.to_path_buf());
             self.add_pending_path(path);
             return Ok(());
         }
@@ -251,6 +289,11 @@ impl Watcher for FsWatcher {
         self.pending_registrations.lock().remove(path);
 
         let sanitized = SanitizedPath::new(path);
+        {
+            let mut roots = self.rescan_roots.lock();
+            roots.remove(&WatchKey::exact(sanitized));
+            roots.remove(&WatchKey::folded(sanitized));
+        }
         let registration = {
             let mut registrations = self.registrations.lock();
             registrations
@@ -264,13 +307,17 @@ impl Watcher for FsWatcher {
     }
 }
 
-/// Whether a recursive registration on a strict ancestor of `path` already covers
-/// it. Both key spellings are probed so a folded registration still matches; only
-/// poll watches and native macOS/Windows watches are recursive.
 fn path_covered_by_recursive_registration(
     registrations: &HashMap<WatchKey, FsWatcherRegistration>,
     path: &SanitizedPath,
 ) -> bool {
+    if path
+        .as_path()
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return false;
+    }
     path.as_path().ancestors().skip(1).any(|ancestor| {
         let ancestor = SanitizedPath::unchecked_new(ancestor);
         [WatchKey::exact(ancestor), WatchKey::folded(ancestor)]
@@ -304,7 +351,11 @@ pub fn requires_poll_watcher(path: &Path) -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        return detect_requires_poll_watcher_linux(path);
+        let existing = path
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .unwrap_or(path);
+        return detect_requires_poll_watcher_linux(existing);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -322,7 +373,8 @@ fn register_existing_path(
     case_insensitive: bool,
     tx: async_channel::Sender<()>,
     pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
-) -> anyhow::Result<Option<FsWatcherRegistration>> {
+    rescan_roots: Arc<Mutex<HashMap<WatchKey, PathBuf>>>,
+) -> anyhow::Result<FsWatcherRegistration> {
     let os_watcher = if fs.requires_poll_watcher(path.as_ref()) {
         log::info!(
             "Using poll watcher ({}ms interval) for {}",
@@ -336,7 +388,7 @@ fn register_existing_path(
     };
     let root_path = SanitizedPath::new_arc(path.as_ref());
     let path_for_callback = path.clone();
-    let Some(registration_id) =
+    let registration_id =
         os_watcher.add(path, case_insensitive, move |event: &notify::Event| {
             log::trace!("watcher received event: {event:?}");
             push_notify_event(
@@ -346,15 +398,13 @@ fn register_existing_path(
                 case_insensitive,
                 path_for_callback.as_ref(),
                 event,
+                &rescan_roots,
             );
-        })?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(FsWatcherRegistration {
+        })?;
+    Ok(FsWatcherRegistration {
         id: registration_id,
         os_watcher: os_watcher.clone(),
-    }))
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -572,7 +622,6 @@ impl WatchKey {
             use unicode_normalization::UnicodeNormalization as _;
             lossy.chars().nfc().collect::<String>().to_lowercase()
         }
-
         #[cfg(not(target_os = "macos"))]
         lossy.to_lowercase()
     }
@@ -594,6 +643,7 @@ async fn poll_path_until_created(
     path: Arc<Path>,
     tx: async_channel::Sender<()>,
     pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
+    rescan_roots: Arc<Mutex<HashMap<WatchKey, PathBuf>>>,
     registrations: Arc<Mutex<HashMap<WatchKey, FsWatcherRegistration>>>,
     pending_registrations: Arc<Mutex<HashMap<Arc<Path>, Task<()>>>>,
 ) {
@@ -621,6 +671,12 @@ async fn poll_path_until_created(
             .await
         };
         let key = WatchKey::for_registration(SanitizedPath::new(&path), case_insensitive);
+        {
+            let mut roots = rescan_roots.lock();
+            roots.remove(&WatchKey::exact(SanitizedPath::new(&path)));
+            roots.remove(&WatchKey::folded(SanitizedPath::new(&path)));
+            roots.insert(key.clone(), path.to_path_buf());
+        }
 
         if registrations.lock().contains_key(&key) {
             pending_registrations.lock().remove(path.as_ref());
@@ -631,6 +687,7 @@ async fn poll_path_until_created(
             let path = path.clone();
             let tx = tx.clone();
             let pending_path_events = pending_path_events.clone();
+            let rescan_roots = rescan_roots.clone();
             let fs = fs.clone();
             let native_watcher = native_watcher.clone();
             let poll_watcher = poll_watcher.clone();
@@ -643,6 +700,7 @@ async fn poll_path_until_created(
                     case_insensitive,
                     tx,
                     pending_path_events,
+                    rescan_roots,
                 )
             }
         };
@@ -653,7 +711,7 @@ async fn poll_path_until_created(
         };
 
         match registration {
-            Ok(Some(registration)) => {
+            Ok(registration) => {
                 {
                     let mut pending_registrations = pending_registrations.lock();
                     if pending_registrations.remove(path.as_ref()).is_none() {
@@ -675,10 +733,10 @@ async fn poll_path_until_created(
                             kind: Some(PathEventKind::Rescan),
                         },
                     ],
+                    || rescan_roots.lock().values().cloned().collect(),
                 );
                 return;
             }
-            Ok(None) => {}
             Err(error) => {
                 log::warn!("failed to watch newly-created path {path:?}: {error}; retrying");
             }
@@ -686,10 +744,11 @@ async fn poll_path_until_created(
     }
 }
 
-fn enqueue_path_events(
+pub(crate) fn enqueue_path_events(
     tx: &smol::channel::Sender<()>,
     pending_path_events: &Arc<Mutex<Vec<PathEvent>>>,
     mut path_events: Vec<PathEvent>,
+    rescan_roots: impl FnOnce() -> Vec<PathBuf>,
 ) {
     if path_events.is_empty() {
         return;
@@ -697,13 +756,35 @@ fn enqueue_path_events(
 
     path_events.sort();
     let mut pending_paths = pending_path_events.lock();
-    if pending_paths.is_empty() {
-        tx.try_send(()).ok();
-    }
+    let needs_wakeup = pending_paths.is_empty();
     coalesce_pending_rescans(&mut pending_paths, &mut path_events);
     util::extend_sorted(&mut *pending_paths, path_events, usize::MAX, |a, b| {
         a.path.cmp(&b.path)
     });
+    if pending_paths.len() > MAX_PENDING_EVENTS
+        || pending_paths
+            .iter()
+            .map(|event| event.path.as_os_str().len())
+            .sum::<usize>()
+            > MAX_PENDING_BYTES
+    {
+        *pending_paths = rescan_roots()
+            .into_iter()
+            .map(|path| PathEvent {
+                path,
+                kind: Some(PathEventKind::Rescan),
+            })
+            .collect();
+        pending_paths.sort();
+        pending_paths.dedup();
+    }
+    if needs_wakeup {
+        match tx.try_send(()) {
+            Ok(())
+            | Err(async_channel::TrySendError::Full(()))
+            | Err(async_channel::TrySendError::Closed(())) => {}
+        }
+    }
 }
 
 fn push_notify_event(
@@ -713,6 +794,7 @@ fn push_notify_event(
     case_insensitive: bool,
     watched_root: &Path,
     event: &notify::Event,
+    rescan_roots: &Mutex<HashMap<WatchKey, PathBuf>>,
 ) {
     let kind = match event.kind {
         EventKind::Create(_) => Some(PathEventKind::Created),
@@ -748,7 +830,9 @@ fn push_notify_event(
         }
     }
     log::trace!("path_events: {:?}", path_events);
-    enqueue_path_events(tx, pending_path_events, path_events);
+    enqueue_path_events(tx, pending_path_events, path_events, || {
+        rescan_roots.lock().values().cloned().collect()
+    });
 }
 
 fn coalesce_pending_rescans(pending_paths: &mut Vec<PathEvent>, path_events: &mut Vec<PathEvent>) {
@@ -797,16 +881,12 @@ fn coalesce_pending_rescans(pending_paths: &mut Vec<PathEvent>, path_events: &mu
     });
 }
 
-fn path_depth(path: &SanitizedPath) -> usize {
-    path.as_path().components().count()
-}
-
 fn is_covered_rescan(kind: Option<PathEventKind>, path: &Path, ancestor: &Path) -> bool {
     kind == Some(PathEventKind::Rescan) && path != ancestor && path.starts_with(ancestor)
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct WatcherRegistrationId(u32);
+pub struct WatcherRegistrationId(u64);
 
 struct WatcherRegistrationState {
     callback: Arc<dyn Fn(&notify::Event) + Send + Sync>,
@@ -815,115 +895,15 @@ struct WatcherRegistrationState {
 
 struct PathRegistrationState {
     path: Arc<SanitizedPath>,
-    /// Empty while a backend watch is retained for covered descendants that
-    /// could not get their own backend watch.
     watcher_ids: Vec<WatcherRegistrationId>,
-    coverage: Coverage,
-    stale: bool,
+    case_insensitive: bool,
 }
 
-enum Coverage {
-    /// Has its own backend watch. On recursive backends, that watch also
-    /// serves the descendant registrations listed here by [`path_depth`] and
-    /// key, so promotion proceeds shallowest first without re-sorting.
-    Watched {
-        covered: BTreeSet<(usize, WatchKey)>,
-    },
-    /// Served by the recursive backend watch of this ancestor registration.
-    CoveredBy(WatchKey),
-}
-
-/// The registered watch paths for one backend, keyed by [`WatchKey`] so that
-/// add (dedup), remove, and dispatch share a single notion of path identity.
 #[derive(Default)]
-struct WatchPaths(FxHashMap<WatchKey, PathRegistrationState>);
-
-impl WatchPaths {
-    fn contains(&self, key: &WatchKey) -> bool {
-        self.0.contains_key(key)
-    }
-
-    fn get_mut(&mut self, key: &WatchKey) -> Option<&mut PathRegistrationState> {
-        self.0.get_mut(key)
-    }
-
-    /// The nearest strict ancestor whose recursive backend watch covers `path`.
-    /// Only poll watches and native macOS/Windows watches are recursive.
-    fn covering_ancestor(&self, path: &SanitizedPath, recursive: bool) -> Option<WatchKey> {
-        if !recursive {
-            return None;
-        }
-        path.as_path().ancestors().skip(1).find_map(|ancestor| {
-            let ancestor = SanitizedPath::unchecked_new(ancestor);
-            [WatchKey::exact(ancestor), WatchKey::folded(ancestor)]
-                .into_iter()
-                .find(|key| {
-                    self.0.get(key).is_some_and(|registration| {
-                        matches!(registration.coverage, Coverage::Watched { .. })
-                    })
-                })
-        })
-    }
-
-    fn covered_by_mut(&mut self, key: &WatchKey) -> Option<&mut BTreeSet<(usize, WatchKey)>> {
-        match &mut self.0.get_mut(key)?.coverage {
-            Coverage::Watched { covered } => Some(covered),
-            Coverage::CoveredBy(_) => None,
-        }
-    }
-
-    /// Collects the watcher ids of every registration whose directory is an
-    /// ancestor of (or equal to) `path`. Both exact and folded keys are probed,
-    /// so a real-cased event path matches a folded registration and vice versa.
-    fn watcher_ids_covering(&self, path: &SanitizedPath, ids: &mut Vec<WatcherRegistrationId>) {
-        for ancestor in path.as_path().ancestors() {
-            let ancestor = SanitizedPath::unchecked_new(ancestor);
-            if let Some(registration) = self.0.get(&WatchKey::exact(ancestor)) {
-                ids.extend_from_slice(&registration.watcher_ids);
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            if let Some(registration) = self.0.get(&WatchKey::folded(ancestor)) {
-                ids.extend_from_slice(&registration.watcher_ids);
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let folded_path = WatchKey::folded_path(path);
-            for ancestor in Path::new(&folded_path).ancestors() {
-                let key = WatchKey::Folded(Arc::from(ancestor.to_string_lossy().as_ref()));
-                if let Some(registration) = self.0.get(&key) {
-                    ids.extend_from_slice(&registration.watcher_ids);
-                }
-            }
-        }
-    }
-}
-
 struct WatcherState {
     watchers: HashMap<WatcherRegistrationId, WatcherRegistrationState>,
-    paths: WatchPaths,
-    cooldown_until: Option<Instant>,
+    paths: FxHashMap<WatchKey, PathRegistrationState>,
     last_registration: WatcherRegistrationId,
-}
-
-impl WatcherState {
-    fn is_native_watch_limit_cooldown_active(&self) -> bool {
-        self.cooldown_until
-            .is_some_and(|cooldown_until| cooldown_until > Instant::now())
-    }
-
-    fn start_native_watch_limit_cooldown(&mut self, path: &Path) {
-        let should_log = !self.is_native_watch_limit_cooldown_active();
-        self.cooldown_until = Some(Instant::now() + *NATIVE_WATCH_LIMIT_COOLDOWN);
-        if should_log {
-            log::warn!(
-                "OS file watch limit reached while watching {path:?}; skipping new native file watcher registrations for {} seconds",
-                NATIVE_WATCH_LIMIT_COOLDOWN.as_secs()
-            );
-        }
-    }
 }
 
 pub(crate) trait WatchBackend: Send {
@@ -941,86 +921,120 @@ impl<T: notify::Watcher + Send> WatchBackend for T {
     }
 }
 
+enum NativeCommand {
+    Start(gix_notify::asynchronous::Watcher),
+    Replace,
+    Barrier(async_channel::Sender<()>),
+}
+
+fn request_native_replacement(
+    commands: &async_channel::Sender<NativeCommand>,
+    queued: &AtomicBool,
+) -> anyhow::Result<()> {
+    if !queued.swap(true, Ordering::AcqRel)
+        && let Err(error) = commands.try_send(NativeCommand::Replace)
+    {
+        queued.store(false, Ordering::Release);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 pub struct OsWatcher {
     kind: OsWatcherKind,
     recursive: bool,
     state: Arc<Mutex<WatcherState>>,
-
-    // Hold state across backend mutations. Callbacks don't acquire state or
-    // invert the lock order.
     backend: Mutex<Option<Box<dyn WatchBackend>>>,
+    native: bool,
+    native_started: Mutex<bool>,
+    commands: async_channel::Sender<NativeCommand>,
+    replacement_queued: Arc<AtomicBool>,
     event_tx: async_channel::Sender<notify::Result<notify::Event>>,
+    overflow: Arc<AtomicBool>,
+    _native_task: Task<()>,
     _dispatch_task: Task<()>,
     diagnostics: Arc<diagnostics::DiagnosticRecorder>,
-    // Closing the event channel can wake the dispatch task. Keep its scheduler
-    // alive through channel and task teardown, even when our owner drops first.
     _executor: BackgroundExecutor,
 }
 
 impl OsWatcher {
-    /// Watches with notify's backend of `kind`, created lazily on first use so
-    /// that a failure to start it can be reported by `ensure_backend`.
     pub fn new(kind: OsWatcherKind, executor: BackgroundExecutor) -> Arc<Self> {
         Self::with_backend(kind, executor, None)
     }
 
-    /// Watches with the given backend in place of notify's; `event_sink` is how
-    /// that backend reports events, standing in for notify's `EventHandler`.
     pub(crate) fn with_backend(
         kind: OsWatcherKind,
         executor: BackgroundExecutor,
         backend: Option<Box<dyn WatchBackend>>,
     ) -> Arc<Self> {
-        let (event_tx, event_rx) = async_channel::unbounded();
-        let state = Arc::new(Mutex::new(WatcherState {
-            watchers: Default::default(),
-            paths: Default::default(),
-            cooldown_until: None,
-            last_registration: Default::default(),
-        }));
+        let native = kind == OsWatcherKind::Native && backend.is_none();
+        let state = Arc::new(Mutex::new(WatcherState::default()));
+        let diagnostics = Arc::new(diagnostics::DiagnosticRecorder::default());
+        let (event_tx, event_rx) = async_channel::bounded(MAX_PENDING_EVENTS);
+        let overflow = Arc::new(AtomicBool::new(false));
         let dispatch_task = executor.spawn({
             let state = state.clone();
+            let overflow = overflow.clone();
+            let diagnostics = diagnostics.clone();
             async move {
                 let mut rescan_history = diagnostics::RescanHistory::default();
                 while let Ok(first) = event_rx.recv().await {
+                    if overflow.swap(false, Ordering::AcqRel) {
+                        let loss = Event::new(EventKind::Other)
+                            .set_flag(notify::event::Flag::Rescan)
+                            .set_info("filesystem event delivery overflowed");
+                        record_event(kind, &diagnostics, &Ok(loss.clone()));
+                        dispatch(kind, &state, Ok(loss));
+                    }
                     dispatch_batch(kind, &state, &mut rescan_history, first, &event_rx);
                     smol::future::yield_now().await;
                 }
             }
         });
+        let (commands, command_rx) = async_channel::unbounded();
+        let replacement_queued = Arc::new(AtomicBool::new(false));
+        let native_task = executor.spawn(native_notifications(
+            state.clone(),
+            {
+                let state = state.clone();
+                let diagnostics = diagnostics.clone();
+                move |event| {
+                    record_event(OsWatcherKind::Native, &diagnostics, &event);
+                    dispatch(OsWatcherKind::Native, &state, event);
+                }
+            },
+            command_rx,
+            executor.clone(),
+            kind.is_recursive(),
+            replacement_queued.clone(),
+        ));
         Arc::new(Self {
             kind,
             recursive: kind.is_recursive(),
             state,
             backend: Mutex::new(backend),
+            native,
+            native_started: Mutex::new(false),
+            commands,
+            replacement_queued,
             event_tx,
+            overflow,
+            _native_task: native_task,
             _dispatch_task: dispatch_task,
-            diagnostics: Default::default(),
+            diagnostics,
             _executor: executor,
         })
     }
 
-    /// The callback a substitute backend uses to report events, standing
-    /// in for the `EventHandler` notify would have been constructed with.
     pub(crate) fn event_sink(
         &self,
     ) -> impl Fn(notify::Result<notify::Event>) + Send + Sync + 'static {
-        let event_tx = self.event_tx.clone();
-        let diagnostics = self.diagnostics.clone();
-        let kind = self.kind;
-        move |event| {
-            diagnostics.record(|| match &event {
-                Ok(event) => WatchDiagnosticEvent::from_notify_event(kind, event),
-                Err(error) => WatchDiagnosticEvent::new(
-                    kind,
-                    "error",
-                    &error.paths,
-                    format!("{error:?}"),
-                    false,
-                ),
-            });
-            enqueue(&event_tx, event);
-        }
+        event_sink(
+            self.kind,
+            self.event_tx.clone(),
+            self.diagnostics.clone(),
+            self.overflow.clone(),
+        )
     }
 
     pub(crate) fn is_recursive(&self) -> bool {
@@ -1030,244 +1044,87 @@ impl OsWatcher {
     #[must_use]
     fn add(
         &self,
-        path: Arc<std::path::Path>,
+        path: Arc<Path>,
         case_insensitive: bool,
-        cb: impl Fn(&notify::Event) + Send + Sync + 'static,
-    ) -> anyhow::Result<Option<WatcherRegistrationId>> {
+        callback: impl Fn(&notify::Event) + Send + Sync + 'static,
+    ) -> anyhow::Result<WatcherRegistrationId> {
         let path = SanitizedPath::from_arc(path);
         let key = WatchKey::for_registration(&path, case_insensitive);
         let mut state = self.state.lock();
-        let new_coverage = if state.paths.contains(&key) {
-            self.rewatch_if_stale(&mut state, &path, &key)?;
-            None
-        } else if let Some(ancestor) = state.paths.covering_ancestor(&path, self.recursive) {
-            Some(Coverage::CoveredBy(ancestor))
-        } else {
-            if self.kind == OsWatcherKind::Native && state.is_native_watch_limit_cooldown_active() {
-                self.diagnostics.record(|| {
-                    WatchDiagnosticEvent::new(
-                        self.kind,
-                        "watch_skipped",
-                        &[path.as_path().to_owned()],
-                        "Native watch limit cooldown is active; registration will be retried"
-                            .into(),
-                        false,
-                    )
-                });
-                return Ok(None);
+        let is_new = !state.paths.contains_key(&key);
+        if is_new {
+            self.ensure_backend()?;
+            if !self.native {
+                self.watch(path.as_path())?;
             }
-
-            match self.watch(path.as_path()) {
-                Ok(()) => {}
-                Err(error)
-                    if self.kind == OsWatcherKind::Native && is_max_files_watch_error(&error) =>
-                {
-                    state.start_native_watch_limit_cooldown(path.as_path());
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            }
-            Some(Coverage::Watched {
-                covered: BTreeSet::new(),
-            })
-        };
-
+        }
         let id = state.last_registration;
-        state.last_registration = WatcherRegistrationId(id.0 + 1);
-
-        let registration_state = WatcherRegistrationState {
-            callback: Arc::new(cb),
-            key: key.clone(),
-        };
-        state.watchers.insert(id, registration_state);
-        match new_coverage {
-            None => {
-                if let Some(registration) = state.paths.get_mut(&key) {
-                    registration.watcher_ids.push(id);
-                }
-            }
-            Some(coverage) => {
-                if let Coverage::CoveredBy(ancestor) = &coverage
-                    && let Some(covered) = state.paths.covered_by_mut(ancestor)
-                {
-                    covered.insert((path_depth(&path), key.clone()));
-                }
-                state.paths.0.insert(
-                    key,
-                    PathRegistrationState {
-                        path,
-                        watcher_ids: vec![id],
-                        coverage,
-                        stale: false,
-                    },
-                );
-            }
-        }
-
-        Ok(Some(id))
-    }
-
-    fn rewatch_if_stale(
-        &self,
-        state: &mut WatcherState,
-        path: &SanitizedPath,
-        key: &WatchKey,
-    ) -> anyhow::Result<()> {
-        let Some(path_state) = state.paths.get_mut(key) else {
-            return Ok(());
-        };
-        if !path_state.stale {
-            return Ok(());
-        }
-
-        log::trace!("rewatching stale path: {path:?}");
-        // A renamed directory's watch survives under the old path; unwatch it
-        // so the backend won't skip installation as a duplicate.
-        self.unwatch(path.as_path()).log_err();
-        self.watch(path.as_path())?;
-        path_state.stale = false;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn dispatch(&self, event: notify::Result<notify::Event>) {
-        dispatch(self.kind, &self.state, event);
-    }
-
-    #[cfg(test)]
-    fn dispatch_batch(
-        &self,
-        first: notify::Result<notify::Event>,
-        event_rx: &async_channel::Receiver<notify::Result<notify::Event>>,
-    ) {
-        dispatch_batch(
-            self.kind,
-            &self.state,
-            &mut diagnostics::RescanHistory::default(),
-            first,
-            event_rx,
+        state.last_registration = WatcherRegistrationId(
+            id.0.checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("watch registration IDs exhausted"))?,
         );
+        state.watchers.insert(
+            id,
+            WatcherRegistrationState {
+                callback: Arc::new(callback),
+                key: key.clone(),
+            },
+        );
+        state
+            .paths
+            .entry(key)
+            .or_insert_with(|| PathRegistrationState {
+                path: path.clone(),
+                watcher_ids: Vec::new(),
+                case_insensitive,
+            })
+            .watcher_ids
+            .push(id);
+        if is_new && self.native {
+            request_native_replacement(&self.commands, &self.replacement_queued)?;
+            self.record_registration("watch", path.as_path(), &Ok(()));
+        }
+        Ok(id)
     }
 
-    pub fn remove(&self, id: WatcherRegistrationId) {
+    fn remove(&self, id: WatcherRegistrationId) {
         let mut state = self.state.lock();
         let Some(registration) = state.watchers.remove(&id) else {
             return;
         };
-        let key = registration.key;
-        let Some(path_state) = state.paths.get_mut(&key) else {
+        let Some(path) = state.paths.get_mut(&registration.key) else {
             return;
         };
-        path_state.watcher_ids.retain(|&existing| existing != id);
-        if !path_state.watcher_ids.is_empty() {
-            return;
-        }
-        match &path_state.coverage {
-            Coverage::Watched { .. } => self.release_watch(&mut state, key),
-            Coverage::CoveredBy(ancestor) => {
-                let ancestor = ancestor.clone();
-                let covered_entry = (path_depth(&path_state.path), key);
-                state.paths.0.remove(&covered_entry.1);
-                let Some(ancestor_state) = state.paths.get_mut(&ancestor) else {
-                    return;
-                };
-                let retained = ancestor_state.watcher_ids.is_empty();
-                let Coverage::Watched { covered } = &mut ancestor_state.coverage else {
-                    return;
-                };
-                // A retained watch stopped at its shallowest covered registration,
-                // so only that registration leaving can unblock its release.
-                let blocked_release = covered.first() == Some(&covered_entry);
-                covered.remove(&covered_entry);
-                if retained && blocked_release {
-                    self.release_watch(&mut state, ancestor);
-                }
+        path.watcher_ids
+            .retain(|registered_id| *registered_id != id);
+        if path.watcher_ids.is_empty()
+            && let Some(path) = state.paths.remove(&registration.key)
+        {
+            if self.native {
+                request_native_replacement(&self.commands, &self.replacement_queued).log_err();
+                self.record_registration("unwatch", path.path.as_path(), &Ok(()));
+            } else {
+                self.unwatch(path.path.as_path()).log_err();
             }
         }
     }
 
-    /// Unwatches the unused backend watch at `key` once every registration it
-    /// covers is served by another watch.
-    ///
-    /// Replacements are installed shallowest first, so one can cover deeper
-    /// registrations. If one cannot be installed, the watch is retained for
-    /// the registrations still covered by it, and is reconsidered when the one
-    /// that could not be promoted is removed.
-    fn release_watch(&self, state: &mut WatcherState, key: WatchKey) {
-        // Exclude this watch from coverage checks while it stays installed.
-        let Some(mut released) = state.paths.0.remove(&key) else {
-            return;
-        };
-        let mut pending = match &mut released.coverage {
-            Coverage::Watched { covered } => std::mem::take(covered),
-            Coverage::CoveredBy(_) => {
-                state.paths.0.insert(key, released);
-                return;
-            }
-        };
-        while let Some((depth, covered_key)) = pending.pop_first() {
-            let Some(covered_path) = state
-                .paths
-                .0
-                .get(&covered_key)
-                .map(|registration| registration.path.clone())
-            else {
-                continue;
-            };
-            let coverage = match state.paths.covering_ancestor(&covered_path, self.recursive) {
-                Some(ancestor) => {
-                    if let Some(covered) = state.paths.covered_by_mut(&ancestor) {
-                        covered.insert((depth, covered_key.clone()));
-                    }
-                    Coverage::CoveredBy(ancestor)
-                }
-                None if self.watch_replacement(state, &covered_path) => Coverage::Watched {
-                    covered: BTreeSet::new(),
-                },
-                None => {
-                    pending.insert((depth, covered_key));
-                    released.coverage = Coverage::Watched { covered: pending };
-                    state.paths.0.insert(key, released);
-                    return;
-                }
-            };
-            if let Some(registration) = state.paths.get_mut(&covered_key) {
-                registration.coverage = coverage;
-                registration.stale = false;
-            }
+    async fn synchronize_registrations(&self) -> anyhow::Result<()> {
+        if !self.native || !*self.native_started.lock() {
+            return Ok(());
         }
-
-        // Forget the watch even if unwatching fails: notify can report failure
-        // after dropping the watch (FSEvents restarts its stream afterwards), so
-        // a later registration of this path must install a fresh watch.
-        self.unwatch(released.path.as_path()).log_err();
-    }
-
-    fn watch_replacement(&self, state: &mut WatcherState, path: &SanitizedPath) -> bool {
-        if self.kind == OsWatcherKind::Native && state.is_native_watch_limit_cooldown_active() {
-            return false;
-        }
-        match self.watch(path.as_path()) {
-            Ok(()) => true,
-            Err(error) => {
-                if self.kind == OsWatcherKind::Native && is_max_files_watch_error(&error) {
-                    state.start_native_watch_limit_cooldown(path.as_path());
-                }
-                log::error!(
-                    "failed to restore watch for {path:?}; retaining its covering watch: {error:#}"
-                );
-                false
-            }
-        }
+        let (sender, receiver) = async_channel::bounded(1);
+        self.commands.try_send(NativeCommand::Barrier(sender))?;
+        receiver.recv().await?;
+        Ok(())
     }
 
     fn watch(&self, path: &Path) -> anyhow::Result<()> {
-        self.ensure_backend()?;
         let result = self
             .backend
             .lock()
             .as_mut()
-            .expect("watcher backend initialized")
+            .ok_or_else(|| anyhow::anyhow!("watcher backend was not initialized"))?
             .watch(
                 path,
                 if self.recursive {
@@ -1276,106 +1133,439 @@ impl OsWatcher {
                     notify::RecursiveMode::NonRecursive
                 },
             );
-        self.diagnostics.record(|| {
-            WatchDiagnosticEvent::new(
-                self.kind,
-                if result.is_ok() {
-                    "watch"
-                } else {
-                    "watch_error"
-                },
-                &[path.to_owned()],
-                match &result {
-                    Ok(()) => format!("recursive={}", self.recursive),
-                    Err(error) => format!("{error:?}"),
-                },
-                false,
-            )
-        });
+        self.record_registration("watch", path, &result);
         result?;
         Ok(())
     }
 
     fn unwatch(&self, path: &Path) -> anyhow::Result<()> {
-        let watcher = self
+        let result = self
             .backend
             .lock()
             .as_mut()
-            .map(|watcher| watcher.unwatch(path));
-
-        self.diagnostics.record(|| {
-            WatchDiagnosticEvent::new(
-                self.kind,
-                if matches!(&watcher, Some(Err(_))) {
-                    "unwatch_error"
-                } else {
-                    "unwatch"
-                },
-                &[path.to_owned()],
-                match &watcher {
-                    Some(Err(error)) => format!("{error:?}"),
-                    _ => String::new(),
-                },
-                false,
-            )
-        });
-        match watcher {
-            // inotify auto-removes a watch when its directory is deleted, so a
-            // later unwatch races that and fails with a benign error. Either way
-            // the path is no longer watched, which is all we wanted.
-            Some(Err(error)) if !matches!(error.kind, notify::ErrorKind::WatchNotFound) => {
+            .ok_or_else(|| anyhow::anyhow!("watcher backend was not initialized"))?
+            .unwatch(path);
+        self.record_registration("unwatch", path, &result);
+        match result {
+            Err(error) if !matches!(error.kind, notify::ErrorKind::WatchNotFound) => {
                 Err(error.into())
             }
             _ => Ok(()),
         }
     }
 
-    pub(crate) fn ensure_backend(&self) -> anyhow::Result<()> {
-        // The lock is held across creation: with a check-then-insert under two
-        // separate lock acquisitions, concurrent callers could each create a
-        // watcher and the loser's insert would silently drop the winner's
-        // watcher along with every path registered on it.
-        let mut backend = self.backend.lock();
-        if backend.is_none() {
-            *backend = Some(match self.kind {
-                OsWatcherKind::Native => {
-                    // CORE excludes Access events, which Zed discards anyway. Without this,
-                    // the default mask subscribes to inotify OPEN/CLOSE_* on Linux, so every
-                    // file read in a watched directory would queue events, increasing the
-                    // risk of queue overflows (and thus full rescans) under read-heavy
-                    // workloads like grep or language server indexing.
-                    let config =
-                        notify::Config::default().with_event_kinds(notify::EventKindMask::CORE);
-                    Box::new(
-                        <notify::RecommendedWatcher as notify::Watcher>::new(
-                            self.event_sink(),
-                            config,
-                        )
-                        .inspect_err(|error| self.record_backend_error(error))?,
-                    )
-                }
-                OsWatcherKind::Poll => {
-                    let config = notify::Config::default().with_poll_interval(*POLL_INTERVAL);
-                    Box::new(
-                        notify::PollWatcher::new(self.event_sink(), config)
-                            .inspect_err(|error| self.record_backend_error(error))?,
-                    )
-                }
-            });
-        }
-        Ok(())
-    }
-
-    fn record_backend_error(&self, error: &notify::Error) {
+    fn record_registration(&self, operation: &str, path: &Path, result: &notify::Result<()>) {
         self.diagnostics.record(|| {
             WatchDiagnosticEvent::new(
                 self.kind,
-                "backend_error",
-                &error.paths,
-                format!("{error:?}"),
+                &if result.is_err() {
+                    format!("{operation}_error")
+                } else {
+                    operation.into()
+                },
+                &[path.to_owned()],
+                result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("{error:?}"))
+                    .unwrap_or_default(),
                 false,
             )
         });
+    }
+
+    pub(crate) fn ensure_backend(&self) -> anyhow::Result<()> {
+        let mut backend = self.backend.lock();
+        if self.native {
+            let mut started = self.native_started.lock();
+            if !*started {
+                let watcher =
+                    gix_notify::asynchronous::Watcher::new(gix_notify::Options::default())
+                        .map_err(anyhow::Error::from)?;
+                self.commands.try_send(NativeCommand::Start(watcher))?;
+                *started = true;
+            }
+        } else if backend.is_none() {
+            // gix-notify has no polling backend for mounts that cannot deliver native events.
+            let config = notify::Config::default().with_poll_interval(*POLL_INTERVAL);
+            *backend = Some(Box::new(notify::PollWatcher::new(
+                self.event_sink(),
+                config,
+            )?));
+        }
+        Ok(())
+    }
+}
+
+fn record_event(
+    kind: OsWatcherKind,
+    diagnostics: &diagnostics::DiagnosticRecorder,
+    event: &notify::Result<notify::Event>,
+) {
+    diagnostics.record(|| match event {
+        Ok(event) => WatchDiagnosticEvent::from_notify_event(kind, event),
+        Err(error) => {
+            WatchDiagnosticEvent::new(kind, "error", &error.paths, format!("{error:?}"), false)
+        }
+    });
+}
+
+fn event_sink(
+    kind: OsWatcherKind,
+    event_tx: async_channel::Sender<notify::Result<notify::Event>>,
+    diagnostics: Arc<diagnostics::DiagnosticRecorder>,
+    overflow: Arc<AtomicBool>,
+) -> impl Fn(notify::Result<notify::Event>) + Send + Sync + 'static {
+    move |event| {
+        record_event(kind, &diagnostics, &event);
+        if matches!(
+            event,
+            Ok(Event {
+                kind: EventKind::Access(_),
+                ..
+            })
+        ) {
+            return;
+        }
+        match event_tx.try_send(event) {
+            Ok(()) | Err(async_channel::TrySendError::Closed(_)) => {}
+            Err(async_channel::TrySendError::Full(_)) => overflow.store(true, Ordering::Release),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct NativeAlias {
+    physical: PathBuf,
+    logical: PathBuf,
+    case_insensitive: bool,
+    rescan: bool,
+}
+
+fn native_watch_set(
+    paths: Vec<(PathBuf, bool)>,
+    recursive: bool,
+) -> (Vec<gix_notify::Watch>, Vec<NativeAlias>, bool) {
+    let mut watches = Vec::new();
+    let mut aliases = Vec::new();
+    let mut needs_recheck = false;
+    for (logical, case_insensitive) in paths {
+        for ancestor in logical.ancestors() {
+            if std::fs::symlink_metadata(ancestor).is_ok_and(|metadata| metadata.is_symlink()) {
+                // Retargeting can leave the previous physical target and its native watches healthy.
+                needs_recheck = true;
+                if let Some(parent) = ancestor.parent()
+                    && parent.parent().is_some()
+                    && let Ok(physical_parent) = std::fs::canonicalize(parent)
+                    && let Some(name) = ancestor.file_name()
+                {
+                    let physical_parent = SanitizedPath::new(&physical_parent).as_path().to_owned();
+                    watches.push(gix_notify::Watch {
+                        path: physical_parent.clone(),
+                        recursive: false,
+                    });
+                    aliases.push(NativeAlias {
+                        physical: physical_parent.join(name),
+                        logical: logical.clone(),
+                        case_insensitive,
+                        rescan: true,
+                    });
+                }
+            }
+        }
+        match std::fs::canonicalize(&logical) {
+            Ok(physical) => {
+                let physical = SanitizedPath::new(&physical).as_path().to_owned();
+                if physical.is_dir() {
+                    watches.push(gix_notify::Watch {
+                        path: physical.clone(),
+                        recursive,
+                    });
+                }
+                // Parent coverage observes atomic file replacement and root recreation.
+                if let Some(parent) = physical.parent() {
+                    watches.push(gix_notify::Watch {
+                        path: parent.to_owned(),
+                        recursive: false,
+                    });
+                }
+                aliases.push(NativeAlias {
+                    physical,
+                    logical,
+                    case_insensitive,
+                    rescan: false,
+                });
+            }
+            Err(error) => {
+                needs_recheck = true;
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "failed to resolve watched path {}: {error}",
+                        logical.display()
+                    );
+                }
+                if let Some((ancestor, physical)) =
+                    logical.ancestors().skip(1).find_map(|ancestor| {
+                        std::fs::canonicalize(ancestor)
+                            .ok()
+                            .filter(|physical| physical.is_dir())
+                            .map(|physical| (ancestor, physical))
+                    })
+                {
+                    let physical = SanitizedPath::new(&physical).as_path().to_owned();
+                    watches.push(gix_notify::Watch {
+                        path: physical.clone(),
+                        recursive: false,
+                    });
+                    if let Ok(suffix) = logical.strip_prefix(ancestor) {
+                        aliases.push(NativeAlias {
+                            physical: physical.join(suffix),
+                            logical,
+                            case_insensitive,
+                            rescan: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    (watches, aliases, needs_recheck)
+}
+
+fn logical_event(event: gix_notify::Event, aliases: &[NativeAlias]) -> notify::Event {
+    use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+    let kind = match event.kind {
+        gix_notify::EventKind::Any => EventKind::Modify(ModifyKind::Any),
+        gix_notify::EventKind::Create => EventKind::Create(CreateKind::Any),
+        gix_notify::EventKind::Modify => EventKind::Modify(ModifyKind::Any),
+        gix_notify::EventKind::Remove => EventKind::Remove(RemoveKind::Any),
+        gix_notify::EventKind::Rename => EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+    };
+    let mut paths = Vec::new();
+    let mut rescan = false;
+    for physical in event.paths {
+        let physical = SanitizedPath::new(&physical);
+        for alias in aliases {
+            let root = SanitizedPath::new(&alias.physical);
+            if path_is_under(physical, root, alias.case_insensitive) {
+                if alias.rescan {
+                    paths.push(alias.logical.clone());
+                    rescan = true;
+                    continue;
+                }
+                let suffix: PathBuf = physical
+                    .as_path()
+                    .components()
+                    .skip(root.as_path().components().count())
+                    .collect();
+                paths.push(alias.logical.join(suffix));
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    let event = notify::Event {
+        paths,
+        ..notify::Event::new(kind)
+    };
+    if rescan {
+        event.set_flag(notify::event::Flag::Rescan)
+    } else {
+        event
+    }
+}
+
+enum NativeActivity {
+    Command(NativeCommand),
+    Ready,
+    Retry,
+    Stopped,
+}
+
+async fn next_native_activity(
+    notification: impl Future<Output = ()>,
+    commands: &async_channel::Receiver<NativeCommand>,
+    retry: &mut Option<Task<()>>,
+    recovering: bool,
+    replacement_queued: &AtomicBool,
+) -> NativeActivity {
+    let notification = async {
+        if recovering {
+            // Repeated backend diagnostics must not defeat the recovery backoff.
+            futures::future::pending::<()>().await;
+        }
+        notification.await;
+    }
+    .fuse();
+    futures::pin_mut!(notification);
+    loop {
+        let command = commands.recv().fuse();
+        let retry = async {
+            match retry {
+                Some(timer) => timer.await,
+                None => futures::future::pending().await,
+            }
+        }
+        .fuse();
+        futures::pin_mut!(command, retry);
+        let activity = futures::select! {
+            () = notification => NativeActivity::Ready,
+            command = command => match command {
+                Ok(command) => NativeActivity::Command(command),
+                Err(_) => NativeActivity::Stopped,
+            },
+            () = retry => NativeActivity::Retry,
+        };
+        if matches!(&activity, NativeActivity::Command(NativeCommand::Replace)) {
+            replacement_queued.store(false, Ordering::Release);
+            if recovering {
+                continue;
+            }
+        }
+        return activity;
+    }
+}
+
+async fn native_notifications(
+    state: Arc<Mutex<WatcherState>>,
+    emit: impl Fn(notify::Result<notify::Event>) + Send + Sync + 'static,
+    commands: async_channel::Receiver<NativeCommand>,
+    executor: BackgroundExecutor,
+    recursive: bool,
+    replacement_queued: Arc<AtomicBool>,
+) {
+    let mut watcher: Option<gix_notify::asynchronous::Watcher> = None;
+    let mut aliases = Vec::new();
+    let mut retry: Option<Task<()>> = None;
+    let mut restart = false;
+    let mut recovering = false;
+    loop {
+        let activity = if let Some(watcher) = &watcher {
+            next_native_activity(
+                watcher.ready(),
+                &commands,
+                &mut retry,
+                recovering,
+                &replacement_queued,
+            )
+            .await
+        } else {
+            match commands.recv().await {
+                Ok(command) => NativeActivity::Command(command),
+                Err(_) => NativeActivity::Stopped,
+            }
+        };
+        let replace = match activity {
+            NativeActivity::Command(NativeCommand::Start(started)) => {
+                watcher = Some(started);
+                false
+            }
+            NativeActivity::Command(NativeCommand::Barrier(reply)) => {
+                match reply.try_send(()) {
+                    Ok(()) | Err(async_channel::TrySendError::Closed(())) => {}
+                    Err(error) => {
+                        log::error!("failed to acknowledge filesystem registration: {error}")
+                    }
+                }
+                false
+            }
+            NativeActivity::Command(NativeCommand::Replace) => true,
+            NativeActivity::Retry => {
+                retry = None;
+                true
+            }
+            NativeActivity::Ready => {
+                let Some(watcher) = &mut watcher else {
+                    continue;
+                };
+                let batch = watcher.drain(gix_notify::Budget::default());
+                smol::future::yield_now().await;
+                let mut refresh = false;
+                for event in batch.events {
+                    let event = logical_event(event, &aliases);
+                    if !event.paths.is_empty() {
+                        refresh |= event.need_rescan();
+                        emit(Ok(event));
+                    }
+                }
+                if let Some(error) = batch.error {
+                    emit(Err(notify::Error::generic(&format!("{error:?}"))));
+                    recovering = true;
+                    restart = true;
+                    retry.get_or_insert_with(|| executor.timer(Duration::from_secs(1)));
+                }
+                if let Some(loss) = batch.loss {
+                    emit(Ok(Event::new(EventKind::Other)
+                        .set_flag(notify::event::Flag::Rescan)
+                        .set_info(&format!("gix-notify: {loss:?}"))));
+                    restart |= loss == gix_notify::Loss::BackendStopped;
+                    match loss {
+                        gix_notify::Loss::BackendError | gix_notify::Loss::BackendStopped => {
+                            recovering = true;
+                            restart = true;
+                            retry.get_or_insert_with(|| executor.timer(Duration::from_secs(1)));
+                            false
+                        }
+                        gix_notify::Loss::WatchSetChanged => refresh && !recovering,
+                        _ => !recovering && (refresh || retry.is_none()),
+                    }
+                } else {
+                    refresh && !recovering
+                }
+            }
+            NativeActivity::Stopped => break,
+        };
+        if !replace {
+            continue;
+        }
+        if restart {
+            match gix_notify::asynchronous::Watcher::new(gix_notify::Options::default()) {
+                Ok(started) => {
+                    watcher = Some(started);
+                    restart = false;
+                }
+                Err(error) => {
+                    emit(Err(notify::Error::generic(&format!("{error:?}"))));
+                    retry.get_or_insert_with(|| executor.timer(Duration::from_secs(1)));
+                    continue;
+                }
+            }
+        }
+        let paths = state
+            .lock()
+            .paths
+            .values()
+            .map(|path| (path.path.as_path().to_owned(), path.case_insensitive))
+            .collect();
+        let (watches, refreshed_aliases, needs_recheck) =
+            smol::unblock(move || native_watch_set(paths, recursive)).await;
+        let identity_changed = !aliases.is_empty() && aliases != refreshed_aliases;
+        aliases = refreshed_aliases;
+        let Some(watcher) = &mut watcher else {
+            continue;
+        };
+        let result = match watcher.replace(watches) {
+            Ok(operation) => operation.await,
+            Err(error) => Err(error),
+        };
+        if identity_changed {
+            emit(Ok(Event::new(EventKind::Other)
+                .set_flag(notify::event::Flag::Rescan)
+                .set_info("watched path identity changed")));
+        }
+        recovering = result.is_err();
+        if let Err(error) = &result {
+            restart = true;
+            emit(Err(notify::Error::generic(&format!("{error:?}"))));
+            emit(Ok(
+                Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+            ));
+        }
+        if needs_recheck || result.is_err() {
+            retry.get_or_insert_with(|| executor.timer(Duration::from_secs(1)));
+        } else {
+            retry = None;
+        }
     }
 }
 
@@ -1391,72 +1581,46 @@ fn dispatch(
             return;
         }
     };
-
-    log::trace!("handle {kind:?} watcher event: {event:?}");
-
     let callbacks = {
-        let mut state = state.lock();
-        // Invalidate before callbacks can trigger a scan.
-        if !kind.is_recursive() && event.need_rescan() {
-            // Overflow may have dropped removal events.
-            for path_state in state.paths.0.values_mut() {
-                path_state.stale = true;
-            }
-        } else if !kind.is_recursive()
-            && matches!(
-                event.kind,
-                EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
-            )
-        {
-            for path in &event.paths {
-                let path = SanitizedPath::new(path);
-                for event_key in [WatchKey::exact(path), WatchKey::folded(path)] {
-                    let Some(path_state) = state.paths.get_mut(&event_key) else {
-                        continue;
-                    };
-                    path_state.stale = true;
-                    if !matches!(event.kind, EventKind::Modify(_)) {
-                        continue;
-                    }
-                    // Descendant watches follow the directory without their own rename events.
-                    for (key, path_state) in &mut state.paths.0 {
-                        let descendant = match (key, &event_key) {
-                            (WatchKey::Exact(key), WatchKey::Exact(event_key)) => {
-                                key.starts_with(event_key)
-                            }
-                            (WatchKey::Folded(key), WatchKey::Folded(event_key)) => {
-                                Path::new(key.as_ref()).starts_with(Path::new(event_key.as_ref()))
-                            }
-                            _ => false,
-                        };
-                        if descendant {
-                            path_state.stale = true;
-                        }
-                    }
-                }
-            }
-        }
+        let state = state.lock();
         if event.need_rescan() {
             state
                 .watchers
                 .values()
-                .map(|registration| registration.callback.clone())
+                .map(|watcher| watcher.callback.clone())
                 .collect::<Vec<_>>()
         } else {
             let mut ids = Vec::new();
             for path in &event.paths {
-                let sanitized = SanitizedPath::new(path);
-                state.paths.watcher_ids_covering(sanitized, &mut ids);
+                for ancestor in SanitizedPath::new(path).as_path().ancestors() {
+                    let ancestor = SanitizedPath::unchecked_new(ancestor);
+                    if let Some(registration) = state.paths.get(&WatchKey::exact(ancestor)) {
+                        ids.extend_from_slice(&registration.watcher_ids);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    if let Some(registration) = state.paths.get(&WatchKey::folded(ancestor)) {
+                        ids.extend_from_slice(&registration.watcher_ids);
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let folded_path = WatchKey::folded_path(SanitizedPath::new(path));
+                    for ancestor in Path::new(&folded_path).ancestors() {
+                        let key = WatchKey::Folded(Arc::from(ancestor.to_string_lossy().as_ref()));
+                        if let Some(registration) = state.paths.get(&key) {
+                            ids.extend_from_slice(&registration.watcher_ids);
+                        }
+                    }
+                }
             }
             ids.sort_unstable_by_key(|id| id.0);
             ids.dedup();
             ids.into_iter()
                 .filter_map(|id| state.watchers.get(&id))
-                .map(|registration| registration.callback.clone())
-                .collect::<Vec<_>>()
+                .map(|watcher| watcher.callback.clone())
+                .collect()
         }
     };
-
     for callback in callbacks {
         callback(&event);
     }
@@ -1469,14 +1633,8 @@ fn dispatch_batch(
     first: notify::Result<notify::Event>,
     event_rx: &async_channel::Receiver<notify::Result<notify::Event>>,
 ) {
-    // A single backend overflow can enqueue many pathless rescan markers, each
-    // of which rescans every watched root, so one covers the entire
-    // drained batch. Rescans that name paths only cover those subtrees and are
-    // all dispatched; ordinary events still run.
     let mut rescan_dispatched = false;
-
-    // The backend can keep producing events faster than we dispatch them, so
-    // don't wait for an empty queue before giving other tasks a turn.
+    // A busy backend must give other tasks a turn before its queue becomes empty.
     for event in std::iter::once(first)
         .chain(std::iter::from_fn(|| event_rx.try_recv().ok()))
         .take(MAX_DISPATCH_BATCH_SIZE)
@@ -1490,41 +1648,17 @@ fn dispatch_batch(
             }
             rescan_dispatched = true;
         }
-
-        // Log writes can block, so keep them off the native watcher reader.
         if let Ok(event) = &event
             && let Some(report) = rescan_history.record(event)
         {
-            log::error!("{kind:?} filesystem watcher requested rescan: {report}");
+            log::debug!("{kind:?} filesystem watcher requested rescan: {report}");
         }
         dispatch(kind, state, event);
     }
 }
 
-fn enqueue(
-    event_tx: &async_channel::Sender<notify::Result<notify::Event>>,
-    event: notify::Result<notify::Event>,
-) {
-    if matches!(
-        event,
-        Ok(Event {
-            kind: EventKind::Access(_),
-            ..
-        })
-    ) {
-        return;
-    }
-
-    // A failed send only happens once the dispatch thread has shut down, at
-    // which point there's nothing left to dispatch to.
-    event_tx.try_send(event).ok();
-}
-
-fn is_max_files_watch_error(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<notify::Error>()
-        .is_some_and(|error| matches!(&error.kind, notify::ErrorKind::MaxFilesWatch))
-}
+const MAX_PENDING_EVENTS: usize = 4096;
+const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 
 static POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
     let poll_ms: u64 = std::env::var("ZED_FILE_WATCHER_POLL_MS")
@@ -1535,15 +1669,6 @@ static POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_millis(poll_ms)
 });
 
-static NATIVE_WATCH_LIMIT_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
-    let cooldown_seconds: u64 = std::env::var("ZED_NATIVE_WATCH_LIMIT_COOLDOWN_SECONDS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(5)
-        .clamp(0, 300);
-    Duration::from_secs(cooldown_seconds)
-});
-
 pub fn poll_interval() -> Duration {
     *POLL_INTERVAL
 }
@@ -1551,915 +1676,483 @@ pub fn poll_interval() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet, path::PathBuf};
+    use futures::StreamExt as _;
+    use gpui::TestAppContext;
+    use notify::event::{Flag, ModifyKind};
 
-    fn rescan(path: &str) -> PathEvent {
-        PathEvent {
-            path: PathBuf::from(path),
-            kind: Some(PathEventKind::Rescan),
-        }
-    }
+    struct Backend;
 
-    fn changed(path: &str) -> PathEvent {
-        PathEvent {
-            path: PathBuf::from(path),
-            kind: Some(PathEventKind::Changed),
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeWatchBackend {
-        watched_paths: HashSet<PathBuf>,
-        watch_calls: Vec<PathBuf>,
-        unwatch_calls: Vec<PathBuf>,
-        operations: Vec<(&'static str, PathBuf)>,
-        fail_with_watch_limit: bool,
-        failed_paths: HashSet<PathBuf>,
-        failed_unwatch_paths: HashSet<PathBuf>,
-    }
-
-    struct SharedFakeWatchBackend(Arc<Mutex<FakeWatchBackend>>);
-
-    impl WatchBackend for SharedFakeWatchBackend {
-        fn watch(&mut self, path: &Path, _mode: notify::RecursiveMode) -> notify::Result<()> {
-            let path = path.to_path_buf();
-            let mut backend = self.0.lock();
-            backend.watch_calls.push(path.clone());
-            backend.operations.push(("watch", path.clone()));
-            if backend.fail_with_watch_limit {
-                return Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch));
-            }
-            if backend.failed_paths.contains(&path) {
-                return Err(notify::Error::generic("injected watch failure"));
-            }
-            backend.watched_paths.insert(path);
+    impl WatchBackend for Backend {
+        fn watch(&mut self, _: &Path, _: notify::RecursiveMode) -> notify::Result<()> {
             Ok(())
         }
 
-        fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
-            let path = path.to_path_buf();
-            let mut backend = self.0.lock();
-            backend.unwatch_calls.push(path.clone());
-            backend.operations.push(("unwatch", path.clone()));
-            if !backend.watched_paths.remove(&path) {
-                return Err(notify::Error::watch_not_found());
-            }
-            // Like FSEvents failing to restart its stream after removing the path.
-            if backend.failed_unwatch_paths.contains(&path) {
-                return Err(notify::Error::generic("injected unwatch failure"));
-            }
+        fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
             Ok(())
         }
     }
 
-    #[test]
-    fn watcher_retains_scheduler_until_teardown() {
-        let dispatcher = Arc::new(gpui::TestDispatcher::new(0));
-        let scheduler = Arc::downgrade(dispatcher.scheduler());
-        let executor = BackgroundExecutor::new(dispatcher.clone());
-        let watcher = OsWatcher::new(OsWatcherKind::Native, executor.clone());
-        executor.run_until_parked();
-        drop(executor);
-
-        drop(dispatcher);
-        assert!(scheduler.upgrade().is_some());
-        drop(watcher);
-        assert!(scheduler.upgrade().is_none());
-    }
-
-    fn test_os_watcher(
-        kind: OsWatcherKind,
-        backend: Option<Arc<Mutex<FakeWatchBackend>>>,
-    ) -> OsWatcher {
-        // Tests call `dispatch` directly to exercise dispatch synchronously,
-        // rather than going through the OS watcher callbacks, so nothing is ever
-        // sent on this channel; the receiver can just be dropped.
-        let (event_tx, _event_rx) = async_channel::unbounded();
-        OsWatcher {
-            kind,
-            recursive: kind.is_recursive(),
-            state: Arc::new(Mutex::new(WatcherState {
-                watchers: Default::default(),
-                paths: Default::default(),
-                cooldown_until: None,
-                last_registration: Default::default(),
-            })),
-            backend: Mutex::new(
-                backend.map(|watcher| {
-                    Box::new(SharedFakeWatchBackend(watcher)) as Box<dyn WatchBackend>
-                }),
-            ),
-            event_tx,
-            _dispatch_task: Task::ready(()),
-            diagnostics: Default::default(),
-            _executor: BackgroundExecutor::new(Arc::new(gpui::TestDispatcher::new(0))),
-        }
-    }
-
-    struct TestCase {
-        name: &'static str,
-        pending_paths: Vec<PathEvent>,
-        path_events: Vec<PathEvent>,
-        expected_pending_paths: Vec<PathEvent>,
-        expected_path_events: Vec<PathEvent>,
-    }
-
-    #[test]
-    fn covered_child_registration_is_promoted_before_parent_is_unwatched() {
-        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-        let watcher = test_os_watcher(OsWatcherKind::Poll, Some(backend.clone()));
-        let parent = Arc::<Path>::from(Path::new("/repo"));
-        let child = Arc::<Path>::from(Path::new("/repo/foo.csproj"));
-
-        let parent_registration = watcher
-            .add(parent.as_ref().into(), false, |_| {})
-            .expect("add parent watch")
-            .expect("parent watch registered");
-        let child_registration = watcher
-            .add(child.as_ref().into(), false, |_| {})
-            .expect("add covered child watch")
-            .expect("child watch registered");
-
-        watcher.remove(parent_registration);
-        assert_eq!(
-            backend.lock().watched_paths,
-            HashSet::from([child.to_path_buf()])
-        );
-        assert_eq!(
-            backend.lock().operations,
-            [
-                ("watch", parent.to_path_buf()),
-                ("watch", child.to_path_buf()),
-                ("unwatch", parent.to_path_buf()),
-            ]
-        );
-        watcher.remove(child_registration);
-
-        let backend = backend.lock();
-        assert_eq!(
-            backend.watch_calls,
-            &[parent.to_path_buf(), child.to_path_buf()]
-        );
-        assert_eq!(
-            backend.unwatch_calls,
-            &[parent.to_path_buf(), child.to_path_buf()]
-        );
-        assert!(backend.watched_paths.is_empty());
-        assert!(watcher.state.lock().paths.0.is_empty());
-    }
-
-    #[test]
-    fn promoted_ancestor_covers_deeper_subscribers() {
-        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-        let watcher = test_os_watcher(OsWatcherKind::Poll, Some(backend.clone()));
-        let root = watcher
-            .add(Path::new("/repo").into(), true, |_| {})
-            .expect("watch root")
-            .expect("registered root");
-        // Several deeper subscribers make an unordered promotion unlikely to
-        // reach the shallowest one first by chance.
-        let deep = (0..8)
-            .map(|index| {
-                watcher
-                    .add(
-                        PathBuf::from(format!("/repo/child/deep{index}")).into(),
-                        true,
-                        |_| {},
-                    )
-                    .expect("watch deep")
-                    .expect("registered deep")
-            })
-            .collect::<Vec<_>>();
-        let child = watcher
-            .add(Path::new("/repo/child").into(), true, |_| {})
-            .expect("watch child")
-            .expect("registered child");
-        watcher.remove(root);
-        assert_eq!(
-            backend.lock().watched_paths,
-            HashSet::from([PathBuf::from("/repo/child")])
-        );
-        assert_eq!(backend.lock().watch_calls.len(), 2);
-        watcher.remove(child);
-        assert_eq!(backend.lock().watched_paths.len(), deep.len());
-        for deep in deep {
-            watcher.remove(deep);
-        }
-        assert!(backend.lock().watched_paths.is_empty());
-        assert!(watcher.state.lock().paths.0.is_empty());
-    }
-
-    #[test]
-    fn failed_promotion_retains_coverage_without_retaining_removed_callback() {
-        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-        let watcher = test_os_watcher(OsWatcherKind::Poll, Some(backend.clone()));
-        let (parent_fired, parent_callback) = fired_count();
-        let (child_fired, child_callback) = fired_count();
-        let parent = watcher
-            .add(Path::new("/repo").into(), false, parent_callback)
-            .expect("watch parent")
-            .expect("registered parent");
-        let child = watcher
-            .add(Path::new("/repo/child").into(), false, child_callback)
-            .expect("watch child")
-            .expect("registered child");
-        backend
-            .lock()
-            .failed_paths
-            .insert(PathBuf::from("/repo/child"));
-
-        watcher.remove(parent);
-        assert_eq!(
-            backend.lock().watched_paths,
-            HashSet::from([PathBuf::from("/repo")])
-        );
-        watcher.dispatch(Ok(modify_event("/repo/child/file")));
-        assert_eq!(*parent_fired.lock(), 0);
-        assert_eq!(*child_fired.lock(), 1);
-
-        watcher.remove(child);
-        assert!(backend.lock().watched_paths.is_empty());
-        assert!(watcher.state.lock().paths.0.is_empty());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn native_child_delivery_survives_parent_removal() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let root = directory.path().canonicalize().expect("canonical root");
-        let child = root.join("child");
-        std::fs::create_dir(&child).expect("create child");
-        let executor = BackgroundExecutor::new(Arc::new(gpui::TestDispatcher::new(0)));
-        let watcher = OsWatcher::new(OsWatcherKind::Native, executor.clone());
-        let parent = watcher
-            .add(root.as_path().into(), false, |_| {})
-            .expect("watch parent")
-            .expect("registered parent");
-        let (sender, receiver) = std::sync::mpsc::channel();
-        watcher
-            .add(child.as_path().into(), false, move |event| {
-                sender.send(event.clone()).expect("receiver alive");
-            })
-            .expect("watch child")
-            .expect("registered child");
-        std::thread::sleep(Duration::from_millis(500));
-        for phase in ["before", "after"] {
-            if phase == "after" {
-                watcher.remove(parent);
-            }
-            let file = child.join(phase);
-            std::fs::write(&file, b"probe").expect("write probe");
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                executor.run_until_parked();
-                if receiver.try_iter().any(|event| event.paths.contains(&file)) {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "missing {phase} event");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-
-    #[test]
-    fn partial_promotion_releases_retained_parent_when_failed_subscriber_leaves() {
-        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-        let watcher = test_os_watcher(OsWatcherKind::Poll, Some(backend.clone()));
-        let registrations = [
-            "/repo",
-            "/repo/a",
-            "/repo/other/deep",
-            "/unrelated",
-            "/repo/other/deep/deeper",
-        ]
-        .map(|path| {
-            watcher
-                .add(Path::new(path).into(), false, |_| {})
-                .expect("watch")
-                .expect("registered")
-        });
-        backend
-            .lock()
-            .failed_paths
-            .insert(PathBuf::from("/repo/other/deep"));
-        watcher.remove(registrations[0]);
-        assert_eq!(
-            backend.lock().watched_paths,
-            HashSet::from([
-                PathBuf::from("/repo"),
-                PathBuf::from("/repo/a"),
-                PathBuf::from("/unrelated")
-            ])
-        );
-        // Only removing the registration that blocked promotion retries it.
-        let watch_calls = backend.lock().watch_calls.len();
-        watcher.remove(registrations[3]);
-        watcher.remove(registrations[1]);
-        watcher.remove(registrations[4]);
-        assert_eq!(backend.lock().watch_calls.len(), watch_calls);
-        assert_eq!(
-            backend.lock().watched_paths,
-            HashSet::from([PathBuf::from("/repo")])
-        );
-
-        watcher.remove(registrations[2]);
-        assert!(backend.lock().watched_paths.is_empty());
-        assert!(watcher.state.lock().paths.0.is_empty());
-    }
-
-    #[test]
-    fn failed_unwatch_is_not_trusted_when_path_is_registered_again() {
-        for kind in [OsWatcherKind::Native, OsWatcherKind::Poll] {
-            let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-            let watcher = test_os_watcher(kind, Some(backend.clone()));
-            let path = PathBuf::from("/repo");
-            backend.lock().failed_unwatch_paths.insert(path.clone());
-
-            let registration = watcher
-                .add(path.as_path().into(), false, |_| {})
-                .expect("watch")
-                .expect("registered");
-            watcher.remove(registration);
-            assert!(backend.lock().watched_paths.is_empty());
-            assert!(watcher.state.lock().paths.0.is_empty());
-
-            let registration = watcher
-                .add(path.as_path().into(), false, |_| {})
-                .expect("watch again")
-                .expect("registered again");
-            assert_eq!(backend.lock().watch_calls, [path.clone(), path.clone()]);
-            assert_eq!(backend.lock().watched_paths, HashSet::from([path]));
-
-            // The backend already dropped this watch, as inotify does when a
-            // watched directory is deleted.
-            backend.lock().watched_paths.clear();
-            watcher.remove(registration);
-            assert!(watcher.state.lock().paths.0.is_empty());
-        }
+    fn watcher(cx: &TestAppContext) -> Arc<OsWatcher> {
+        OsWatcher::with_backend(
+            OsWatcherKind::Native,
+            cx.executor(),
+            Some(Box::new(Backend)),
+        )
     }
 
     #[gpui::test]
-    async fn pending_path_is_registered_once_created(cx: &mut gpui::TestAppContext) {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let path = temp_dir.path().join("file.txt");
-
-        let (tx, rx) = async_channel::unbounded();
-        let pending_path_events: Arc<Mutex<Vec<PathEvent>>> = Default::default();
-        let watcher = FsWatcher::new(
-            OsWatcher::new(OsWatcherKind::Native, cx.executor()),
-            OsWatcher::new(OsWatcherKind::Poll, cx.executor()),
-            crate::RealFs::new(None, cx.executor()),
-            cx.executor(),
-            tx,
-            pending_path_events.clone(),
-        );
-
-        watcher
-            .add(&path)
-            .expect("add path that does not exist yet");
-        assert!(
-            watcher
-                .pending_registrations
-                .lock()
-                .contains_key(path.as_path())
-        );
-        assert!(watcher.registrations.lock().is_empty());
-
-        std::fs::write(&path, b"contents").expect("create path");
-
-        // poll_path_until_created stats the path on smol's blocking pool, which
-        // the deterministic executor cannot drive; park until the poll task
-        // signals the event channel.
-        cx.executor().allow_parking();
-        cx.executor().advance_clock(poll_interval());
-        rx.recv().await.expect("receive watcher event");
-
-        assert!(
-            !watcher
-                .pending_registrations
-                .lock()
-                .contains_key(path.as_path())
-        );
-        let case_insensitive = case_insensitive_path(&path);
-        let key = WatchKey::for_registration(SanitizedPath::new(&path), case_insensitive);
-        assert!(watcher.registrations.lock().contains_key(&key));
-
-        // poll_path_until_created also enqueues a Rescan for the same path, but
-        // enqueue_path_events -> util::extend_sorted dedups by path, so only Created survives.
-        assert_eq!(
-            pending_path_events.lock().clone(),
-            vec![PathEvent {
-                path: path.clone(),
-                kind: Some(PathEventKind::Created),
-            }]
-        );
-    }
-
-    #[test]
-    fn native_watch_limit_cools_down_subsequent_native_registrations() {
-        let native_backend = Arc::new(Mutex::new(FakeWatchBackend {
-            fail_with_watch_limit: true,
-            ..Default::default()
-        }));
-        let watcher = test_os_watcher(OsWatcherKind::Native, Some(native_backend.clone()));
-        let first_path = Arc::<Path>::from(Path::new("/repo/first"));
-        let second_path = Arc::<Path>::from(Path::new("/repo/second"));
-
-        let first_registration = watcher
-            .add(first_path.clone(), false, |_| {})
-            .expect("native watch limit is handled");
-        let second_registration = watcher
-            .add(second_path, false, |_| {})
-            .expect("native watch limit backoff is handled");
-
-        assert!(first_registration.is_none());
-        assert!(second_registration.is_none());
-
-        let native_backend = native_backend.lock();
-        assert_eq!(native_backend.watch_calls, &[first_path.to_path_buf()]);
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    #[test]
-    fn removed_or_renamed_path_is_rewatched_once() {
-        let dir = PathBuf::from("/Repo/Dir");
-        let subdir = PathBuf::from("/Repo/Dir/Subdir");
-        let removal = notify::Event {
-            paths: vec![dir.clone()],
-            ..notify::Event::new(EventKind::Remove(notify::event::RemoveKind::Folder))
-        };
-        let overflow = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
-        let rename = |path: &str| notify::Event {
-            paths: vec![PathBuf::from(path)],
-            ..notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
-                notify::event::RenameMode::From,
-            )))
-        };
-
-        for (event, case_insensitive, rewatched) in [
-            (removal, false, &dir),
-            (overflow, false, &dir),
-            (rename("/Repo/Dir"), false, &subdir),
-            (rename("/repo/dir"), true, &subdir),
-        ] {
-            let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-            let watcher = test_os_watcher(OsWatcherKind::Native, Some(backend.clone()));
-            for path in [&dir, &dir, &subdir] {
-                watcher
-                    .add(path.as_path().into(), case_insensitive, |_| {})
-                    .expect("add watch")
-                    .expect("watch registered");
-            }
-
-            watcher.dispatch(Ok(event));
-            let rewatched = SanitizedPath::new(rewatched);
-            let key = WatchKey::for_registration(rewatched, case_insensitive);
-            watcher
-                .rewatch_if_stale(&mut watcher.state.lock(), rewatched, &key)
-                .expect("rewatch");
-
-            let backend = backend.lock();
-            assert_eq!(
-                backend.watch_calls,
-                &[
-                    dir.clone(),
-                    subdir.clone(),
-                    rewatched.as_path().to_path_buf()
-                ]
-            );
-            assert_eq!(backend.unwatch_calls, &[rewatched.as_path().to_path_buf()]);
-        }
-    }
-
-    fn modify_event(path: &str) -> notify::Event {
-        notify::Event {
-            paths: vec![PathBuf::from(path)],
-            ..notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
-        }
-    }
-
-    fn recording_watcher() -> (OsWatcher, Arc<Mutex<Vec<String>>>) {
-        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-        let watcher = test_os_watcher(OsWatcherKind::Native, Some(backend));
+    fn dispatch_batches_are_bounded_without_losing_or_reordering_events(cx: &TestAppContext) {
+        let watcher = watcher(cx);
         let fired = Arc::new(Mutex::new(Vec::new()));
-        for dir in ["/repo/a", "/repo/a/nested", "/repo/b"] {
-            let fired = fired.clone();
-            let label = dir.to_owned();
-            watcher
-                .add(Arc::<Path>::from(Path::new(dir)), false, move |_| {
-                    fired.lock().push(label.clone());
-                })
-                .expect("add watch")
-                .expect("watch registered");
-        }
-        (watcher, fired)
-    }
-
-    #[test]
-    fn event_dispatches_only_to_registrations_covering_its_path() {
-        let (watcher, fired) = recording_watcher();
-
-        watcher.dispatch(Ok(modify_event("/repo/a/file.txt")));
-
-        // Only the directory containing the file resolves; siblings stay untouched.
-        assert_eq!(*fired.lock(), vec!["/repo/a".to_owned()]);
-    }
-
-    #[test]
-    fn event_dispatches_to_every_ancestor_registration() {
-        let (watcher, fired) = recording_watcher();
-
-        watcher.dispatch(Ok(modify_event("/repo/a/nested/file.txt")));
-
-        // Both the directory containing the file and the ancestor watching it
-        // resync, each exactly once, matching the previous broadcast-and-filter
-        // behavior.
-        let mut got = fired.lock().clone();
-        got.sort();
-        assert_eq!(got, vec!["/repo/a".to_owned(), "/repo/a/nested".to_owned()]);
-    }
-
-    fn fired_count() -> (
-        Arc<Mutex<usize>>,
-        impl Fn(&notify::Event) + Send + Sync + 'static,
-    ) {
-        let fired = Arc::new(Mutex::new(0usize));
-        let cb = {
-            let fired = fired.clone();
-            move |_: &notify::Event| *fired.lock() += 1
-        };
-        (fired, cb)
-    }
-
-    #[test]
-    fn equivalent_path_spellings_share_watch_delivery_and_lifetime() {
-        for case_insensitive in [false, true] {
-            for spelling in ["/repo/project/", "/repo//project", "/repo/./project"] {
-                let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-                let watcher = test_os_watcher(OsWatcherKind::Native, Some(backend.clone()));
-                let (first_fired, first_callback) = fired_count();
-                let first = watcher
-                    .add(Path::new(spelling).into(), case_insensitive, first_callback)
-                    .expect("add alternate spelling")
-                    .expect("registered alternate spelling");
-                watcher.dispatch(Ok(modify_event("/repo/project/file.txt")));
-                assert_eq!(
-                    *first_fired.lock(),
-                    1,
-                    "{spelling}, folded={case_insensitive}"
-                );
-
-                let (second_fired, second_callback) = fired_count();
-                let second = watcher
-                    .add(
-                        Path::new("/repo/project").into(),
-                        case_insensitive,
-                        second_callback,
-                    )
-                    .expect("add ordinary spelling")
-                    .expect("registered ordinary spelling");
-                assert_eq!(backend.lock().watch_calls.len(), 1);
-                watcher.dispatch(Ok(modify_event("/repo/project/file.txt")));
-                assert_eq!(*first_fired.lock(), 2);
-                assert_eq!(*second_fired.lock(), 1);
-
-                watcher.remove(first);
-                assert!(backend.lock().unwatch_calls.is_empty());
-                watcher.dispatch(Ok(modify_event("/repo/project/file.txt")));
-                assert_eq!(*first_fired.lock(), 2);
-                assert_eq!(*second_fired.lock(), 2);
-                watcher.remove(second);
-                assert_eq!(backend.lock().unwatch_calls.len(), 1);
-                assert!(backend.lock().watched_paths.is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn folded_keys_preserve_root_and_parent_component_identity() {
-        for path in ["/", "/repo/../project", "./project", "project"] {
-            let ordinary = Path::new(path);
-            let with_separator = PathBuf::from(format!("{path}/"));
-            assert_eq!(ordinary, with_separator);
-            assert_eq!(
-                WatchKey::folded(SanitizedPath::new(ordinary)),
-                WatchKey::folded(SanitizedPath::new(&with_separator)),
-            );
-        }
-        for (left, right) in [
-            ("/", ""),
-            ("/repo/../project", "/project"),
-            ("./project", "project"),
-        ] {
-            assert_ne!(
-                WatchKey::folded(SanitizedPath::new(Path::new(left))),
-                WatchKey::folded(SanitizedPath::new(Path::new(right))),
-            );
-        }
-    }
-
-    #[test]
-    fn watch_key_folds_case_but_keeps_exact_distinct() {
-        let mixed = SanitizedPath::new(Path::new("/Repo/Proj"));
-        let lower = SanitizedPath::new(Path::new("/repo/proj"));
-
-        // Folded keys collide regardless of casing; exact keys do not.
-        assert_eq!(WatchKey::folded(mixed), WatchKey::folded(lower));
-        assert_ne!(WatchKey::exact(mixed), WatchKey::exact(lower));
-        // Exact and folded live in different key spaces even for the same path.
-        assert_ne!(WatchKey::exact(mixed), WatchKey::folded(mixed));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn watch_key_folds_unicode_normalization_on_macos() {
-        // "Café" precomposed (NFC) vs decomposed (NFD) are different byte
-        // sequences but the same directory on a normalization-insensitive volume.
-        let nfc = Path::new("/repo/Caf\u{00e9}");
-        let nfd = Path::new("/repo/Cafe\u{0301}");
-        assert_ne!(nfc, nfd);
-        assert_eq!(
-            WatchKey::folded(SanitizedPath::new(nfc)),
-            WatchKey::folded(SanitizedPath::new(nfd)),
-        );
-    }
-
-    #[test]
-    fn case_insensitive_registration_matches_differently_cased_event() {
-        let (fired, cb) = fired_count();
-        let watcher = test_os_watcher(OsWatcherKind::Native, Some(Default::default()));
         watcher
-            .add(Path::new("/Repo/Project").into(), true, cb)
-            .expect("add")
-            .expect("registered");
-
-        // Event arrives lowercased (as TSGO/macOS may report it).
-        watcher.dispatch(Ok(modify_event("/repo/project/file.txt")));
-        assert_eq!(*fired.lock(), 1);
-    }
-
-    #[test]
-    fn case_insensitive_registration_survives_case_only_rename() {
-        let (fired, cb) = fired_count();
-        let watcher = test_os_watcher(OsWatcherKind::Native, Some(Default::default()));
-        watcher
-            .add(Path::new("/Repo/Proj").into(), true, cb)
-            .expect("add")
-            .expect("registered");
-
-        // The watched directory was renamed to a different casing; events now
-        // arrive under the new spelling.
-        watcher.dispatch(Ok(modify_event("/Repo/PROJ/file.txt")));
-        assert_eq!(*fired.lock(), 1);
-    }
-
-    #[test]
-    fn case_sensitive_registration_ignores_differently_cased_event() {
-        let (fired, cb) = fired_count();
-        let watcher = test_os_watcher(OsWatcherKind::Native, Some(Default::default()));
-        watcher
-            .add(Path::new("/Repo/proj").into(), false, cb)
-            .expect("add")
-            .expect("registered");
-
-        // On a case-sensitive volume these are genuinely different directories.
-        watcher.dispatch(Ok(modify_event("/Repo/PROJ/file.txt")));
-        assert_eq!(*fired.lock(), 0);
-    }
-
-    #[test]
-    fn differently_cased_adds_dedupe_on_case_insensitive_volume() {
-        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-        let watcher = test_os_watcher(OsWatcherKind::Native, Some(backend.clone()));
-        watcher
-            .add(Path::new("/Repo/Proj").into(), true, |_| {})
-            .expect("add")
-            .expect("registered");
-        watcher
-            .add(Path::new("/repo/proj").into(), true, |_| {})
-            .expect("add")
-            .expect("registered");
-
-        // The second, differently-cased spelling reuses the same OS watch.
-        assert_eq!(backend.lock().watch_calls.len(), 1);
-    }
-
-    #[test]
-    fn recursive_parent_covers_differently_cased_child() {
-        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-        let watcher = test_os_watcher(OsWatcherKind::Poll, Some(backend.clone()));
-        watcher
-            .add(Path::new("/Repo").into(), true, |_| {})
-            .expect("add")
-            .expect("registered");
-        watcher
-            .add(Path::new("/repo/child").into(), true, |_| {})
-            .expect("add");
-
-        // The child is covered by the recursive parent despite the case mismatch.
-        assert_eq!(backend.lock().watch_calls, vec![PathBuf::from("/Repo")]);
-    }
-
-    #[test]
-    fn rescan_event_broadcasts_to_all_registrations_of_the_same_backend() {
-        let (watcher, fired) = recording_watcher();
-
-        let rescan = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
-        watcher.dispatch(Ok(rescan));
-
-        // A pathless rescan may have missed events anywhere, so every registration
-        // of that backend resyncs, regardless of which directory it watches.
-        let mut got = fired.lock().clone();
-        got.sort();
-        assert_eq!(
-            got,
-            vec![
-                "/repo/a".to_owned(),
-                "/repo/a/nested".to_owned(),
-                "/repo/b".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn dispatch_batches_are_bounded_without_losing_or_reordering_events() {
-        let (watcher, fired) = recording_watcher();
-        let (event_tx, event_rx) = async_channel::unbounded();
-        let rescan = || notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+            .add(Path::new("/root").into(), false, {
+                let fired = fired.clone();
+                move |event| fired.lock().push(event.paths.first().cloned())
+            })
+            .expect("register watch");
+        let (sender, receiver) = async_channel::unbounded();
         for _ in 0..MAX_DISPATCH_BATCH_SIZE {
-            event_tx.try_send(Ok(rescan())).expect("enqueue rescan");
+            sender
+                .try_send(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)))
+                .expect("enqueue rescan");
         }
         let expected = (0..MAX_DISPATCH_BATCH_SIZE * 2 + 3)
-            .map(|index| if index % 2 == 0 { "/repo/a" } else { "/repo/b" })
+            .map(|index| Some(PathBuf::from(format!("/root/{index}"))))
             .collect::<Vec<_>>();
-        for path in &expected {
-            event_tx
-                .try_send(Ok(modify_event(&format!("{path}/file.txt"))))
+        for path in expected.iter().flatten() {
+            sender
+                .try_send(Ok(
+                    Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.clone())
+                ))
                 .expect("enqueue event");
         }
-
-        let first = event_rx.try_recv().expect("first rescan");
-        watcher.dispatch_batch(first, &event_rx);
-        assert_eq!(fired.lock().len(), 3);
-        assert_eq!(event_rx.len(), expected.len());
+        let mut history = diagnostics::RescanHistory::default();
+        dispatch_batch(
+            OsWatcherKind::Native,
+            &watcher.state,
+            &mut history,
+            receiver.try_recv().expect("first rescan"),
+            &receiver,
+        );
+        assert_eq!(fired.lock().as_slice(), &[None]);
+        assert_eq!(receiver.len(), expected.len());
         fired.lock().clear();
-
-        let first = event_rx.try_recv().expect("first event");
-        watcher.dispatch_batch(first, &event_rx);
+        dispatch_batch(
+            OsWatcherKind::Native,
+            &watcher.state,
+            &mut history,
+            receiver.try_recv().expect("first event"),
+            &receiver,
+        );
         assert_eq!(
             fired.lock().as_slice(),
             &expected[..MAX_DISPATCH_BATCH_SIZE]
         );
-        assert_eq!(event_rx.len(), expected.len() - MAX_DISPATCH_BATCH_SIZE);
-
-        while let Ok(first) = event_rx.try_recv() {
-            watcher.dispatch_batch(first, &event_rx);
+        assert_eq!(receiver.len(), expected.len() - MAX_DISPATCH_BATCH_SIZE);
+        while let Ok(first) = receiver.try_recv() {
+            dispatch_batch(
+                OsWatcherKind::Native,
+                &watcher.state,
+                &mut history,
+                first,
+                &receiver,
+            );
         }
         assert_eq!(fired.lock().as_slice(), expected.as_slice());
     }
 
-    #[test]
-    fn queued_rescans_are_coalesced_without_dropping_normal_events() {
-        let (watcher, fired) = recording_watcher();
-        let (event_tx, event_rx) = async_channel::unbounded();
-        let rescan = || notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
-
-        event_tx.try_send(Ok(rescan())).unwrap();
-        event_tx
-            .try_send(Ok(modify_event("/repo/a/file.txt")))
-            .unwrap();
-        watcher.dispatch_batch(Ok(rescan()), &event_rx);
-
-        let mut got = fired.lock().clone();
-        got.sort();
-        assert_eq!(
-            got,
-            vec![
-                "/repo/a".to_owned(),
-                "/repo/a".to_owned(),
-                "/repo/a/nested".to_owned(),
-                "/repo/b".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn queued_rescans_naming_distinct_paths_are_all_dispatched() {
-        let (watcher, fired) = recording_watcher();
-        let (event_tx, event_rx) = async_channel::unbounded();
-        let rescan_of = |path: &str| {
-            notify::Event::new(EventKind::Other)
-                .set_flag(notify::event::Flag::Rescan)
-                .add_path(PathBuf::from(path))
-        };
-
-        event_tx.try_send(Ok(rescan_of("/repo/b"))).unwrap();
-        watcher.dispatch_batch(Ok(rescan_of("/repo/a/nested")), &event_rx);
-
-        // Each named rescan only covers its own subtree once it reaches the
-        // callbacks, so collapsing the second one would lose /repo/b's resync.
-        // Both are broadcast to every registration of the backend.
-        let mut got = fired.lock().clone();
-        got.sort();
-        assert_eq!(
-            got,
-            vec![
-                "/repo/a".to_owned(),
-                "/repo/a".to_owned(),
-                "/repo/a/nested".to_owned(),
-                "/repo/a/nested".to_owned(),
-                "/repo/b".to_owned(),
-                "/repo/b".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn event_dispatches_when_reported_path_has_verbatim_prefix() {
-        // `notify` (and Windows APIs generally) can report a changed path using the
-        // verbatim `\\?\` long-path form even when the directory was registered
-        // without it.
-        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
-        let watcher = test_os_watcher(OsWatcherKind::Native, Some(backend));
+    #[gpui::test]
+    fn overlapping_subscriptions_survive_parent_removal(cx: &TestAppContext) {
+        let watcher = watcher(cx);
         let fired = Arc::new(Mutex::new(Vec::new()));
-        {
+        let mut registrations = Vec::new();
+        for path in ["/root", "/root/child", "/other"] {
             let fired = fired.clone();
-            watcher
-                .add(
-                    Arc::<Path>::from(Path::new("C:\\repo\\src")),
-                    false,
-                    move |_| fired.lock().push(()),
-                )
-                .expect("add watch")
-                .expect("watch registered");
+            registrations.push(
+                watcher
+                    .add(Path::new(path).into(), false, move |_| {
+                        fired.lock().push(path)
+                    })
+                    .expect("register watch"),
+            );
         }
+        let event =
+            || Event::new(EventKind::Modify(ModifyKind::Any)).add_path("/root/child/file".into());
+        dispatch(OsWatcherKind::Native, &watcher.state, Ok(event()));
+        fired.lock().sort();
+        assert_eq!(*fired.lock(), ["/root", "/root/child"]);
+        if let Some(parent) = registrations.first() {
+            watcher.remove(*parent);
+        }
+        fired.lock().clear();
+        dispatch(OsWatcherKind::Native, &watcher.state, Ok(event()));
+        assert_eq!(*fired.lock(), ["/root/child"]);
+    }
 
-        watcher.dispatch(Ok(modify_event("\\\\?\\C:\\repo\\src\\main.rs")));
-
-        assert_eq!(fired.lock().len(), 1);
+    #[gpui::test]
+    fn loss_does_not_discard_adjacent_notifications(cx: &TestAppContext) {
+        let watcher = watcher(cx);
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        watcher
+            .add(Path::new("/root").into(), false, {
+                let fired = fired.clone();
+                move |event| fired.lock().push(event.need_rescan())
+            })
+            .expect("register watch");
+        let (sender, receiver) = async_channel::unbounded();
+        sender
+            .try_send(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)))
+            .expect("queue duplicate loss");
+        sender
+            .try_send(Ok(
+                Event::new(EventKind::Modify(ModifyKind::Any)).add_path("/root/file".into())
+            ))
+            .expect("queue file notification");
+        dispatch_batch(
+            OsWatcherKind::Native,
+            &watcher.state,
+            &mut diagnostics::RescanHistory::default(),
+            Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+            &receiver,
+        );
+        assert_eq!(*fired.lock(), [true, false]);
     }
 
     #[test]
-    fn test_coalesce_pending_rescans() {
-        let test_cases = [
-            TestCase {
-                name: "coalesces descendant rescans under pending ancestor",
-                pending_paths: vec![rescan("/root")],
-                path_events: vec![rescan("/root/child"), rescan("/root/child/grandchild")],
-                expected_pending_paths: vec![rescan("/root")],
-                expected_path_events: vec![],
+    fn physical_paths_are_mapped_to_each_logical_alias() {
+        let event = logical_event(
+            gix_notify::Event {
+                paths: vec!["/physical/child/file".into(), "/outside/file".into()],
+                kind: gix_notify::EventKind::Rename,
+                path_kind: gix_notify::PathKind::File,
             },
-            TestCase {
-                name: "new ancestor rescan replaces pending descendant rescans",
-                pending_paths: vec![
-                    changed("/other"),
-                    rescan("/root/child"),
-                    rescan("/root/child/grandchild"),
-                ],
-                path_events: vec![rescan("/root")],
-                expected_pending_paths: vec![changed("/other")],
-                expected_path_events: vec![rescan("/root")],
-            },
-            TestCase {
-                name: "same path rescan replaces pending non-rescan event",
-                pending_paths: vec![changed("/root")],
-                path_events: vec![rescan("/root")],
-                expected_pending_paths: vec![],
-                expected_path_events: vec![rescan("/root")],
-            },
-            TestCase {
-                name: "unrelated rescans are preserved",
-                pending_paths: vec![rescan("/root-a")],
-                path_events: vec![rescan("/root-b")],
-                expected_pending_paths: vec![rescan("/root-a")],
-                expected_path_events: vec![rescan("/root-b")],
-            },
-            TestCase {
-                name: "batch ancestor rescan replaces descendant rescan",
-                pending_paths: vec![],
-                path_events: vec![rescan("/root/child"), rescan("/root")],
-                expected_pending_paths: vec![],
-                expected_path_events: vec![rescan("/root")],
-            },
-        ];
+            &[
+                NativeAlias {
+                    physical: "/physical".into(),
+                    logical: "/symlink".into(),
+                    case_insensitive: false,
+                    rescan: false,
+                },
+                NativeAlias {
+                    physical: "/physical/child".into(),
+                    logical: "/another".into(),
+                    case_insensitive: false,
+                    rescan: false,
+                },
+            ],
+        );
+        assert_eq!(
+            event.paths,
+            [
+                PathBuf::from("/another/file"),
+                PathBuf::from("/symlink/child/file")
+            ]
+        );
+        assert!(matches!(event.kind, EventKind::Modify(ModifyKind::Name(_))));
+    }
 
-        for test_case in test_cases {
-            let mut pending_paths = test_case.pending_paths;
-            let mut path_events = test_case.path_events;
+    #[test]
+    fn native_file_watches_cover_atomic_replacement_through_parent() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"contents").expect("create watched file");
+        let file = std::fs::canonicalize(&file).expect("resolve watched file");
+        let file = SanitizedPath::new(&file).as_path().to_owned();
+        let (watches, aliases, missing) = native_watch_set(vec![(file.clone(), false)], false);
+        assert!(!missing);
+        assert_eq!(watches.len(), 1);
+        let parent = std::fs::canonicalize(directory.path()).expect("resolve parent");
+        let parent = SanitizedPath::new(&parent).as_path().to_owned();
+        assert_eq!(watches.first().map(|watch| &watch.path), Some(&parent));
+        assert!(watches.iter().all(|watch| !watch.recursive));
+        assert_eq!(aliases.first().map(|alias| &alias.logical), Some(&file));
 
-            coalesce_pending_rescans(&mut pending_paths, &mut path_events);
+        std::fs::remove_file(&file).expect("remove watched file");
+        let (watches, _, missing) = native_watch_set(vec![(file, false)], false);
+        assert!(missing);
+        assert_eq!(watches.first().map(|watch| &watch.path), Some(&parent));
+    }
 
+    #[test]
+    fn native_directory_watches_preserve_requested_recursion() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let root = std::fs::canonicalize(directory.path()).expect("resolve watched directory");
+        let root = SanitizedPath::new(&root).as_path().to_owned();
+        std::fs::create_dir_all(root.join("ignored/deep")).expect("create unloaded directories");
+        for recursive in [false, true] {
+            let (watches, _, _) = native_watch_set(vec![(root.clone(), false)], recursive);
+            assert_eq!(watches.len(), 2);
             assert_eq!(
-                pending_paths, test_case.expected_pending_paths,
-                "pending_paths mismatch for case: {}",
-                test_case.name
+                watches
+                    .iter()
+                    .find(|watch| watch.path == root)
+                    .map(|watch| watch.recursive),
+                Some(recursive)
             );
-            assert_eq!(
-                path_events, test_case.expected_path_events,
-                "path_events mismatch for case: {}",
-                test_case.name
+            assert!(
+                watches
+                    .iter()
+                    .filter(|watch| watch.path != root)
+                    .all(|watch| !watch.recursive)
             );
         }
+    }
+
+    #[gpui::test]
+    fn synthetic_backends_use_the_platform_recursion_contract(cx: &TestAppContext) {
+        struct Backend {
+            modes: Arc<Mutex<Vec<notify::RecursiveMode>>>,
+        }
+        impl WatchBackend for Backend {
+            fn watch(&mut self, _: &Path, mode: notify::RecursiveMode) -> notify::Result<()> {
+                self.modes.lock().push(mode);
+                Ok(())
+            }
+
+            fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+                Ok(())
+            }
+        }
+
+        for kind in [OsWatcherKind::Native, OsWatcherKind::Poll] {
+            let modes: Arc<Mutex<Vec<notify::RecursiveMode>>> = Default::default();
+            let watcher = OsWatcher::with_backend(
+                kind,
+                cx.executor(),
+                Some(Box::new(Backend {
+                    modes: modes.clone(),
+                })),
+            );
+            watcher
+                .add(Path::new(util::path!("/root")).into(), false, |_| {})
+                .expect("register synthetic watch");
+            let expected = if kind == OsWatcherKind::Poll
+                || gix_notify::asynchronous::Watcher::supports_native_recursive_watches()
+            {
+                notify::RecursiveMode::Recursive
+            } else {
+                notify::RecursiveMode::NonRecursive
+            };
+            assert_eq!(modes.lock().last(), Some(&expected));
+        }
+    }
+
+    #[gpui::test]
+    async fn missing_fake_path_is_registered_after_creation(cx: &mut TestAppContext) {
+        let fs = crate::FakeFs::new(cx.executor());
+        let root = Path::new(util::path!("/root"));
+        fs.create_dir(root).await.expect("create parent");
+        let file = root.join("file");
+        let (mut events, _watcher) = fs.watch(&file, Duration::ZERO).await;
+        fs.write(&file, b"contents")
+            .await
+            .expect("create watched file");
+        cx.run_until_parked();
+        cx.executor().advance_clock(poll_interval());
+        let batch = events.next().await.expect("receive creation notification");
+        assert!(batch.iter().any(|event| event.path == file));
+        assert_eq!(fs.registered_watch_paths(), [file]);
+    }
+
+    #[gpui::test]
+    async fn cancelling_next_preserves_pending_collection(cx: &mut TestAppContext) {
+        let fs = crate::FakeFs::new(cx.executor());
+        let root = Path::new(util::path!("/root"));
+        fs.create_dir(root).await.expect("create root");
+        let (mut events, _watcher) = watch(
+            fs.clone(),
+            fs.native_watcher.clone(),
+            fs.poll_watcher.clone(),
+            cx.executor(),
+            root,
+            Duration::from_millis(100),
+        )
+        .await;
+        let file = root.join("file");
+        fs.write(&file, b"contents")
+            .await
+            .expect("change watched file");
+        cx.run_until_parked();
+        assert!(events.next().now_or_never().is_none());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        let batch = events
+            .next()
+            .await
+            .expect("receive collected notifications");
+        assert!(batch.iter().any(|event| event.path == file));
+    }
+
+    #[gpui::test]
+    async fn replacement_bursts_preserve_updates_and_barrier_order() {
+        let (sender, receiver) = async_channel::unbounded();
+        let queued = AtomicBool::new(false);
+        for _ in 0..1_000 {
+            request_native_replacement(&sender, &queued).expect("queue initial replacement");
+        }
+        let (barrier_sender, barrier_receiver) = async_channel::bounded(1);
+        sender
+            .try_send(NativeCommand::Barrier(barrier_sender))
+            .expect("queue registration barrier");
+        assert_eq!(receiver.len(), 2);
+        let mut retry = None;
+        let activity = next_native_activity(
+            futures::future::pending(),
+            &receiver,
+            &mut retry,
+            false,
+            &queued,
+        )
+        .await;
+        assert!(matches!(
+            activity,
+            NativeActivity::Command(NativeCommand::Replace)
+        ));
+        assert!(!queued.load(Ordering::Acquire));
+
+        for _ in 0..1_000 {
+            request_native_replacement(&sender, &queued).expect("queue update during registration");
+        }
+        assert_eq!(receiver.len(), 2);
+        match next_native_activity(
+            futures::future::pending(),
+            &receiver,
+            &mut retry,
+            false,
+            &queued,
+        )
+        .await
+        {
+            NativeActivity::Command(NativeCommand::Barrier(reply)) => reply
+                .try_send(())
+                .expect("acknowledge completed registration"),
+            _ => panic!("later replacements overtook the registration barrier"),
+        }
+        barrier_receiver
+            .recv()
+            .await
+            .expect("receive registration acknowledgement");
+        assert!(queued.load(Ordering::Acquire));
+        let activity = next_native_activity(
+            futures::future::pending(),
+            &receiver,
+            &mut retry,
+            false,
+            &queued,
+        )
+        .await;
+        assert!(matches!(
+            activity,
+            NativeActivity::Command(NativeCommand::Replace)
+        ));
+        assert!(!queued.load(Ordering::Acquire));
+        assert!(receiver.is_empty());
+    }
+
+    #[gpui::test]
+    async fn stopped_backend_waits_for_recovery_and_coalesces_replacements(
+        cx: &mut TestAppContext,
+    ) {
+        let (sender, receiver) = async_channel::unbounded();
+        let queued = AtomicBool::new(false);
+        for _ in 0..3 {
+            request_native_replacement(&sender, &queued).expect("queue replacement");
+        }
+        let mut retry = Some(cx.executor().timer(Duration::from_secs(1)));
+        let activity = next_native_activity(
+            futures::future::ready(()),
+            &receiver,
+            &mut retry,
+            true,
+            &queued,
+        );
+        futures::pin_mut!(activity);
+        assert!(activity.as_mut().now_or_never().is_none());
+        assert!(!queued.load(Ordering::Acquire));
+        for _ in 0..3 {
+            request_native_replacement(&sender, &queued)
+                .expect("queue replacement during recovery");
+        }
+        assert!(activity.as_mut().now_or_never().is_none());
+        assert!(!queued.load(Ordering::Acquire));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(999));
+        cx.run_until_parked();
+        assert!(activity.as_mut().now_or_never().is_none());
+        cx.executor().advance_clock(Duration::from_millis(1));
+        assert!(matches!(activity.await, NativeActivity::Retry));
+        assert!(receiver.try_recv().is_err());
+        request_native_replacement(&sender, &queued).expect("queue replacement after recovery");
+        assert!(matches!(receiver.try_recv(), Ok(NativeCommand::Replace)));
+    }
+
+    #[test]
+    fn pending_overflow_collapses_to_registered_roots_with_one_wakeup() {
+        let pending: Arc<Mutex<Vec<PathEvent>>> = Default::default();
+        let (sender, receiver) = async_channel::bounded(1);
+        let events = (0..=MAX_PENDING_EVENTS)
+            .map(|index| PathEvent {
+                path: PathBuf::from(format!("/root/file-{index}")),
+                kind: Some(PathEventKind::Changed),
+            })
+            .collect();
+        enqueue_path_events(&sender, &pending, events, || {
+            vec!["/root".into(), "/outside/file".into()]
+        });
+        assert_eq!(pending.lock().len(), 2);
+        assert!(
+            pending
+                .lock()
+                .iter()
+                .all(|event| event.kind == Some(PathEventKind::Rescan))
+        );
+        receiver.try_recv().expect("receive overflow wakeup");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[gpui::test]
+    fn synthetic_transport_overflow_requests_rescan(cx: &TestAppContext) {
+        let watcher = watcher(cx);
+        let rescans = Arc::new(Mutex::new(0));
+        watcher
+            .add(Path::new("/root").into(), false, {
+                let rescans = rescans.clone();
+                move |event| {
+                    if event.need_rescan() {
+                        *rescans.lock() += 1;
+                    }
+                }
+            })
+            .expect("register root");
+        let sink = watcher.event_sink();
+        for index in 0..=MAX_PENDING_EVENTS {
+            sink(Ok(Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(PathBuf::from(format!("/root/file-{index}")))));
+        }
+        cx.run_until_parked();
+        assert_eq!(*rescans.lock(), 1);
+    }
+
+    #[test]
+    fn case_folding_keeps_component_boundaries_and_exact_paths_distinct() {
+        let root = SanitizedPath::new(Path::new("/Root"));
+        assert!(path_is_under(
+            SanitizedPath::new(Path::new("/root/file")),
+            root,
+            true
+        ));
+        assert!(!path_is_under(
+            SanitizedPath::new(Path::new("/root-other/file")),
+            root,
+            true
+        ));
+        assert_ne!(
+            WatchKey::exact(root),
+            WatchKey::exact(SanitizedPath::new(Path::new("/root")))
+        );
+        assert_eq!(
+            WatchKey::folded(root),
+            WatchKey::folded(SanitizedPath::new(Path::new("/root")))
+        );
     }
 }

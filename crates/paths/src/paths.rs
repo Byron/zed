@@ -630,8 +630,5 @@ pub fn global_gitignore_path() -> Option<PathBuf> {
 
 #[cfg(not(any(test, feature = "test-support")))]
 pub fn global_gitignore_path() -> Option<PathBuf> {
-    static GLOBAL_GITIGNORE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-    GLOBAL_GITIGNORE_PATH
-        .get_or_init(::ignore::gitignore::gitconfig_excludes_path)
-        .clone()
+    ::ignore::gitignore::gitconfig_excludes_path()
 }

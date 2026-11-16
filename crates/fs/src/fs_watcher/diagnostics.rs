@@ -1,4 +1,4 @@
-use super::{Coverage, OsWatcher, OsWatcherKind};
+use super::{OsWatcher, OsWatcherKind};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::{
@@ -6,7 +6,7 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Weak},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const EVENT_CAPACITY: usize = 10_000;
@@ -187,9 +187,7 @@ impl WatchRecording {
                 let state = watcher.state.lock();
                 let mut roots: Vec<_> = state
                     .paths
-                    .0
                     .values()
-                    .filter(|path| matches!(path.coverage, Coverage::Watched { .. }))
                     .map(|path| WatchRoot {
                         path: path.path.as_path().to_string_lossy().into_owned(),
                         registrations: path.watcher_ids.len(),
@@ -200,10 +198,7 @@ impl WatchRecording {
                     backend: watcher.kind,
                     recursive: watcher.recursive,
                     roots,
-                    cooldown_remaining_millis: state
-                        .cooldown_until
-                        .and_then(|until| until.checked_duration_since(Instant::now()))
-                        .map(|remaining| remaining.as_millis()),
+                    cooldown_remaining_millis: None,
                 }
             })
             .collect();
@@ -360,14 +355,8 @@ mod tests {
     fn recording_snapshots_existing_roots_and_registration_errors(cx: &TestAppContext) {
         let watcher = watcher(OsWatcherKind::Native, cx);
         let root = util::path!("/root");
-        let registration = watcher
-            .add(Path::new(root).into(), false, |_| {})
-            .unwrap()
-            .unwrap();
-        let duplicate = watcher
-            .add(Path::new(root).into(), false, |_| {})
-            .unwrap()
-            .unwrap();
+        let registration = watcher.add(Path::new(root).into(), false, |_| {}).unwrap();
+        let duplicate = watcher.add(Path::new(root).into(), false, |_| {}).unwrap();
         let recording = WatchRecording::new([watcher.clone()]);
         let snapshot = recording.snapshot();
         assert!(snapshot.events.is_empty());
@@ -392,26 +381,25 @@ mod tests {
     }
 
     #[gpui::test]
-    fn recording_snapshots_retained_roots_without_registrations(cx: &TestAppContext) {
-        let watcher = watcher(OsWatcherKind::Poll, cx);
+    fn recording_keeps_remaining_subscriber_roots(cx: &TestAppContext) {
+        let watcher = watcher(OsWatcherKind::Native, cx);
         let root = util::path!("/root");
+        let child = Path::new(root).join("child");
         let registration = watcher
             .add(Path::new(root).into(), false, |_| {})
-            .unwrap()
-            .unwrap();
-        let covered = watcher
-            .add(Path::new(util::path!("/root/fail")).into(), false, |_| {})
-            .unwrap()
-            .unwrap();
+            .expect("register root");
+        let descendant = watcher
+            .add(child.as_path().into(), false, |_| {})
+            .expect("register child");
         let recording = WatchRecording::new([watcher.clone()]);
 
         watcher.remove(registration);
-        let roots = &recording.snapshot().watchers[0].roots;
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].path, root);
-        assert_eq!(roots[0].registrations, 0);
+        let snapshot = recording.snapshot();
+        assert_eq!(snapshot.watchers[0].roots.len(), 1);
+        assert_eq!(snapshot.watchers[0].roots[0].path, child.to_string_lossy());
+        assert_eq!(snapshot.watchers[0].roots[0].registrations, 1);
 
-        watcher.remove(covered);
+        watcher.remove(descendant);
         assert!(recording.snapshot().watchers[0].roots.is_empty());
     }
 }
