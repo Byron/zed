@@ -464,10 +464,16 @@ pub async fn stream_completion(
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<ResponseStreamEvent, OpenRouterError>>, OpenRouterError> {
     let headers = completion_headers(extra_headers);
-    let events =
-        open_ai::stream_chat_completion(client, "OpenRouter", api_url, api_key, &headers, &request)
-            .await
-            .map_err(OpenRouterError::from_chat_completion_request_error)?;
+    let events = open_ai::stream_chat_completion(
+        client,
+        "OpenRouter",
+        api_url,
+        open_ai::ApiAuthentication::Bearer(api_key),
+        &headers,
+        &request,
+    )
+    .await
+    .map_err(OpenRouterError::from_chat_completion_request_error)?;
     Ok(events
         .filter_map(|event| async move {
             let value = match event {

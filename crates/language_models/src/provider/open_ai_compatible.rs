@@ -13,11 +13,11 @@ use language_model::{
     SubPageProviderSettings, unavailable_error,
 };
 use open_ai::{
-    ResponseStreamEvent,
+    ApiAuthentication, ResponseStreamEvent,
     responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
     stream_completion,
 };
-use settings::Settings;
+use settings::{OpenAiCompatibleApiKeyHeader, Settings};
 use std::sync::Arc;
 use ui::IconName;
 
@@ -34,6 +34,7 @@ const API_KEY_PLACEHOLDER: &str = "000000000000000000000000000000000000000000000
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenAiCompatibleSettings {
     pub api_url: String,
+    pub api_key_header: OpenAiCompatibleApiKeyHeader,
     pub available_models: Vec<AvailableModel>,
     pub custom_headers: CustomHeaders,
 }
@@ -149,14 +150,16 @@ impl OpenAiCompatibleLanguageModelProvider {
     > {
         let http_client = self.http_client.clone();
 
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
-            (
-                state.api_key_state.key(api_url),
-                state.settings.api_url.clone(),
-                state.settings.custom_headers.clone(),
-            )
-        });
+        let (api_key, api_url, api_key_header, extra_headers) =
+            self.state.read_with(cx, |state, _cx| {
+                let api_url = &state.settings.api_url;
+                (
+                    state.api_key_state.key(api_url),
+                    state.settings.api_url.clone(),
+                    state.settings.api_key_header,
+                    state.settings.custom_headers.clone(),
+                )
+            });
 
         let provider = self.name.clone();
         let future = request_limiter.stream(async move {
@@ -167,7 +170,7 @@ impl OpenAiCompatibleLanguageModelProvider {
                 http_client.as_ref(),
                 provider.0.as_str(),
                 &api_url,
-                &api_key,
+                api_authentication(api_key_header, &api_key),
                 request,
                 &extra_headers,
             );
@@ -194,14 +197,16 @@ impl OpenAiCompatibleLanguageModelProvider {
     > {
         let http_client = self.http_client.clone();
 
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
-            (
-                state.api_key_state.key(api_url),
-                state.settings.api_url.clone(),
-                state.settings.custom_headers.clone(),
-            )
-        });
+        let (api_key, api_url, api_key_header, extra_headers) =
+            self.state.read_with(cx, |state, _cx| {
+                let api_url = &state.settings.api_url;
+                (
+                    state.api_key_state.key(api_url),
+                    state.settings.api_url.clone(),
+                    state.settings.api_key_header,
+                    state.settings.custom_headers.clone(),
+                )
+            });
 
         let provider = self.name.clone();
         let future = request_limiter.stream(async move {
@@ -212,7 +217,7 @@ impl OpenAiCompatibleLanguageModelProvider {
                 http_client.as_ref(),
                 provider.0.as_str(),
                 &api_url,
-                &api_key,
+                api_authentication(api_key_header, &api_key),
                 request,
                 &extra_headers,
             );
@@ -221,6 +226,13 @@ impl OpenAiCompatibleLanguageModelProvider {
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
+    }
+}
+
+fn api_authentication(header: OpenAiCompatibleApiKeyHeader, key: &str) -> ApiAuthentication<'_> {
+    match header {
+        OpenAiCompatibleApiKeyHeader::Authorization => ApiAuthentication::Bearer(key),
+        OpenAiCompatibleApiKeyHeader::ApiKey => ApiAuthentication::ApiKey(key),
     }
 }
 

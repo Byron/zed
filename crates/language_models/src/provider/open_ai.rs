@@ -194,7 +194,7 @@ impl OpenAiLanguageModelProvider {
                 http_client.as_ref(),
                 provider.0.as_str(),
                 &api_url,
-                &api_key,
+                open_ai::ApiAuthentication::Bearer(&api_key),
                 request,
                 &extra_headers,
             );
@@ -238,7 +238,7 @@ impl OpenAiLanguageModelProvider {
                 http_client.as_ref(),
                 provider.0.as_str(),
                 &api_url,
-                &api_key,
+                open_ai::ApiAuthentication::Bearer(&api_key),
                 request,
                 &extra_headers,
             );

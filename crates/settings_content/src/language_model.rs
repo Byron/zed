@@ -423,8 +423,17 @@ impl MergeFrom for OpenAiReasoningEffort {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
 pub struct OpenAiCompatibleSettingsContent {
     pub api_url: String,
+    pub api_key_header: Option<OpenAiCompatibleApiKeyHeader>,
     pub available_models: Vec<OpenAiCompatibleAvailableModel>,
     pub custom_headers: Option<HashMap<String, String>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenAiCompatibleApiKeyHeader {
+    #[default]
+    Authorization,
+    ApiKey,
 }
 
 #[with_fallible_options]

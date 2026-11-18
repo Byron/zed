@@ -8,8 +8,8 @@ mod chat_completion_transport_tests;
 use anyhow::{Context as _, Result};
 use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
 use http_client::{
-    AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest, RequestBuilderExt,
-    StatusCode,
+    AsyncBody, Builder, CustomHeaders, HttpClient, HttpRequestExt, Method, RedirectPolicy,
+    Request as HttpRequest, RequestBuilderExt, StatusCode,
     http::{HeaderMap, HeaderValue},
 };
 use language_model_core::LanguageModelCompletionError;
@@ -26,6 +26,34 @@ use strum::EnumIter;
 use thiserror::Error;
 
 pub const OPEN_AI_API_URL: &str = "https://api.openai.com/v1";
+
+pub enum ApiAuthentication<'a> {
+    Bearer(&'a str),
+    ApiKey(&'a str),
+}
+
+impl ApiAuthentication<'_> {
+    fn apply(self, request: Builder, provider_name: &str) -> Result<Builder, RequestError> {
+        match self {
+            Self::Bearer(key) => {
+                Ok(request.header("Authorization", format!("Bearer {}", key.trim())))
+            }
+            Self::ApiKey(key) => {
+                let mut key = HeaderValue::from_str(key.trim()).map_err(|error| {
+                    RequestError::BuildRequestBody {
+                        provider: provider_name.to_string(),
+                        error: error.into(),
+                    }
+                })?;
+                key.set_sensitive(true);
+                // Redirect handlers only strip standard credential headers across origins.
+                Ok(request
+                    .follow_redirects(RedirectPolicy::NoFollow)
+                    .header("api-key", key))
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -1020,7 +1048,13 @@ pub async fn non_streaming_chat_completion<RequestBody>(
 where
     RequestBody: Serialize + ?Sized,
 {
-    let request = chat_completion_request(provider_name, api_url, api_key, extra_headers, request)?;
+    let request = chat_completion_request(
+        provider_name,
+        api_url,
+        ApiAuthentication::Bearer(api_key),
+        extra_headers,
+        request,
+    )?;
     let host = request.uri().host().unwrap_or(api_url).to_owned();
     let mut response = client
         .send(request)
@@ -1080,7 +1114,7 @@ pub async fn stream_chat_completion<RequestBody>(
     client: &dyn HttpClient,
     provider_name: &str,
     api_url: &str,
-    api_key: &str,
+    api_key: ApiAuthentication<'_>,
     extra_headers: &CustomHeaders,
     request: &RequestBody,
 ) -> Result<
@@ -1153,7 +1187,7 @@ pub async fn stream_completion(
     client: &dyn HttpClient,
     provider_name: &str,
     api_url: &str,
-    api_key: &str,
+    api_key: ApiAuthentication<'_>,
     request: Request,
     extra_headers: &CustomHeaders,
 ) -> Result<
@@ -1219,7 +1253,7 @@ pub async fn stream_completion(
 fn chat_completion_request<RequestBody>(
     provider_name: &str,
     api_url: &str,
-    api_key: &str,
+    api_key: ApiAuthentication<'_>,
     extra_headers: &CustomHeaders,
     request: &RequestBody,
 ) -> std::result::Result<HttpRequest<AsyncBody>, RequestError>
@@ -1230,11 +1264,12 @@ where
         provider: provider_name.to_string(),
         error,
     })?;
-    HttpRequest::builder()
+    let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(format!("{api_url}/chat/completions"))
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .header("Content-Type", "application/json");
+    api_key
+        .apply(request, provider_name)?
         .extra_headers(extra_headers)
         .body(AsyncBody::from(body))
         .map_err(|error| RequestError::BuildRequestBody {

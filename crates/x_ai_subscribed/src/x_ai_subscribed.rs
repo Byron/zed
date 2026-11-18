@@ -449,7 +449,7 @@ fn stream_open_ai_completion(
                     http_client.as_ref(),
                     PROVIDER_NAME.0.as_str(),
                     XAI_API_URL,
-                    &access_token,
+                    open_ai::ApiAuthentication::Bearer(&access_token),
                     request,
                     &extra_headers,
                 )

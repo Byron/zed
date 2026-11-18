@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use collections::HashMap;
-use settings::RegisterSetting;
+use settings::{OpenAiCompatibleApiKeyHeader, RegisterSetting};
 
 use crate::provider::{
     anthropic, anthropic::AnthropicSettings, anthropic_compatible::AnthropicCompatibleSettings,
@@ -177,15 +177,21 @@ impl settings::Settings for AllLanguageModelSettings {
                 .into_iter()
                 .map(|(key, value)| {
                     let provider_label = format!("OpenAI Compatible ({key})");
+                    let api_key_header = value.api_key_header.unwrap_or_default();
+                    let reserved_headers: &[&str] = match api_key_header {
+                        OpenAiCompatibleApiKeyHeader::Authorization => &[],
+                        OpenAiCompatibleApiKeyHeader::ApiKey => &["api-key"],
+                    };
                     (
                         key,
                         OpenAiCompatibleSettings {
                             api_url: value.api_url,
+                            api_key_header,
                             available_models: value.available_models,
                             custom_headers: custom_headers_from(
                                 &provider_label,
                                 value.custom_headers,
-                                &[],
+                                reserved_headers,
                             ),
                         },
                     )

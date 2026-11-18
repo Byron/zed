@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize, ser::SerializeSeq as _};
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::{ReasoningEffort, RequestError, Role, ServiceTier, ToolChoice};
+use crate::{ApiAuthentication, ReasoningEffort, RequestError, Role, ServiceTier, ToolChoice};
 use language_model_core::{
     CompactedContext, LanguageModelProviderId, ProviderCompactionState, SharedString,
 };
@@ -880,17 +880,18 @@ pub async fn stream_response(
     client: &dyn HttpClient,
     provider_name: &str,
     api_url: &str,
-    api_key: &str,
+    api_key: ApiAuthentication<'_>,
     request: Request,
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<StreamEvent, RequestError>>, RequestError> {
     let uri = format!("{api_url}/responses");
     let is_streaming = request.stream;
-    let request = HttpRequest::builder()
+    let builder = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .header("Content-Type", "application/json");
+    let request = api_key
+        .apply(builder, provider_name)?
         .extra_headers(extra_headers)
         .body(AsyncBody::from(
             serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?,
@@ -1214,7 +1215,7 @@ mod tests {
                     client.as_ref(),
                     "Custom",
                     "https://example.com/v1",
-                    "test-key",
+                    ApiAuthentication::Bearer("test-key"),
                     request,
                     &CustomHeaders::default(),
                 )
@@ -1237,6 +1238,34 @@ mod tests {
             assert_eq!(thinking.concat(), "Let me think.");
             assert!(thinking.iter().all(|text| !text.is_empty()));
         }
+    }
+
+    #[test]
+    fn streaming_responses_sends_api_key_header() {
+        let client = FakeHttpClient::create(|request| async move {
+            assert_eq!(request.headers()["api-key"], "subscription-key");
+            assert!(request.headers()["api-key"].is_sensitive());
+            assert!(!request.headers().contains_key("authorization"));
+            assert_eq!(
+                request.extensions().get::<http_client::RedirectPolicy>(),
+                Some(&http_client::RedirectPolicy::NoFollow)
+            );
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(AsyncBody::from("data: [DONE]\n\n"))?)
+        });
+        let mut request = response_test_request();
+        request.stream = true;
+        let mut stream = block_on(stream_response(
+            client.as_ref(),
+            "Azure",
+            "https://example.com/v1",
+            ApiAuthentication::ApiKey(" subscription-key "),
+            request,
+            &CustomHeaders::default(),
+        ))
+        .expect("streaming request");
+        assert!(block_on(stream.next()).is_none());
     }
 
     #[test]
@@ -1270,7 +1299,7 @@ mod tests {
                 client.as_ref(),
                 "Custom Responses",
                 "https://example.com/v1",
-                "test-key",
+                ApiAuthentication::Bearer("test-key"),
                 response_test_request(),
                 &CustomHeaders::default(),
             )
@@ -1552,7 +1581,7 @@ mod tests {
             http_client.as_ref(),
             "ChatGPT Subscription",
             "https://chatgpt.com/backend-api/codex",
-            "secret",
+            ApiAuthentication::Bearer("secret"),
             response_test_request(),
             &CustomHeaders::default(),
         ));

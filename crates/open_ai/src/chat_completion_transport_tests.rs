@@ -54,7 +54,7 @@ fn streaming_transport_serializes_custom_requests_and_reports_done() {
             client.as_ref(),
             "Compatible Provider",
             "https://example.com/v1",
-            " secret ",
+            ApiAuthentication::Bearer(" secret "),
             &extra_headers,
             &json!({"model": "custom/model", "provider_option": true}),
         )
@@ -89,6 +89,36 @@ fn streaming_transport_serializes_custom_requests_and_reports_done() {
 }
 
 #[test]
+fn streaming_chat_completions_sends_api_key_header() {
+    let client = FakeHttpClient::create(|request| async move {
+        assert_eq!(request.headers()["api-key"], "subscription-key");
+        assert!(request.headers()["api-key"].is_sensitive());
+        assert!(!request.headers().contains_key("authorization"));
+        assert_eq!(
+            request.extensions().get::<RedirectPolicy>(),
+            Some(&RedirectPolicy::NoFollow)
+        );
+        Ok(Response::builder()
+            .status(200)
+            .body(AsyncBody::from("data: [DONE]\n\n"))?)
+    });
+
+    let mut stream = block_on(stream_chat_completion(
+        client.as_ref(),
+        "Azure",
+        "https://example.com/v1",
+        ApiAuthentication::ApiKey(" subscription-key "),
+        &CustomHeaders::default(),
+        &json!({"model": "deployment"}),
+    ))
+    .expect("streaming request");
+    assert!(matches!(
+        block_on(stream.next()),
+        Some(Ok(ChatCompletionStreamEvent::Done))
+    ));
+}
+
+#[test]
 fn streaming_transport_does_not_synthesize_done_at_eof() {
     let client = FakeHttpClient::create(|_| async move {
         Ok(Response::builder()
@@ -101,7 +131,7 @@ fn streaming_transport_does_not_synthesize_done_at_eof() {
             client.as_ref(),
             "Compatible Provider",
             "https://example.com/v1",
-            "secret",
+            ApiAuthentication::Bearer("secret"),
             &CustomHeaders::default(),
             &json!({"model": "custom/model"}),
         )
@@ -142,7 +172,7 @@ fn streaming_transport_preserves_usage_limit_errors() {
             client.as_ref(),
             "Compatible Provider",
             "https://example.com/v1",
-            "secret",
+            ApiAuthentication::Bearer("secret"),
             request,
             &CustomHeaders::default(),
         )
@@ -202,7 +232,7 @@ fn streaming_transport_preserves_decode_and_read_errors() {
                 client.as_ref(),
                 "Compatible Provider",
                 "https://example.com/v1",
-                "secret",
+                ApiAuthentication::Bearer("secret"),
                 request,
                 &CustomHeaders::default(),
             )

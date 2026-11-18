@@ -503,6 +503,8 @@ By default, OpenAI-compatible models inherit these capabilities:
 - `interleaved_reasoning`: `false`
 - `max_tokens_parameter`: `false`
 
+If your endpoint expects the key in an `api-key` header, set `api_key_header` to `"api-key"` in the provider's settings. Zed reads the key from the usual credential sources. By default, Zed sends `Authorization: Bearer`.
+
 If a model only works with the Responses API, set `capabilities.chat_completions` to `false`. Zed will use the Responses endpoint for that model.
 
 For reasoning models (e.g. GPT-5), set `reasoning_effort` to the non-`none` effort level your endpoint supports. This enables thinking in the agent panel and tells Zed which effort to send when thinking is enabled. The provider settings UI can configure this when adding an OpenAI-compatible provider. Zed sends OpenAI-style `reasoning_effort` on chat-completions requests.

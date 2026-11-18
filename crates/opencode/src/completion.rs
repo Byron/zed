@@ -103,7 +103,7 @@ pub async fn stream_completion(
                 client,
                 config.provider_name.0.as_ref(),
                 &format!("{api_url}/v1"),
-                config.api_key,
+                open_ai::ApiAuthentication::Bearer(config.api_key),
                 request,
                 config.custom_headers,
             )
@@ -130,7 +130,7 @@ pub async fn stream_completion(
                 client,
                 config.provider_name.0.as_ref(),
                 &format!("{api_url}/v1"),
-                config.api_key,
+                open_ai::ApiAuthentication::Bearer(config.api_key),
                 request,
                 config.custom_headers,
             )

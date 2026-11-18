@@ -806,7 +806,7 @@ pub fn compact(
                     http_client.as_ref(),
                     PROVIDER_NAME.0.as_str(),
                     CODEX_BASE_URL,
-                    &access_token,
+                    open_ai::ApiAuthentication::Bearer(&access_token),
                     responses_request,
                     &extra_headers,
                 )
@@ -881,7 +881,7 @@ pub fn stream_completion(
                     http_client.as_ref(),
                     PROVIDER_NAME.0.as_str(),
                     CODEX_BASE_URL,
-                    &access_token,
+                    open_ai::ApiAuthentication::Bearer(&access_token),
                     responses_request,
                     &extra_headers,
                 )
