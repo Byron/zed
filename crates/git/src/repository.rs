@@ -1247,14 +1247,10 @@ impl RealGitRepository {
         match gix::ThreadSafeRepository::open_opts(path, Self::gix_open_options()) {
             Ok(repository) => Ok(repository),
             Err(open_error) if path.is_dir() => {
-                let trust_map = gix::sec::trust::Mapping {
-                    full: Self::gix_open_options(),
-                    reduced: Self::gix_open_options(),
-                };
                 gix::ThreadSafeRepository::discover_opts(
                     path,
                     gix::discover::upwards::Options::default(),
-                    trust_map,
+                    |_, _| Self::gix_open_options(),
                 )
                 .with_context(|| {
                     format!(
