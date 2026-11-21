@@ -1802,6 +1802,12 @@ pub fn rust_lang() -> Arc<Language> {
 
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
+pub fn python_lang() -> Arc<Language> {
+    test_language("python", tree_sitter_python::LANGUAGE.into())
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn json_lang() -> Arc<Language> {
     test_language("json", tree_sitter_json::LANGUAGE.into())
 }

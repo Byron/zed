@@ -141,7 +141,7 @@ pub struct OutlinePanel {
     buffers: HashMap<BufferId, BufferOutlines>,
     cached_entries: Vec<CachedEntry>,
     filter_editor: Entity<Editor>,
-    show_public_symbols_only: bool,
+    symbol_filter: SymbolFilter,
     mode: ItemsDisplayMode,
     max_width_item_index: Option<usize>,
     preserve_selection_on_buffer_fold_toggles: HashSet<BufferId>,
@@ -149,6 +149,13 @@ pub struct OutlinePanel {
     default_depth_applied_buffers: HashSet<BufferId>,
     outline_children_cache: HashMap<BufferId, OutlineChildren>,
     hide_symbols_override: Option<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SymbolFilter {
+    All,
+    Public,
+    Tests,
 }
 
 #[derive(Debug)]
@@ -343,6 +350,7 @@ struct CachedEntry {
     depth: usize,
     string_match: Option<StringMatch>,
     entry: PanelEntry,
+    test_name: Option<SharedString>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1260,7 +1268,7 @@ impl OutlinePanel {
                 rendered_entries_len: 0,
                 focus_handle,
                 filter_editor,
-                show_public_symbols_only: false,
+                symbol_filter: SymbolFilter::All,
                 fs_entries: Vec::new(),
                 fs_children_count: HashMap::default(),
                 collapsed_entries: HashSet::default(),
@@ -2549,6 +2557,7 @@ impl OutlinePanel {
         outline: &Outline,
         depth: usize,
         string_match: Option<&StringMatch>,
+        test_name: Option<&SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -2557,29 +2566,40 @@ impl OutlinePanel {
             outline.range, outline.text,
         )));
 
-        let label_element = outline::render_item(
-            &outline,
-            string_match
-                .map(|string_match| string_match.ranges().collect::<Vec<_>>())
-                .unwrap_or_default(),
-            cx,
-        )
-        .into_any_element();
+        let label_element = if let Some(test_name) = test_name {
+            HighlightedLabel::new(
+                test_name.clone(),
+                string_match
+                    .map(|string_match| string_match.positions.clone())
+                    .unwrap_or_default(),
+            )
+            .into_any_element()
+        } else {
+            outline::render_item(
+                outline,
+                string_match
+                    .map(|string_match| string_match.ranges().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                cx,
+            )
+            .into_any_element()
+        };
 
         let is_active = match self.selected_entry() {
             Some(PanelEntry::Outline(OutlineEntry::Outline(selected))) => outline == selected,
             _ => false,
         };
 
-        let has_children = self
-            .outline_children_cache
-            .get(&outline.range.start.buffer_id)
-            .and_then(|children_map| {
-                let key = (outline.range.clone(), outline.depth);
-                children_map.get(&key)
-            })
-            .copied()
-            .unwrap_or(false);
+        let has_children = test_name.is_none()
+            && self
+                .outline_children_cache
+                .get(&outline.range.start.buffer_id)
+                .and_then(|children_map| {
+                    let key = (outline.range.clone(), outline.depth);
+                    children_map.get(&key)
+                })
+                .copied()
+                .unwrap_or(false);
         let is_expanded = !self
             .collapsed_entries
             .contains(&CollapsedEntry::Outline(outline.range.clone()));
@@ -3629,11 +3649,30 @@ impl OutlinePanel {
             }
         }
 
+        let tests_only = self.symbol_filter == SymbolFilter::Tests
+            && multi_buffer_snapshot
+                .as_singleton()
+                .is_some_and(supports_test_filter);
+        let test_outlines = tests_only
+            .then_some(self.cached_entries.as_slice())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                if let PanelEntry::Outline(OutlineEntry::Outline(outline)) = &entry.entry
+                    && entry.test_name.is_some()
+                {
+                    Some(outline)
+                } else {
+                    None
+                }
+            });
         let excerpt_outlines = self
             .buffers
             .get(&selection_anchor.buffer_id)
+            .filter(|_| !tests_only)
             .into_iter()
             .flat_map(|buffer| buffer.iter_outlines())
+            .chain(test_outlines)
             .flat_map(|outline| {
                 let snapshot = buffer_snapshot?;
                 let (start, end) = if outline
@@ -3968,17 +4007,40 @@ impl OutlinePanel {
         }
     }
 
-    fn supports_public_symbol_filter(&self, cx: &App) -> bool {
-        self.active_editor().is_some_and(|editor| {
-            editor
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .as_singleton()
-                .and_then(BufferSnapshot::language)
-                .is_some_and(|language| language.name() == "Rust")
-        })
+    fn singleton_buffer_snapshot(&self, cx: &App) -> Option<BufferSnapshot> {
+        let buffer = self
+            .active_editor()?
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()?;
+        Some(buffer.read(cx).snapshot())
+    }
+
+    fn test_filter_buffer(&self, cx: &App) -> Option<BufferSnapshot> {
+        if self.symbol_filter != SymbolFilter::Tests
+            || !matches!(self.mode, ItemsDisplayMode::Outline)
+        {
+            return None;
+        }
+        self.singleton_buffer_snapshot(cx)
+            .filter(supports_test_filter)
+    }
+
+    fn toggle_symbol_filter(
+        &mut self,
+        filter: SymbolFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.symbol_filter = if self.symbol_filter == filter {
+            SymbolFilter::All
+        } else {
+            filter
+        };
+        self.selected_entry.invalidate();
+        self.update_cached_entries(None, window, cx);
+        cx.notify();
     }
 
     fn invalidate_outlines(&mut self, ids: &[BufferId]) {
@@ -4133,6 +4195,13 @@ impl OutlinePanel {
                     .update_in(cx, |outline_panel, window, cx| {
                         outline_panel.cached_entries = new_cached_entries;
                         outline_panel.max_width_item_index = max_width_item_index;
+                        if outline_panel.test_filter_buffer(cx).is_some()
+                            && outline_panel.selected_entry().is_some_and(|selected| {
+                                outline_panel.cached_entry_for_selection(selected).is_none()
+                            })
+                        {
+                            outline_panel.selected_entry = SelectedEntry::None;
+                        }
                         if let SelectedEntry::Valid(selected, _) = &outline_panel.selected_entry
                             && let Some((index, cached)) =
                                 outline_panel.cached_entry_for_selection(selected)
@@ -4151,8 +4220,11 @@ impl OutlinePanel {
                                     )
                                 })
                         {
-                            if outline_panel.show_public_symbols_only
-                                && outline_panel.supports_public_symbol_filter(cx)
+                            if outline_panel.symbol_filter == SymbolFilter::Public
+                                && outline_panel
+                                    .singleton_buffer_snapshot(cx)
+                                    .as_ref()
+                                    .is_some_and(supports_public_symbol_filter)
                                 && !outline_panel
                                     .cached_entries
                                     .iter()
@@ -4265,14 +4337,60 @@ impl OutlinePanel {
         let Some(active_editor) = self.active_editor() else {
             return Task::ready((Vec::new(), None));
         };
+        let test_buffer = self.test_filter_buffer(cx);
         cx.spawn_in(window, async move |outline_panel, cx| {
             let mut generation_state = GenerationState::default();
+            let test_ranges = if let Some(buffer) = test_buffer {
+                Some(
+                    cx.background_spawn(async move {
+                        let ranges = buffer
+                            .runnable_ranges(0..buffer.len())
+                            .filter(|runnable| {
+                                runnable.runnable.tags.iter().any(|tag| {
+                                    matches!(
+                                        tag.0.as_ref(),
+                                        "rust-test"
+                                            | "python-unittest-method"
+                                            | "python-pytest-method"
+                                    )
+                                })
+                            })
+                            .map(|runnable| runnable.run_range)
+                            .collect::<HashSet<_>>();
+                        (buffer, ranges)
+                    })
+                    .await,
+                )
+            } else {
+                None
+            };
 
             let Ok(()) = outline_panel.update(cx, |outline_panel, cx| {
+                let track_matches = query.is_some();
+                if let Some((snapshot, test_ranges)) = &test_ranges {
+                    generation_state.tests_only = true;
+                    if let Some(buffer) = outline_panel.buffers.get(&snapshot.remote_id()) {
+                        for outline in buffer.iter_outlines().filter(|outline| {
+                            let selection = &outline.selection_range;
+                            snapshot.can_resolve(&selection.start)
+                                && snapshot.can_resolve(&selection.end)
+                                && test_ranges.contains(&selection.to_offset(snapshot))
+                        }) {
+                            outline_panel.push_entry(
+                                &mut generation_state,
+                                track_matches,
+                                PanelEntry::Outline(OutlineEntry::Outline(outline.clone())),
+                                0,
+                                cx,
+                            );
+                        }
+                    }
+                    return;
+                }
+
                 let auto_fold_dirs = OutlinePanelSettings::get_global(cx).auto_fold_dirs;
                 let hide_symbols = !is_singleton && outline_panel.hide_symbols_active(cx);
                 let mut folded_dirs_entry = None::<(usize, FoldedDirsEntry)>;
-                let track_matches = query.is_some();
 
                 #[derive(Debug)]
                 struct ParentStats {
@@ -4729,6 +4847,15 @@ impl OutlinePanel {
             entry
         };
 
+        let test_name: Option<SharedString> = match &entry {
+            PanelEntry::Outline(OutlineEntry::Outline(outline)) if state.tests_only => outline
+                .name_ranges
+                .first()
+                .and_then(|range| outline.text.get(range.clone()))
+                .map(SharedString::from),
+            _ => None,
+        };
+
         if track_matches {
             let id = state.entries.len();
             match &entry {
@@ -4757,9 +4884,12 @@ impl OutlinePanel {
                             .push(StringMatchCandidate::new(id, &dir_names));
                     }
                 }
-                PanelEntry::Outline(OutlineEntry::Outline(outline_entry)) => state
-                    .match_candidates
-                    .push(StringMatchCandidate::new(id, &outline_entry.text)),
+                PanelEntry::Outline(OutlineEntry::Outline(outline_entry)) => {
+                    state.match_candidates.push(StringMatchCandidate::new(
+                        id,
+                        test_name.as_ref().unwrap_or(&outline_entry.text),
+                    ))
+                }
                 PanelEntry::Outline(OutlineEntry::Excerpt(_)) => {}
                 PanelEntry::Search(new_search_entry) => {
                     if let Some(search_data) = new_search_entry.render_data.get() {
@@ -4771,7 +4901,10 @@ impl OutlinePanel {
             }
         }
 
-        let width_estimate = self.width_estimate(depth, &entry, cx);
+        let width_estimate = test_name.as_ref().map_or_else(
+            || self.width_estimate(depth, &entry, cx),
+            |name| (name.len() + depth) as u64,
+        );
         if Some(width_estimate)
             > state
                 .max_width_estimate_and_index
@@ -4783,6 +4916,7 @@ impl OutlinePanel {
             depth,
             entry,
             string_match: None,
+            test_name,
         });
     }
 
@@ -4976,10 +5110,8 @@ impl OutlinePanel {
             let children = self.outline_children_cache.entry(buffer_id).or_default();
             let mut outlines = buffer.iter_outlines().collect::<Vec<_>>();
             if is_singleton
-                && self.show_public_symbols_only
-                && snapshot
-                    .and_then(BufferSnapshot::language)
-                    .is_some_and(|language| language.name() == "Rust")
+                && self.symbol_filter == SymbolFilter::Public
+                && snapshot.is_some_and(supports_public_symbol_filter)
             {
                 outlines = public_outlines_with_ancestors(&outlines);
             }
@@ -5305,6 +5437,8 @@ impl OutlinePanel {
         let contents = if self.cached_entries.is_empty() {
             let header = if query.is_some() {
                 "No matches for query"
+            } else if self.test_filter_buffer(cx).is_some() {
+                "No tests found"
             } else {
                 "No outlines available"
             };
@@ -5398,6 +5532,7 @@ impl OutlinePanel {
                                         &entry,
                                         cached_entry.depth,
                                         cached_entry.string_match.as_ref(),
+                                        cached_entry.test_name.as_ref(),
                                         window,
                                         cx,
                                     ))
@@ -5515,7 +5650,12 @@ impl OutlinePanel {
         } else {
             (IconName::FileCode, "Hide Symbols")
         };
-        let supports_public_symbol_filter = self.supports_public_symbol_filter(cx);
+        let singleton_buffer = self.singleton_buffer_snapshot(cx);
+        let supports_public_symbol_filter = singleton_buffer
+            .as_ref()
+            .is_some_and(supports_public_symbol_filter);
+        let supports_test_filter = matches!(self.mode, ItemsDisplayMode::Outline)
+            && singleton_buffer.as_ref().is_some_and(supports_test_filter);
 
         h_flex()
             .p_2()
@@ -5567,13 +5707,30 @@ impl OutlinePanel {
                         this.child(
                             IconButton::new("public_symbols_filter", IconName::Filter)
                                 .shape(IconButtonShape::Square)
-                                .toggle_state(self.show_public_symbols_only)
+                                .toggle_state(self.symbol_filter == SymbolFilter::Public)
                                 .tooltip(Tooltip::text("Show Public Symbols Only"))
                                 .on_click(cx.listener(|outline_panel, _, window, cx| {
-                                    outline_panel.show_public_symbols_only =
-                                        !outline_panel.show_public_symbols_only;
-                                    outline_panel.selected_entry.invalidate();
-                                    outline_panel.update_cached_entries(None, window, cx);
+                                    outline_panel.toggle_symbol_filter(
+                                        SymbolFilter::Public,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })
+                    .when(supports_test_filter, |this| {
+                        this.child(
+                            IconButton::new("tests_filter", IconName::ListTodo)
+                                .shape(IconButtonShape::Square)
+                                .toggle_state(self.symbol_filter == SymbolFilter::Tests)
+                                .aria_label("Show Tests Only")
+                                .tooltip(Tooltip::text("Show Tests Only"))
+                                .on_click(cx.listener(|outline_panel, _, window, cx| {
+                                    outline_panel.toggle_symbol_filter(
+                                        SymbolFilter::Tests,
+                                        window,
+                                        cx,
+                                    );
                                 })),
                         )
                     })
@@ -6027,6 +6184,18 @@ fn empty_icon() -> AnyElement {
         .into_any_element()
 }
 
+fn supports_public_symbol_filter(buffer: &BufferSnapshot) -> bool {
+    buffer
+        .language()
+        .is_some_and(|language| language.name() == "Rust")
+}
+
+fn supports_test_filter(buffer: &BufferSnapshot) -> bool {
+    buffer
+        .language()
+        .is_some_and(|language| matches!(language.name().as_ref(), "Rust" | "Python"))
+}
+
 fn public_outlines_with_ancestors<'a>(outlines: &[&'a Outline]) -> Vec<&'a Outline> {
     let mut ancestors = Vec::new();
     let mut retain = vec![false; outlines.len()];
@@ -6054,6 +6223,7 @@ struct GenerationState {
     entries: Vec<CachedEntry>,
     match_candidates: Vec<StringMatchCandidate>,
     max_width_estimate_and_index: Option<(u64, usize)>,
+    tests_only: bool,
 }
 
 impl GenerationState {
@@ -6071,7 +6241,7 @@ mod tests {
     use editor::{HiddenUnstagedDiffHunkRenderer, PathKey};
     use futures::{FutureExt as _, StreamExt as _, future::poll_fn, task::Poll};
     use gpui::{MouseUpEvent, TestAppContext, UpdateGlobal, VisualTestContext, WindowHandle};
-    use language::{self, FakeLspAdapter, markdown_lang, rust_lang};
+    use language::{self, FakeLspAdapter, markdown_lang, python_lang, rust_lang};
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use search::{
@@ -10901,8 +11071,7 @@ outline: struct OutlineEntryExcerpt
         cx.run_until_parked();
         outline_panel.update_in(cx, |outline_panel, window, cx| {
             outline_panel.update_non_fs_items(window, cx);
-            outline_panel.show_public_symbols_only = true;
-            outline_panel.update_cached_entries(None, window, cx);
+            outline_panel.toggle_symbol_filter(SymbolFilter::Public, window, cx);
         });
         cx.run_until_parked();
 
@@ -10931,8 +11100,7 @@ outline: struct OutlineEntryExcerpt
         });
 
         outline_panel.update_in(cx, |outline_panel, window, cx| {
-            outline_panel.show_public_symbols_only = false;
-            outline_panel.update_cached_entries(None, window, cx);
+            outline_panel.toggle_symbol_filter(SymbolFilter::Public, window, cx);
         });
         cx.run_until_parked();
         outline_panel.update(cx, |outline_panel, _| {
@@ -10944,6 +11112,125 @@ outline: struct OutlineEntryExcerpt
                 )
             }));
         });
+    }
+
+    #[gpui::test]
+    async fn test_filter_outline_to_test_names(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/test",
+            json!({
+                "lib.rs": indoc!("
+                    pub fn helper() {}
+                    fn test_without_attribute() {}
+                    fn main() {}
+
+                    #[cfg(test)]
+                    mod tests {
+                        fn fixture() {}
+
+                        #[test]
+                        #[ignore]
+                        fn adds_two_numbers() {}
+
+                        #[tokio::test]
+                        async fn loads_data() {}
+                    }
+                "),
+                "test_example.py": indoc!("
+                    import unittest
+
+                    def helper():
+                        pass
+
+                    @decorate
+                    def test_free():
+                        pass
+
+                    class TestPytest:
+                        def test_method(self):
+                            pass
+
+                        def setup_method(self):
+                            pass
+
+                    class Example(unittest.TestCase):
+                        def test_unittest(self):
+                            pass
+                "),
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, ["/test".as_ref()], cx).await;
+        project.read_with(cx, |project, _| {
+            project.languages().add(rust_lang());
+            project.languages().add(python_lang());
+        });
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let panel = outline_panel(&workspace, cx);
+        panel.update_in(cx, |panel, window, cx| panel.set_active(true, window, cx));
+
+        for (path, expected) in [
+            ("/test/lib.rs", &["adds_two_numbers", "loads_data"][..]),
+            (
+                "/test/test_example.py",
+                &["test_free", "test_method", "test_unittest"][..],
+            ),
+        ] {
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_abs_path(
+                        PathBuf::from(path),
+                        OpenOptions {
+                            visible: Some(OpenVisible::All),
+                            ..Default::default()
+                        },
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .expect("test file opens");
+            cx.executor()
+                .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(500));
+            cx.run_until_parked();
+
+            panel.update_in(cx, |panel, window, cx| {
+                panel.update_non_fs_items(window, cx);
+                panel.toggle_symbol_filter(SymbolFilter::Tests, window, cx);
+            });
+            cx.run_until_parked();
+
+            panel.read_with(cx, |panel, _| {
+                assert_eq!(panel.cached_entries.len(), expected.len());
+                for (entry, name) in panel.cached_entries.iter().zip(expected) {
+                    assert_eq!(entry.depth, 0);
+                    assert_eq!(entry.test_name.as_deref(), Some(*name));
+                    assert!(matches!(
+                        entry.entry,
+                        PanelEntry::Outline(OutlineEntry::Outline(_))
+                    ));
+                }
+            });
+
+            panel.update_in(cx, |panel, window, cx| {
+                panel.toggle_symbol_filter(SymbolFilter::Tests, window, cx);
+            });
+            cx.run_until_parked();
+            panel.read_with(cx, |panel, _| {
+                assert!(panel.cached_entries.len() > expected.len());
+                assert!(
+                    panel
+                        .cached_entries
+                        .iter()
+                        .all(|entry| entry.test_name.is_none())
+                );
+            });
+        }
     }
 
     #[gpui::test]
@@ -13668,7 +13955,7 @@ test/
                         panel.render_folded_dirs(entry, 0, None, window, cx)
                     }
                     PanelEntry::Outline(OutlineEntry::Outline(entry)) => {
-                        panel.render_outline(entry, 0, None, window, cx)
+                        panel.render_outline(entry, 0, None, None, window, cx)
                     }
                     PanelEntry::Outline(OutlineEntry::Excerpt(entry)) => panel
                         .render_excerpt(entry, 0, window, cx)
