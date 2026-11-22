@@ -277,6 +277,7 @@ pub trait AnySettingValue: 'static + Send + Sync {
     fn all_local_values(&self) -> Vec<(WorktreeId, Arc<RelPath>, &dyn Any)>;
     fn set_global_value(&mut self, value: Box<dyn Any>);
     fn set_local_value(&mut self, root_id: WorktreeId, path: Arc<RelPath>, value: Box<dyn Any>);
+    fn remove_local_value(&mut self, root_id: WorktreeId, path: &RelPath);
     fn clear_local_values(&mut self, root_id: WorktreeId);
 }
 
@@ -1098,6 +1099,11 @@ impl SettingsStore {
                     .local_settings
                     .remove(&(root_id, directory_path.clone()))
                     .is_some();
+                if zed_settings_changed {
+                    for setting_value in self.setting_values.values_mut() {
+                        setting_value.remove_local_value(root_id, &directory_path);
+                    }
+                }
                 self.file_errors
                     .remove(&SettingsFile::Project((root_id, directory_path)));
             }
@@ -1676,6 +1682,15 @@ impl<T: Settings> AnySettingValue for SettingValue<T> {
         {
             Ok(ix) => self.local_values[ix].2 = value,
             Err(ix) => self.local_values.insert(ix, (root_id, path, value)),
+        }
+    }
+
+    fn remove_local_value(&mut self, root_id: WorktreeId, path: &RelPath) {
+        if let Ok(index) = self
+            .local_values
+            .binary_search_by_key(&(root_id, path), |entry| (entry.0, entry.1.as_ref()))
+        {
+            self.local_values.remove(index);
         }
     }
 
@@ -2879,6 +2894,60 @@ mod tests {
             store.get_value_from_file(SettingsFile::User, get),
             (SettingsFile::Default, Some(&default_value))
         );
+    }
+
+    #[gpui::test]
+    fn test_removing_local_settings_restores_inherited_values(cx: &mut App) {
+        let mut store = SettingsStore::new(cx, &test_settings());
+        store.register_setting::<DefaultLanguageSettings>();
+        store
+            .set_user_settings(r#"{"preferred_line_length": 120}"#, cx)
+            .expect("set user settings");
+
+        let worktree_id = WorktreeId::from_usize(0);
+        for (path, content) in [
+            ("", r#"{"preferred_line_length": 100}"#),
+            ("nested", r#"{"preferred_line_length": 80}"#),
+            ("nested/child", r#"{"tab_size": 2}"#),
+            ("sibling", r#"{"preferred_line_length": 60}"#),
+        ] {
+            store
+                .set_local_settings(
+                    worktree_id,
+                    LocalSettingsPath::InWorktree(rel_path(path).into_arc()),
+                    LocalSettingsKind::Settings,
+                    Some(content),
+                    cx,
+                )
+                .expect("set local settings");
+        }
+
+        let effective = |store: &SettingsStore, path| {
+            let settings = store.get::<DefaultLanguageSettings>(Some(SettingsLocation {
+                worktree_id,
+                path: rel_path(path),
+            }));
+            (settings.preferred_line_length, settings.tab_size.get())
+        };
+        assert_eq!(effective(&store, "nested/child/file.rs"), (80, 2));
+
+        for (path, inherited_length) in [("nested", 100), ("", 120)] {
+            store
+                .set_local_settings(
+                    worktree_id,
+                    LocalSettingsPath::InWorktree(rel_path(path).into_arc()),
+                    LocalSettingsKind::Settings,
+                    None,
+                    cx,
+                )
+                .expect("remove local settings");
+            assert_eq!(effective(&store, "nested/file.rs").0, inherited_length);
+            assert_eq!(
+                effective(&store, "nested/child/file.rs"),
+                (inherited_length, 2)
+            );
+            assert_eq!(effective(&store, "sibling/file.rs").0, 60);
+        }
     }
 
     #[gpui::test]
